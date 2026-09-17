@@ -77,13 +77,189 @@ function userMenu() {
     .text("🔄 Refresh", "menu:user");
 }
 
+const BOT_VERSION = String(
+  process.env.BOT_VERSION ||
+    process.env.npm_package_version ||
+    "1.0.0"
+).trim();
+
 function adminMenu() {
   return new InlineKeyboard()
-    .text("➕ Add User", "admin:add")
-    .text("👥 Total User", "admin:total")
+    .text("➕ Tambah User", "admin:add")
+    .text("🔓 Aktivasi User", "admin:activate")
     .row()
+    .text("👤 Detail User", "admin:detail")
+    .text("🧾 Riwayat User", "admin:history")
+    .row()
+    .text("👥 Total User", "admin:total")
     .text("🟢 User Aktif", "admin:active")
-    .text("🔌 Putuskan User", "admin:disconnect");
+    .row()
+    .text("🔌 Putuskan User", "admin:disconnect")
+    .text("🔄 Refresh", "admin:refresh");
+}
+
+function adminBackMenu() {
+  return new InlineKeyboard()
+    .text("⬅️ Dashboard", "admin:refresh");
+}
+
+function adminFlowMenu() {
+  return new InlineKeyboard()
+    .text("❌ Batal", "admin:cancel");
+}
+
+function adminIdentity(ctx) {
+  const from = ctx.from || {};
+  const first = String(from.first_name || "").trim();
+  const last = String(from.last_name || "").trim();
+  const fullName = [first, last].filter(Boolean).join(" ");
+  const name = fullName || from.username || "Admin";
+  const username = from.username ? `@${from.username}` : "Tidak tersedia";
+
+  return {
+    name: escapeHtml(name),
+    username: escapeHtml(username),
+    id: escapeHtml(from.id),
+    version: escapeHtml(BOT_VERSION)
+  };
+}
+
+function adminDashboardText(ctx, extra = "") {
+  const a = adminIdentity(ctx);
+  const noteName = a.name;
+  const note = extra ||
+    `Admin <b>${noteName}</b>, silakan cek atau setting panel melalui menu di bawah.`;
+
+  return [
+    `🛡️ <b>ADMIN CONTROL CENTER</b>`,
+    `<i>Panel kontrol utama administrator</i>`,
+    ``,
+    `<pre>👤 Nama Admin : ${a.name}
+🆔 Telegram ID: ${a.id}
+🔗 Username   : ${a.username}
+🤖 Bot Version: v${a.version}</pre>`,
+    ``,
+    `╭───────────────╮`,
+    `│ <b>STATUS PANEL</b>`,
+    `╰───────────────╯`,
+    `🟢 <b>Administrator terverifikasi</b>`,
+    `🔐 Akses: <code>ADMIN</code>`,
+    ``,
+    `💬 ${note}`,
+    ``,
+    `👇 <b>Pilih menu administrasi:</b>`
+  ].join("\n");
+}
+
+function adminResultText(title, rows = [], footer = "") {
+  const body = rows.filter(Boolean).join("\n");
+  return [
+    `╭───────────────╮`,
+    `│ <b>${escapeHtml(title)}</b>`,
+    `╰───────────────╯`,
+    body,
+    footer ? `\n${footer}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+async function adminLoading(ctx, label = "Memproses data") {
+  const frames = ["⏳", "⌛", "🔄", "⏳"];
+  let index = 0;
+  const chatId = ctx.chat?.id || ctx.from.id;
+
+  try {
+    const msg = await bot.api.sendMessage(
+      chatId,
+      `${frames[index]} <b>${escapeHtml(label)}</b>...`,
+      { parse_mode: "HTML" }
+    );
+
+    let stopped = false;
+    const timer = setInterval(async () => {
+      if (stopped) return;
+      index = (index + 1) % frames.length;
+      try {
+        await bot.api.editMessageText(
+          chatId,
+          msg.message_id,
+          `${frames[index]} <b>${escapeHtml(label)}</b>...`,
+          { parse_mode: "HTML" }
+        );
+      } catch (_) {}
+    }, 800);
+
+    return {
+      async done() {
+        stopped = true;
+        clearInterval(timer);
+        try {
+          await bot.api.deleteMessage(chatId, msg.message_id);
+        } catch (_) {}
+      }
+    };
+  } catch (_) {
+    // Loading bersifat kosmetik; kegagalan loading tidak boleh menggagalkan aksi admin.
+    return {
+      async done() {}
+    };
+  }
+}
+
+async function getAdminStats() {
+  const [{ count: total, error: totalError }, { count: active, error: activeError }] =
+    await Promise.all([
+      sb.from("app_users").select("*", { count: "exact", head: true }),
+      sb.from("app_users").select("*", { count: "exact", head: true }).eq("status", "active")
+    ]);
+
+  if (totalError) throw totalError;
+  if (activeError) throw activeError;
+
+  return {
+    total: Number(total || 0),
+    active: Number(active || 0)
+  };
+}
+
+async function renderAdminDashboard(ctx, extra = "") {
+  let stats = { total: 0, active: 0 };
+
+  try {
+    stats = await getAdminStats();
+  } catch (e) {
+    console.error("ADMIN STATS:", e);
+  }
+
+  const text = adminDashboardText(
+    ctx,
+    extra ||
+      `Admin <b>${adminIdentity(ctx).name}</b>, silakan cek atau setting panel melalui menu di bawah.`
+  ).replace(
+    `🟢 <b>Administrator terverifikasi</b>`,
+    `🟢 <b>Administrator terverifikasi</b>\n👥 Total User: <b>${stats.total}</b>  •  🟢 Aktif: <b>${stats.active}</b>`
+  );
+
+  const saved = uiMessages.get(ctx.from.id);
+
+  // Pertahankan banner yang sudah tampil. Hanya caption + tombol yang diperbarui.
+  if (saved?.isMedia) {
+    return renderUi(
+      ctx.from.id,
+      text,
+      adminMenu(),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  // Jika UI sebelumnya teks, bersihkan agar dashboard tidak menumpuk.
+  if (saved) {
+    try {
+      await bot.api.deleteMessage(saved.chatId, saved.messageId);
+    } catch (_) {}
+    uiMessages.delete(ctx.from.id);
+  }
+
+  return renderStart(ctx, text, adminMenu());
 }
 
 function backMenu() {
@@ -1910,25 +2086,7 @@ bot.command(
           ctx.from.id
         )
       ) {
-        const name =
-          escapeHtml(
-            ctx.from.first_name ||
-              ctx.from.username ||
-              "Admin"
-          );
-
-        return renderUi(
-          ctx.from.id,
-          `🛠 <b>Admin Dashboard</b>\n\n` +
-            `👋 Halo, <b>${name}</b>\n` +
-            `🆔 ID: <code>${ctx.from.id}</code>\n\n` +
-            `Pilih menu yang ingin digunakan.`,
-          adminMenu(),
-          {
-            parse_mode:
-              "HTML"
-          }
-        );
+        return renderAdminDashboard(ctx);
       }
 
       const u =
@@ -2928,39 +3086,76 @@ bot.callbackQuery(
 );
 
 /* =========================
-   ADMIN
+   ADMIN CONTROL CENTER
 ========================= */
+
+bot.callbackQuery(
+  "admin:refresh",
+  async ctx => {
+    if (!admin(ctx.from.id)) return ctx.answerCallbackQuery();
+    await ctx.answerCallbackQuery();
+    return renderAdminDashboard(ctx);
+  }
+);
+
+bot.callbackQuery(
+  "admin:cancel",
+  async ctx => {
+    if (!admin(ctx.from.id)) return ctx.answerCallbackQuery();
+    await ctx.answerCallbackQuery("Dibatalkan");
+    flows.delete(ctx.from.id);
+    return renderAdminDashboard(ctx);
+  }
+);
 
 bot.callbackQuery(
   "admin:add",
   async ctx => {
-    if (
-      !admin(
-        ctx.from.id
-      )
-    ) {
-      return ctx.answerCallbackQuery();
-    }
-
+    if (!admin(ctx.from.id)) return ctx.answerCallbackQuery();
     await ctx.answerCallbackQuery();
-
-    flows.set(
-      ctx.from.id,
-      {
-        t:
-          "admin:add"
-      }
-    );
+    flows.set(ctx.from.id, { t: "admin:add" });
 
     return replaceUi(
       ctx,
-      "➕ <b>Add User</b>\n\n" +
-        "Kirim numeric Telegram ID user.",
-      new InlineKeyboard(),
-      {
-        parse_mode:
-          "HTML"
-      }
+      adminResultText(
+        "TAMBAH USER",
+        [
+          `➕ Masukkan <b>Telegram ID</b> user yang ingin ditambahkan.`,
+          ``,
+          `<pre>Contoh : 7607446655</pre>`,
+          ``,
+          `ℹ️ User akan langsung diberi status <code>active</code>.`
+        ],
+        `Gunakan tombol ❌ Batal jika ingin kembali.`
+      ),
+      adminFlowMenu(),
+      { parse_mode: "HTML" }
+    );
+  }
+);
+
+bot.callbackQuery(
+  "admin:activate",
+  async ctx => {
+    if (!admin(ctx.from.id)) return ctx.answerCallbackQuery();
+    await ctx.answerCallbackQuery();
+    flows.set(ctx.from.id, { t: "admin:activate" });
+
+    return replaceUi(
+      ctx,
+      adminResultText(
+        "AKTIVASI USER",
+        [
+          `🔓 Masukkan <b>Telegram ID</b> user yang ingin diaktifkan kembali.`,
+          ``,
+          `<pre>Contoh : 7607446655</pre>`,
+          ``,
+          `Status user akan diubah menjadi <code>active</code>.`
+        ],
+        `Gunakan tombol ❌ Batal jika ingin kembali.`
+      ),
+      adminFlowMenu(),
+      { parse_mode: "HTML" }
     );
   }
 );
@@ -2968,125 +3163,151 @@ bot.callbackQuery(
 bot.callbackQuery(
   "admin:total",
   async ctx => {
-    if (
-      !admin(
-        ctx.from.id
-      )
-    ) {
-      return ctx.answerCallbackQuery();
-    }
-
+    if (!admin(ctx.from.id)) return ctx.answerCallbackQuery();
     await ctx.answerCallbackQuery();
+    const loading = await adminLoading(ctx, "Mengambil total user");
 
-    const {
-      count,
-      error
-    } = await sb
-      .from("app_users")
-      .select("*", {
-        count:
-          "exact",
-        head:
-          true
-      });
+    try {
+      const { count, error } = await sb
+        .from("app_users")
+        .select("*", { count: "exact", head: true });
 
-    if (error) {
-      return replaceUi(
+      if (error) throw error;
+
+      return await replaceUi(
         ctx,
-        `❌ ${escapeHtml(
-          String(
-            error.message ||
-              error
-          ).slice(0, 500)
-        )}`,
-        adminMenu(),
-        {
-          parse_mode:
-            "HTML"
-        }
+        adminResultText(
+          "TOTAL USER",
+          [
+            `👥 Jumlah seluruh user`,
+            `<pre>┌────────────────────┐
+│  TOTAL : ${String(count || 0).padStart(8, " ")} user  │
+└────────────────────┘</pre>`,
+            ``,
+            `📌 Data dihitung langsung dari database.`
+          ],
+          `⬅️ Kembali ke dashboard admin.`
+        ),
+        adminBackMenu(),
+        { parse_mode: "HTML" }
       );
+    } catch (e) {
+      return await replaceUi(
+        ctx,
+        adminResultText(
+          "GAGAL MENGAMBIL DATA",
+          [`❌ ${escapeHtml(String(e.message || e).slice(0, 500))}`]
+        ),
+        adminBackMenu(),
+        { parse_mode: "HTML" }
+      );
+    } finally {
+      await loading.done();
     }
-
-    return replaceUi(
-      ctx,
-      `👥 <b>Total User</b>\n\nJumlah user: <b>${
-        count || 0
-      }</b>`,
-      adminMenu(),
-      {
-        parse_mode:
-          "HTML"
-      }
-    );
   }
 );
 
 bot.callbackQuery(
   "admin:active",
   async ctx => {
-    if (
-      !admin(
-        ctx.from.id
-      )
-    ) {
-      return ctx.answerCallbackQuery();
-    }
-
+    if (!admin(ctx.from.id)) return ctx.answerCallbackQuery();
     await ctx.answerCallbackQuery();
+    const loading = await adminLoading(ctx, "Memuat user aktif");
 
-    const {
-      data,
-      error
-    } = await sb
-      .from("app_users")
-      .select("*")
-      .eq(
-        "status",
-        "active"
-      );
+    try {
+      const { data, error } = await sb
+        .from("app_users")
+        .select("*")
+        .eq("status", "active");
 
-    if (error) {
-      return replaceUi(
+      if (error) throw error;
+
+      const rows = data || [];
+      const list = rows.length
+        ? rows.slice(0, 40).map((x, i) => {
+            const name = x.first_name || x.name || "User";
+            const username = x.username ? `@${x.username}` : "-";
+            return `${String(i + 1).padStart(2, "0")} • <b>${escapeHtml(name)}</b>\n   🆔 <code>${escapeHtml(x.telegram_user_id)}</code>  🔗 ${escapeHtml(username)}`;
+          }).join("\n\n")
+        : "<i>Belum ada user aktif.</i>";
+
+      const shown = Math.min(rows.length, 40);
+      return await replaceUi(
         ctx,
-        `❌ ${escapeHtml(
-          String(
-            error.message ||
-              error
-          ).slice(0, 500)
-        )}`,
-        adminMenu(),
-        {
-          parse_mode:
-            "HTML"
-        }
+        adminResultText(
+          "USER AKTIF",
+          [
+            `🟢 <b>${rows.length}</b> user berstatus active`,
+            ``,
+            list,
+            rows.length > shown ? `\n⚠️ Menampilkan ${shown} dari ${rows.length} user.` : ""
+          ],
+          `Pilih ⬅️ Dashboard untuk kembali.`
+        ),
+        adminBackMenu(),
+        { parse_mode: "HTML" }
       );
+    } catch (e) {
+      return await replaceUi(
+        ctx,
+        adminResultText("GAGAL MEMUAT USER", [`❌ ${escapeHtml(String(e.message || e).slice(0, 500))}`]),
+        adminBackMenu(),
+        { parse_mode: "HTML" }
+      );
+    } finally {
+      await loading.done();
     }
+  }
+);
 
-    const text =
-      data?.length
-        ? data
-            .map(
-              (x, i) =>
-                `${i + 1}. ${
-                  escapeHtml(
-                    x.first_name ||
-                      "-"
-                  )
-                } | <code>${
-                  x.telegram_user_id
-                }</code>`
-            )
-            .join("\n")
-        : "Belum ada user aktif.";
+bot.callbackQuery(
+  "admin:detail",
+  async ctx => {
+    if (!admin(ctx.from.id)) return ctx.answerCallbackQuery();
+    await ctx.answerCallbackQuery();
+    flows.set(ctx.from.id, { t: "admin:detail" });
 
     return replaceUi(
       ctx,
-      `🟢 <b>User Aktif</b>\n\n${text}`,
-      adminMenu(),
-      {
-        parse_mode:
-          "HTML"
-      }
+      adminResultText(
+        "DETAIL USER",
+        [
+          `👤 Masukkan <b>Telegram ID</b> user yang ingin diperiksa.`,
+          ``,
+          `<pre>Contoh : 7607446655</pre>`,
+          ``,
+          `🔎 Sistem akan menampilkan identitas, status, dan status sesi Telegram.`
+        ],
+        `Gunakan tombol ❌ Batal jika ingin kembali.`
+      ),
+      adminFlowMenu(),
+      { parse_mode: "HTML" }
+    );
+  }
+);
+
+bot.callbackQuery(
+  "admin:history",
+  async ctx => {
+    if (!admin(ctx.from.id)) return ctx.answerCallbackQuery();
+    await ctx.answerCallbackQuery();
+    flows.set(ctx.from.id, { t: "admin:history" });
+
+    return replaceUi(
+      ctx,
+      adminResultText(
+        "RIWAYAT USER",
+        [
+          `🧾 Masukkan <b>Telegram ID</b> user untuk melihat riwayat pengiriman.`,
+          ``,
+          `<pre>Contoh : 7607446655</pre>`,
+          ``,
+          `📊 Riwayat diambil dari tabel <code>send_logs</code>.`
+        ],
+        `Gunakan tombol ❌ Batal jika ingin kembali.`
+      ),
+      adminFlowMenu(),
+      { parse_mode: "HTML" }
     );
   }
 );
@@ -3094,33 +3315,25 @@ bot.callbackQuery(
 bot.callbackQuery(
   "admin:disconnect",
   async ctx => {
-    if (
-      !admin(
-        ctx.from.id
-      )
-    ) {
-      return ctx.answerCallbackQuery();
-    }
-
+    if (!admin(ctx.from.id)) return ctx.answerCallbackQuery();
     await ctx.answerCallbackQuery();
-
-    flows.set(
-      ctx.from.id,
-      {
-        t:
-          "admin:disconnect"
-      }
-    );
+    flows.set(ctx.from.id, { t: "admin:disconnect" });
 
     return replaceUi(
       ctx,
-      "🔌 <b>Putuskan User</b>\n\n" +
-        "Kirim Telegram ID user yang mau dinonaktifkan.",
-      new InlineKeyboard(),
-      {
-        parse_mode:
-          "HTML"
-      }
+      adminResultText(
+        "PUTUSKAN USER",
+        [
+          `🔌 Masukkan <b>Telegram ID</b> user yang ingin dinonaktifkan.`,
+          ``,
+          `<pre>Contoh : 7607446655</pre>`,
+          ``,
+          `⚠️ Sesi Telegram akan diputus dan status user menjadi <code>disabled</code>.`
+        ],
+        `Gunakan tombol ❌ Batal jika ingin kembali.`
+      ),
+      adminFlowMenu(),
+      { parse_mode: "HTML" }
     );
   }
 );
@@ -3191,169 +3404,227 @@ bot.on(
 
     try {
       /* =====================
-         ADMIN ADD USER
+         ADMIN INPUT HANDLERS
       ===================== */
 
-      if (
-        admin(userId) &&
-        f.t ===
-          "admin:add"
-      ) {
-        if (
-          !ctx.message.text
-        ) {
+      if (admin(userId) && f.t.startsWith("admin:")) {
+        if (!ctx.message.text) {
           return renderUi(
             userId,
-            "❌ Kirim Telegram ID berupa angka.",
-            adminMenu()
+            adminResultText("INPUT TIDAK VALID", ["❌ Kirim Telegram ID berupa angka."]),
+            adminFlowMenu(),
+            { parse_mode: "HTML" }
           );
         }
 
-        const id =
-          Number(
-            ctx.message.text.trim()
-          );
+        const rawId = ctx.message.text.trim();
+        const id = Number(rawId);
 
-        if (
-          !Number.isSafeInteger(
-            id
-          ) ||
-          id <= 0
-        ) {
+        if (!/^\d+$/.test(rawId) || !Number.isSafeInteger(id) || id <= 0) {
           return renderUi(
             userId,
-            "❌ ID Telegram tidak valid.",
-            adminMenu()
+            adminResultText("TELEGRAM ID TIDAK VALID", [
+              "❌ ID Telegram harus berupa angka positif.",
+              `<pre>Contoh : 7607446655</pre>`
+            ]),
+            adminFlowMenu(),
+            { parse_mode: "HTML" }
           );
         }
 
-        const {
-          error
-        } = await sb
-          .from(
-            "app_users"
-          )
-          .upsert(
-            {
-              telegram_user_id:
-                id,
+        const loading = await adminLoading(ctx, "Memproses permintaan admin");
 
-              status:
-                "active"
-            },
-            {
-              onConflict:
-                "telegram_user_id"
+        try {
+          if (f.t === "admin:add" || f.t === "admin:activate") {
+            const { data: existing, error: findError } = await sb
+              .from("app_users")
+              .select("*")
+              .eq("telegram_user_id", id)
+              .maybeSingle();
+
+            if (findError) throw findError;
+
+            const { error } = await sb
+              .from("app_users")
+              .upsert(
+                {
+                  telegram_user_id: id,
+                  status: "active"
+                },
+                { onConflict: "telegram_user_id" }
+              );
+
+            if (error) throw error;
+            flows.delete(userId);
+
+            const action = existing?.status === "active" && f.t === "admin:activate"
+              ? "USER SUDAH AKTIF"
+              : f.t === "admin:activate"
+                ? "USER BERHASIL DIAKTIFKAN"
+                : "USER BERHASIL DITAMBAHKAN";
+
+            return await replaceUi(
+              ctx,
+              adminResultText(
+                action,
+                [
+                  `✅ Telegram ID <code>${id}</code> sekarang berstatus <b>active</b>.`,
+                  ``,
+                  `🔐 Akses user telah diizinkan.`
+                ],
+                `Gunakan ⬅️ Dashboard untuk kembali.`
+              ),
+              adminBackMenu(),
+              { parse_mode: "HTML" }
+            );
+          }
+
+          const target = await getUser(id);
+
+          if (!target) {
+            flows.delete(userId);
+            return await replaceUi(
+              ctx,
+              adminResultText("USER TIDAK DITEMUKAN", [
+                `❌ Tidak ada user dengan Telegram ID <code>${id}</code>.`
+              ]),
+              adminBackMenu(),
+              { parse_mode: "HTML" }
+            );
+          }
+
+          if (f.t === "admin:detail") {
+            const { data: session, error: sessionError } = await sb
+              .from("telegram_sessions")
+              .select("status,phone,updated_at")
+              .eq("user_id", target.id)
+              .maybeSingle();
+
+            if (sessionError) throw sessionError;
+            flows.delete(userId);
+
+            const name = target.first_name || target.name || "Tidak tersedia";
+            const username = target.username ? `@${target.username}` : "Tidak tersedia";
+            const phone = session?.phone || "Tidak tersedia";
+            const sessionStatus = session?.status || "Belum ada sesi";
+
+            return await replaceUi(
+              ctx,
+              adminResultText(
+                "DETAIL USER",
+                [
+                  `<pre>👤 Nama      : ${escapeHtml(name)}
+🆔 Telegram ID: ${escapeHtml(target.telegram_user_id)}
+🔗 Username  : ${escapeHtml(username)}
+📌 Status    : ${escapeHtml(target.status || "-")}
+🔐 Sesi      : ${escapeHtml(sessionStatus)}
+📱 Telepon   : ${escapeHtml(phone)}
+🕒 Update    : ${escapeHtml(session?.updated_at || target.updated_at || "Tidak tersedia")}</pre>`
+                ],
+                `Data ditampilkan dari database bot.`
+              ),
+              adminBackMenu(),
+              { parse_mode: "HTML" }
+            );
+          }
+
+          if (f.t === "admin:history") {
+            const { data: logs, error: logsError } = await sb
+              .from("send_logs")
+              .select("*")
+              .eq("user_id", target.id)
+              .order("created_at", { ascending: false })
+              .limit(12);
+
+            if (logsError) throw logsError;
+            flows.delete(userId);
+
+            const history = (logs || []).map((log, i) => {
+              const status = String(log.status || "unknown").toLowerCase();
+              const icon = status === "sent" ? "✅" : status === "error" ? "❌" : "ℹ️";
+              const when = log.created_at || log.sent_at || "-";
+              const group = log.group_id ?? "-";
+              const campaign = log.campaign_id ?? "-";
+              const errorText = log.error ? `
+   ⚠️ ${escapeHtml(String(log.error).slice(0, 100))}` : "";
+              return `${icon} <b>#${i + 1}</b> • ${escapeHtml(status.toUpperCase())}
+   🕒 ${escapeHtml(when)}
+   👥 Group: <code>${escapeHtml(group)}</code> • Campaign: <code>${escapeHtml(campaign)}</code>${errorText}`;
+            }).join("\n\n");
+
+            return await replaceUi(
+              ctx,
+              adminResultText(
+                "RIWAYAT USER",
+                [
+                  `👤 Telegram ID: <code>${escapeHtml(target.telegram_user_id)}</code>`,
+                  `📊 Total log ditampilkan: <b>${logs?.length || 0}</b>`,
+                  ``,
+                  history || "<i>Belum ada riwayat pengiriman.</i>"
+                ],
+                `Menampilkan maksimal 12 riwayat terbaru.`
+              ),
+              adminBackMenu(),
+              { parse_mode: "HTML" }
+            );
+          }
+
+          if (f.t === "admin:disconnect") {
+            const c = clients.get(target.id);
+            if (c) {
+              try { await c.disconnect(); } catch (_) {}
+              clients.delete(target.id);
             }
-          );
 
-        if (error) {
-          throw error;
-        }
+            const { error: sessionError } = await sb
+              .from("telegram_sessions")
+              .update({ status: "disconnected" })
+              .eq("user_id", target.id);
 
-        flows.delete(
-          userId
-        );
+            if (sessionError) throw sessionError;
 
-        return renderUi(
-          userId,
-          "✅ <b>User berhasil diaktifkan.</b>",
-          adminMenu(),
-          {
-            parse_mode:
-              "HTML"
+            const { error: userError } = await sb
+              .from("app_users")
+              .update({ status: "disabled" })
+              .eq("id", target.id);
+
+            if (userError) throw userError;
+            flows.delete(userId);
+
+            return await replaceUi(
+              ctx,
+              adminResultText(
+                "USER BERHASIL DIPUTUSKAN",
+                [
+                  `🔌 Telegram ID <code>${escapeHtml(target.telegram_user_id)}</code> telah dinonaktifkan.`,
+                  ``,
+                  `📌 Status: <b>disabled</b>`,
+                  `🔐 Sesi: <b>disconnected</b>`
+                ],
+                `Gunakan ⬅️ Dashboard untuk kembali.`
+              ),
+              adminBackMenu(),
+              { parse_mode: "HTML" }
+            );
           }
-        );
-      }
 
-      /* =====================
-         ADMIN DISCONNECT
-      ===================== */
-
-      if (
-        admin(userId) &&
-        f.t ===
-          "admin:disconnect"
-      ) {
-        if (
-          !ctx.message.text
-        ) {
-          return renderUi(
-            userId,
-            "❌ Kirim Telegram ID user.",
-            adminMenu()
+          flows.delete(userId);
+          return await renderAdminDashboard(ctx);
+        } catch (e) {
+          console.error("ADMIN ACTION:", e);
+          return await replaceUi(
+            ctx,
+            adminResultText("ADMIN ERROR", [
+              `❌ ${escapeHtml(String(e.message || e).slice(0, 500))}`,
+              ``,
+              `Silakan coba lagi dari dashboard.`
+            ]),
+            adminBackMenu(),
+            { parse_mode: "HTML" }
           );
+        } finally {
+          await loading.done();
         }
-
-        const target =
-          await getUser(
-            Number(
-              ctx.message.text.trim()
-            )
-          );
-
-        if (!target) {
-          return renderUi(
-            userId,
-            "❌ User tidak ditemukan.",
-            adminMenu()
-          );
-        }
-
-        const c =
-          clients.get(
-            target.id
-          );
-
-        if (c) {
-          try {
-            await c.disconnect();
-          } catch (_) {}
-
-          clients.delete(
-            target.id
-          );
-        }
-
-        await sb
-          .from(
-            "telegram_sessions"
-          )
-          .update({
-            status:
-              "disconnected"
-          })
-          .eq(
-            "user_id",
-            target.id
-          );
-
-        await sb
-          .from(
-            "app_users"
-          )
-          .update({
-            status:
-              "disabled"
-          })
-          .eq(
-            "id",
-            target.id
-          );
-
-        flows.delete(
-          userId
-        );
-
-        return renderUi(
-          userId,
-          "✅ <b>User diputuskan.</b>",
-          adminMenu(),
-          {
-            parse_mode:
-              "HTML"
-          }
-        );
       }
 
       const u =
