@@ -1,11 +1,16 @@
 require("dotenv").config();
 
 const express = require("express");
-const { Bot, InlineKeyboard } = require("grammy");
+const { Bot, InlineKeyboard, InputFile } = require("grammy");
 const { createClient } = require("@supabase/supabase-js");
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const ws = require("ws");
+let ws = null;
+try {
+  ws = require("ws");
+} catch (_) {
+  // ws is optional; Supabase can use its default realtime transport.
+}
 
 const ADMIN_IDS = new Set(
   (process.env.ADMIN_IDS || "")
@@ -14,14 +19,14 @@ const ADMIN_IDS = new Set(
     .filter(Boolean)
 );
 
+const supabaseOptions = ws
+  ? { realtime: { transport: ws } }
+  : {};
+
 const sb = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
-  {
-    realtime: {
-      transport: ws
-    }
-  }
+  supabaseOptions
 );
 
 const bot = new Bot(process.env.BOT_TOKEN);
@@ -217,79 +222,65 @@ async function renderStart(
   text,
   keyboard
 ) {
-  /*
-    Jangan biarkan banner merusak /start.
-    Kalau file_id/URL banner gagal dikirim, bot
-    tetap wajib menampilkan menu utama dalam bentuk teks.
-  */
+  // Banner tidak boleh membuat /start gagal.
+  // Coba file_id, lalu download URL dari server dan kirim sebagai file,
+  // terakhir fallback ke menu teks.
   if (START_BANNER_FILE_ID) {
     try {
-      const msg =
-        await ctx.replyWithPhoto(
-          START_BANNER_FILE_ID,
-          {
-            caption: text,
-            parse_mode: "HTML",
-            reply_markup: keyboard
-          }
-        );
-
-      await saveUiMessage(
-        ctx.from.id,
-        msg,
-        true
+      const msg = await ctx.replyWithPhoto(
+        START_BANNER_FILE_ID,
+        {
+          caption: text,
+          parse_mode: "HTML",
+          reply_markup: keyboard
+        }
       );
-
+      await saveUiMessage(ctx.from.id, msg, true);
       return msg;
     } catch (e) {
-      console.error(
-        "START BANNER FILE_ID:",
-        String(e?.message || e)
-      );
+      console.error("START BANNER FILE_ID:", e?.message || e);
     }
   }
 
-  if (
-    START_BANNER_URL &&
-    /^https?:\/\//i.test(
-      START_BANNER_URL
-    )
-  ) {
+  if (START_BANNER_URL && /^https?:\/\//i.test(START_BANNER_URL)) {
     try {
-      const msg =
-        await ctx.replyWithPhoto(
-          START_BANNER_URL,
-          {
-            caption: text,
-            parse_mode: "HTML",
-            reply_markup: keyboard
-          }
-        );
+      const response = await fetch(START_BANNER_URL, {
+        redirect: "follow",
+        signal: AbortSignal.timeout(15000)
+      });
 
-      await saveUiMessage(
-        ctx.from.id,
-        msg,
-        true
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const type = String(response.headers.get("content-type") || "").toLowerCase();
+      if (!type.startsWith("image/")) {
+        throw new Error(`URL bukan file gambar (content-type: ${type || "unknown"})`);
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (!buffer.length) throw new Error("File banner kosong.");
+      if (buffer.length > 10 * 1024 * 1024) throw new Error("File banner terlalu besar.");
+
+      const msg = await ctx.replyWithPhoto(
+        new InputFile(buffer, "start-banner.jpg"),
+        {
+          caption: text,
+          parse_mode: "HTML",
+          reply_markup: keyboard
+        }
       );
 
+      await saveUiMessage(ctx.from.id, msg, true);
       return msg;
     } catch (e) {
-      console.error(
-        "START BANNER URL:",
-        START_BANNER_URL,
-        String(e?.message || e)
-      );
+      console.error("START BANNER URL:", START_BANNER_URL, e?.message || e);
     }
   }
 
-  return renderUi(
-    ctx.from.id,
-    text,
-    keyboard,
-    {
-      parse_mode: "HTML"
-    }
-  );
+  return renderUi(ctx.from.id, text, keyboard, {
+    parse_mode: "HTML"
+  });
 }
 
 async function replaceUi(
@@ -2694,9 +2685,21 @@ bot.callbackQuery(
       );
     }
 
+    // Kirim percobaan pertama sekarang supaya tombol MULAI
+    // benar-benar menjalankan campaign, bukan hanya mengubah active=true.
+    try {
+      await fire(c.id);
+    } catch (e) {
+      console.error("CAMPAIGN FIRST FIRE:", e?.message || e);
+    }
+
+    // Pengiriman berikutnya mengikuti jeda yang sudah diset.
     schedule(
       c.id,
-      0
+      Math.max(
+        1000,
+        Number(c.interval_minutes || 10) * 60 * 1000
+      )
     );
 
     return replaceUi(
