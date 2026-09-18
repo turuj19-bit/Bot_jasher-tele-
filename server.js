@@ -1,11 +1,6 @@
-/* =========================================================================
-   TELEGRAM AUTO PROMOTION BOT - MULTI ACCOUNT ADMIN CENTER v3.0
-   - Satu bot admin, banyak akun Telegram per akun.
-   - Setiap akun punya grup, format, delay, durasi, dan scheduler sendiri.
-   - Admin owner: kelola admin. Admin biasa: kelola akun & promosi.
-   ========================================================================= */
 require("dotenv").config();
 
+const crypto = require("crypto");
 const express = require("express");
 const { Bot, InlineKeyboard, InputFile } = require("grammy");
 const { createClient } = require("@supabase/supabase-js");
@@ -13,62 +8,133 @@ const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 
 let ws = null;
-try { ws = require("ws"); } catch (_) { /* opsional */ }
+try {
+  ws = require("ws");
+} catch (_) {
+  // Optional. Supabase can use its default transport.
+}
 
-/* =========================
-   CONFIG
-========================= */
-const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = String(process.env.BOT_VERSION || "3.0.0").trim();
-const SEED_ADMIN_IDS = String(process.env.ADMIN_IDS || "")
-  .split(",").map(x => x.trim()).filter(Boolean);
+/* =========================================================
+   ENV / CONFIG
+========================================================= */
 
-const START_BANNER_FILE_ID = String(process.env.START_BANNER_FILE_ID || "").trim();
-const START_BANNER_URL = String(
-  process.env.START_BANNER_URL ||
-  "https://cdn.phototourl.com/free/2026-09-17-491f8197-8c02-4344-8754-8314826f54f4.jpg"
+const requiredEnv = [
+  "BOT_TOKEN",
+  "API_ID",
+  "API_HASH",
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY"
+];
+
+for (const key of requiredEnv) {
+  if (!String(process.env[key] || "").trim()) {
+    throw new Error(`ENV wajib belum diisi: ${key}`);
+  }
+}
+
+const ADMIN_IDS = new Set(
+  (process.env.ADMIN_IDS || "")
+    .split(",")
+    .map(x => x.trim())
+    .filter(x => /^\d+$/.test(x))
+);
+
+if (!ADMIN_IDS.size) {
+  throw new Error(
+    "ADMIN_IDS wajib berisi minimal satu Telegram user ID owner."
+  );
+}
+
+const BOT_VERSION = String(
+  process.env.BOT_VERSION ||
+    process.env.npm_package_version ||
+    "3.0.0"
 ).trim();
 
-/* =========================
-   SUPABASE
-========================= */
-const supabaseOptions = ws ? { realtime: { transport: ws } } : {};
+const START_BANNER_FILE_ID = String(
+  process.env.START_BANNER_FILE_ID || ""
+).trim();
+
+const START_BANNER_URL = String(
+  process.env.START_BANNER_URL ||
+    "https://cdn.phototourl.com/free/2026-09-17-491f8197-8c02-4344-8754-8314826f54f4.jpg"
+).trim();
+
+const supabaseOptions = ws
+  ? { realtime: { transport: ws } }
+  : {};
+
 const sb = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
   supabaseOptions
 );
 
-/* =========================
-   BOT
-========================= */
 const bot = new Bot(process.env.BOT_TOKEN);
 
-/* =========================
-   STATE (in-memory)
-========================= */
-const clients      = new Map(); // accountId -> TelegramClient
-const schedulers   = new Map(); // accountId -> { timer }
-const flows        = new Map(); // adminUserId -> { t, ... }
-const waiters      = new Map(); // adminUserId -> { type, resolve, reject, timer }
-const uiMessages   = new Map(); // adminUserId -> { chatId, messageId, isMedia }
+/* =========================================================
+   RUNTIME STATE
+========================================================= */
 
-/* =========================
-   UTIL
-========================= */
-function escapeHtml(v) {
-  return String(v ?? "")
+// Account ID -> GramJS TelegramClient
+const clients = new Map();
+
+// Admin Telegram ID -> current text/media flow
+const flows = new Map();
+
+// Admin Telegram ID -> { type, resolve, reject, timer }
+const waiters = new Map();
+
+// Account ID -> scheduler task object
+const schedulerTasks = new Map();
+
+// Account ID -> currently loading GramJS client Promise
+const clientLoads = new Map();
+
+// Account ID -> Promise used as a simple async mutex
+const accountLocks = new Map();
+
+// Telegram admin ID -> last UI message
+const uiMessages = new Map();
+
+const ACCOUNT_PAGE_SIZE = 8;
+const HISTORY_PAGE_SIZE = 8;
+const GROUP_PAGE_SIZE = 8;
+const ADMIN_PAGE_SIZE = 12;
+
+/* =========================================================
+   BASIC HELPERS
+========================================================= */
+
+function escapeHtml(value) {
+  return String(value ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
-function safeButtonText(v, max = 28) {
-  const text = String(v ?? "Tanpa Nama")
+
+function safeButtonText(value, max = 30) {
+  const text = String(value ?? "Tanpa Nama")
     .replace(/[\u0000-\u001F\u007F-\u009F]/g, "");
-  return Array.from(text).slice(0, max).join("");
+
+  return Array.from(text)
+    .filter(ch => {
+      const cp = ch.codePointAt(0);
+      return cp !== undefined && cp >= 0x20;
+    })
+    .slice(0, max)
+    .join("");
 }
-function nowIso() { return new Date().toISOString(); }
+
+function safeErrorMessage(error, max = 500) {
+  const raw = String(error?.message || error || "Kesalahan tidak diketahui");
+  return raw.replace(/\s+/g, " ").slice(0, max);
+}
+
+function isOwnerId(telegramUserId) {
+  return ADMIN_IDS.has(String(telegramUserId));
+}
 
 function formatInterval(minutes) {
   const m = Number(minutes || 0);
@@ -77,1656 +143,3737 @@ function formatInterval(minutes) {
   if (m % 60 === 0) return `${m / 60} jam`;
   return `${m} menit`;
 }
+
 function formatDuration(hours) {
   const h = Number(hours || 0);
   if (!h) return "-";
   if (h % 24 === 0) return `${h / 24} hari`;
   return `${h} jam`;
 }
+
 function parseMinutes(value) {
-  const m = String(value || "").trim().toLowerCase()
-    .match(/^(\d+(?:\.\d+)?)\s*(menit|jam|hari|m|h|d)$/);
+  const m = String(value || "")
+    .trim()
+    .toLowerCase()
+    .match(/^([1-9]\d*(?:\.\d+)?)\s*(menit|jam|hari|m|h|d)$/);
+
   if (!m) return null;
-  const unit = { menit: 1, m: 1, jam: 60, h: 60, hari: 1440, d: 1440 }[m[2]];
+
+  const unit = {
+    menit: 1,
+    m: 1,
+    jam: 60,
+    h: 60,
+    hari: 1440,
+    d: 1440
+  }[m[2]];
+
   const minutes = Math.round(Number(m[1]) * unit);
-  return Number.isFinite(minutes) ? minutes : null;
+  if (!Number.isFinite(minutes) || minutes < 1) return null;
+  return minutes;
 }
+
 function parseHours(value) {
-  const m = String(value || "").trim().toLowerCase()
-    .match(/^(\d+(?:\.\d+)?)\s*(jam|hari|h|d)$/);
+  const m = String(value || "")
+    .trim()
+    .toLowerCase()
+    .match(/^([1-9]\d*(?:\.\d+)?)\s*(jam|hari|h|d)$/);
+
   if (!m) return null;
-  const unit = { jam: 1, h: 1, hari: 24, d: 24 }[m[2]];
+
+  const unit = {
+    jam: 1,
+    h: 1,
+    hari: 24,
+    d: 24
+  }[m[2]];
+
   const hours = Math.round(Number(m[1]) * unit);
-  return Number.isFinite(hours) ? hours : null;
+  if (!Number.isFinite(hours) || hours < 1) return null;
+  return hours;
 }
 
-/* =========================
-   ADMIN PERMISSION
-========================= */
-async function getAdmin(tgId) {
+function parsePositiveTelegramId(value) {
+  const raw = String(value || "").trim();
+  if (!/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n <= 0) return null;
+  return n;
+}
+
+function formatDate(value) {
+  if (!value) return "-";
+  try {
+    return new Date(value).toLocaleString("id-ID");
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function accountStatusIcon(account) {
+  if (account?.status === "connected") return "🟢";
+  if (account?.status === "error") return "🟠";
+  return "⚪";
+}
+
+function promotionStatusIcon(settings) {
+  if (settings?.promotion_enabled) return "▶️";
+  return "⏹";
+}
+
+function ensurePage(value, maxPage = 0) {
+  const page = Math.max(0, Number.parseInt(value, 10) || 0);
+  return Math.min(page, Math.max(0, maxPage));
+}
+
+function buildPageButtons(prefix, page, hasPrev, hasNext, extraButtons = []) {
+  const kb = new InlineKeyboard();
+
+  if (hasPrev) kb.text("◀️", `${prefix}:${page - 1}`);
+  if (hasNext) kb.text("▶️", `${prefix}:${page + 1}`);
+  if (hasPrev || hasNext) kb.row();
+
+  for (const row of extraButtons) {
+    if (!row?.length) continue;
+    for (const item of row) {
+      kb.text(item.text, item.callback);
+    }
+    kb.row();
+  }
+
+  return kb;
+}
+
+/* =========================================================
+   SESSION ENCRYPTION
+   New sessions are always encrypted at application level.
+   Existing deployments can start without a new ENV because a
+   stable key is derived from existing secrets, but a dedicated
+   SESSION_ENCRYPTION_KEY is strongly recommended.
+========================================================= */
+
+function encryptionKey() {
+  const explicit = String(process.env.SESSION_ENCRYPTION_KEY || "").trim();
+
+  if (explicit) {
+    if (/^[0-9a-fA-F]{64}$/.test(explicit)) {
+      return Buffer.from(explicit, "hex");
+    }
+
+    try {
+      const decoded = Buffer.from(explicit, "base64");
+      if (decoded.length === 32) return decoded;
+    } catch (_) {}
+
+    throw new Error(
+      "SESSION_ENCRYPTION_KEY harus berupa 64 karakter hex atau base64 32-byte."
+    );
+  }
+
+  // Compatibility fallback: avoids breaking old VPS deployments.
+  return crypto
+    .createHash("sha256")
+    .update(
+      `${process.env.SUPABASE_SERVICE_ROLE_KEY}|${process.env.API_HASH}|telegram-auto-bot-session-v3`
+    )
+    .digest();
+}
+
+const SESSION_KEY = encryptionKey();
+
+function encryptSession(plainText) {
+  if (!plainText) return null;
+
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", SESSION_KEY, iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(String(plainText), "utf8"),
+    cipher.final()
+  ]);
+  const tag = cipher.getAuthTag();
+
+  return [
+    "v1",
+    iv.toString("base64url"),
+    tag.toString("base64url"),
+    ciphertext.toString("base64url")
+  ].join(".");
+}
+
+function decryptSession(encoded) {
+  const raw = String(encoded || "");
+  if (!raw) return null;
+
+  const parts = raw.split(".");
+  if (parts.length !== 4 || parts[0] !== "v1") {
+    throw new Error("Format session terenkripsi tidak valid.");
+  }
+
+  const iv = Buffer.from(parts[1], "base64url");
+  const tag = Buffer.from(parts[2], "base64url");
+  const ciphertext = Buffer.from(parts[3], "base64url");
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", SESSION_KEY, iv);
+  decipher.setAuthTag(tag);
+
+  return Buffer.concat([
+    decipher.update(ciphertext),
+    decipher.final()
+  ]).toString("utf8");
+}
+
+/* =========================================================
+   ADMIN AUTHORIZATION
+========================================================= */
+
+async function getAdminByTelegramId(telegramUserId) {
   const { data, error } = await sb
-    .from("admins").select("*")
-    .eq("telegram_user_id", tgId).maybeSingle();
-  if (error) { console.error("getAdmin:", error); return null; }
-  return data;
-}
-async function requireAdmin(ctx) {
-  const a = await getAdmin(ctx.from.id);
-  if (!a) {
-    try { await ctx.answerCallbackQuery({ text: "Akses ditolak.", show_alert: true }); }
-    catch (_) {}
-    return null;
-  }
-  return a;
-}
-async function requireOwner(ctx) {
-  const a = await getAdmin(ctx.from.id);
-  if (!a || a.role !== "owner") {
-    try { await ctx.answerCallbackQuery({ text: "Hanya owner.", show_alert: true }); }
-    catch (_) {}
-    return null;
-  }
-  return a;
+    .from("admins")
+    .select("*")
+    .eq("telegram_user_id", telegramUserId)
+    .eq("active", true)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data || null;
 }
 
-/* =========================
+async function ensureBootstrapOwners() {
+  const rows = [];
+
+  for (const id of ADMIN_IDS) {
+    rows.push({
+      telegram_user_id: Number(id),
+      role: "OWNER",
+      active: true
+    });
+  }
+
+  if (!rows.length) return;
+
+  const { error } = await sb
+    .from("admins")
+    .upsert(rows, { onConflict: "telegram_user_id" });
+
+  if (error) throw error;
+}
+
+async function requireAdmin(ctx, options = {}) {
+  const telegramUserId = ctx.from?.id;
+  const adminRow = telegramUserId
+    ? await getAdminByTelegramId(telegramUserId)
+    : null;
+
+  if (!adminRow) {
+    await ctx.answerCallbackQuery("Akses ditolak.", {
+      show_alert: true
+    }).catch(() => {});
+    return null;
+  }
+
+  if (options.ownerOnly && adminRow.role !== "OWNER") {
+    await ctx.answerCallbackQuery(
+      "Fungsi ini hanya untuk ADMIN UTAMA.",
+      { show_alert: true }
+    ).catch(() => {});
+    return null;
+  }
+
+  // Keep optional profile data fresh without using it for authorization.
+  const profileUpdate = {
+    username: ctx.from?.username || null,
+    first_name: ctx.from?.first_name || null
+  };
+
+  sb.from("admins")
+    .update(profileUpdate)
+    .eq("id", adminRow.id)
+    .then(result => {
+      if (result.error) console.error("ADMIN PROFILE UPDATE:", result.error);
+    })
+    .catch(error => console.error("ADMIN PROFILE UPDATE:", error));
+
+  return adminRow;
+}
+
+/* =========================================================
    UI HELPERS
-========================= */
+========================================================= */
+
 async function saveUiMessage(userId, msg, isMedia = false) {
   if (!msg) return;
-  uiMessages.set(userId, {
+  uiMessages.set(String(userId), {
     chatId: msg.chat.id,
     messageId: msg.message_id,
-    isMedia,
+    isMedia
   });
 }
 
+async function deleteSavedUi(userId) {
+  const saved = uiMessages.get(String(userId));
+  if (!saved) return;
+
+  try {
+    await bot.api.deleteMessage(saved.chatId, saved.messageId);
+  } catch (_) {}
+
+  uiMessages.delete(String(userId));
+}
+
 async function renderUi(userId, text, keyboard, options = {}) {
-  const saved = uiMessages.get(userId);
-  const extra = { reply_markup: keyboard };
+  const key = String(userId);
+  const saved = uiMessages.get(key);
+
+  const extra = {
+    reply_markup: keyboard
+  };
+
   if (options.parse_mode) extra.parse_mode = options.parse_mode;
 
   if (saved) {
     try {
       if (saved.isMedia) {
-        await bot.api.editMessageCaption(saved.chatId, saved.messageId,
-          { caption: text, ...extra });
+        await bot.api.editMessageCaption(
+          saved.chatId,
+          saved.messageId,
+          {
+            caption: text,
+            ...extra
+          }
+        );
         return;
       }
-      await bot.api.editMessageText(saved.chatId, saved.messageId, text, extra);
+
+      await bot.api.editMessageText(
+        saved.chatId,
+        saved.messageId,
+        text,
+        extra
+      );
       return;
     } catch (e) {
-      if (/message is not modified/i.test(String(e.message || e))) return;
-      try { await bot.api.deleteMessage(saved.chatId, saved.messageId); } catch (_) {}
-      uiMessages.delete(userId);
+      if (/message is not modified/i.test(String(e.message || e))) {
+        return;
+      }
+
+      await deleteSavedUi(userId);
     }
   }
+
   const msg = await bot.api.sendMessage(userId, text, extra);
   await saveUiMessage(userId, msg, false);
-  return msg;
+}
+
+async function replaceUi(ctx, text, keyboard, options = {}) {
+  return renderUi(ctx.from.id, text, keyboard, options);
 }
 
 async function renderStart(ctx, text, keyboard) {
-  // Banner via file_id
+  const userId = ctx.from.id;
+
   if (START_BANNER_FILE_ID) {
     try {
       const msg = await ctx.replyWithPhoto(START_BANNER_FILE_ID, {
-        caption: text, parse_mode: "HTML", reply_markup: keyboard,
+        caption: text,
+        parse_mode: "HTML",
+        reply_markup: keyboard
       });
-      await saveUiMessage(ctx.from.id, msg, true);
+      await saveUiMessage(userId, msg, true);
       return msg;
-    } catch (e) { console.error("BANNER FILE_ID:", e?.message || e); }
+    } catch (e) {
+      console.error("START BANNER FILE_ID:", safeErrorMessage(e));
+    }
   }
-  // Banner via URL
+
   if (START_BANNER_URL && /^https?:\/\//i.test(START_BANNER_URL)) {
     try {
-      const r = await fetch(START_BANNER_URL, {
-        redirect: "follow", signal: AbortSignal.timeout(15000),
+      const response = await fetch(START_BANNER_URL, {
+        redirect: "follow",
+        signal: AbortSignal.timeout(15000)
       });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const type = String(r.headers.get("content-type") || "").toLowerCase();
-      if (!type.startsWith("image/")) throw new Error(`content-type ${type}`);
-      const buf = Buffer.from(await r.arrayBuffer());
-      if (!buf.length) throw new Error("banner kosong");
-      if (buf.length > 10 * 1024 * 1024) throw new Error("banner >10MB");
-      const msg = await ctx.replyWithPhoto(new InputFile(buf, "start-banner.jpg"), {
-        caption: text, parse_mode: "HTML", reply_markup: keyboard,
-      });
-      await saveUiMessage(ctx.from.id, msg, true);
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const contentType = String(
+        response.headers.get("content-type") || ""
+      ).toLowerCase();
+
+      if (!contentType.startsWith("image/")) {
+        throw new Error(
+          `URL bukan file gambar (content-type: ${contentType || "unknown"})`
+        );
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (!buffer.length) throw new Error("File banner kosong.");
+      if (buffer.length > 10 * 1024 * 1024) {
+        throw new Error("File banner terlalu besar.");
+      }
+
+      const msg = await ctx.replyWithPhoto(
+        new InputFile(buffer, "start-banner.jpg"),
+        {
+          caption: text,
+          parse_mode: "HTML",
+          reply_markup: keyboard
+        }
+      );
+
+      await saveUiMessage(userId, msg, true);
       return msg;
-    } catch (e) { console.error("BANNER URL:", e?.message || e); }
+    } catch (e) {
+      console.error("START BANNER URL:", safeErrorMessage(e));
+    }
   }
-  return renderUi(ctx.from.id, text, keyboard, { parse_mode: "HTML" });
+
+  return renderUi(userId, text, keyboard, { parse_mode: "HTML" });
 }
 
-/* =========================
-   MENUS
-========================= */
-function backHomeMenu() {
-  return new InlineKeyboard()
-    .text("🏠 Menu Utama", "home")
-    .text("🔄 Refresh", "home");
-}
-function backAccountsMenu() {
-  return new InlineKeyboard()
-    .text("⬅️ Daftar Akun", "acc:list:0")
-    .text("🏠 Menu Utama", "home");
-}
-function cancelFlowMenu() {
-  return new InlineKeyboard().text("❌ Batal", "flow:cancel");
-}
-
-function homeMenu(isOwner) {
-  const kb = new InlineKeyboard()
-    .text("👤 Akun Telegram", "acc:list:0")
-    .row()
-    .text("📊 Statistik", "stats")
-    .text("ℹ️ Info Bot", "info");
-  if (isOwner) {
-    kb.row().text("👨‍💼 Manajemen Admin", "adm:list:0");
-  }
-  kb.row().text("🔄 Refresh", "home");
-  return kb;
-}
-
-function accountListMenu(rows, page) {
-  const kb = new InlineKeyboard();
-  rows.forEach((a, i) => {
-    const idx = page * 10 + i + 1;
-    const icon = a.status === "connected" ? "🟢" : "⚪";
-    const label = safeButtonText(a.label, 22);
-    kb.text(`${icon} ${String(idx).padStart(2, "0")}. ${label}`, `acc:v:${a.id}`).row();
-  });
-  // pagination
-  const nav = [];
-  if (page > 0) nav.push(new InlineKeyboard().text("⬅️ Prev", `acc:list:${page - 1}`));
-  if (rows.length === 10) nav.push(new InlineKeyboard().text("Next ➡️", `acc:list:${page + 1}`));
-  // gabung navigasi
-  if (nav.length === 1) { kb.text("⬅️ Prev", `acc:list:${page - 1}`); }
-  if (nav.length === 2) {
-    kb.text("⬅️ Prev", `acc:list:${page - 1}`).text("Next ➡️", `acc:list:${page + 1}`);
-  }
-  kb.row().text("➕ Tambah Akun", "acc:add").text("🏠 Menu Utama", "home");
-  return kb;
-}
-
-function accountDetailMenu(accId, isRunning) {
-  const kb = new InlineKeyboard()
-    .text("👥 Grup", `grp:list:${accId}:0`)
-    .text("📝 Format", `fmt:show:${accId}`)
-    .row()
-    .text("⏱ Delay", `dly:set:${accId}`)
-    .text("📅 Durasi", `dur:set:${accId}`)
-    .row();
-  if (isRunning) {
-    kb.text("⏹ STOP Promosi", `prm:stop:${accId}`);
-  } else {
-    kb.text("▶️ START Promosi", `prm:start:${accId}`);
-  }
-  kb.row()
-    .text("🔌 Putuskan", `acc:disc:${accId}`)
-    .text("🗑 Hapus Akun", `acc:del:${accId}`)
-    .row()
-    .text("📋 Riwayat", `his:${accId}:0`)
-    .text("🔄 Refresh", `acc:v:${accId}`)
-    .row()
-    .text("⬅️ Daftar Akun", "acc:list:0")
-    .text("🏠 Menu Utama", "home");
-  return kb;
-}
-
-function groupMenu(groups, accId, page) {
-  const kb = new InlineKeyboard();
-  groups.forEach((g, i) => {
-    const icon = g.enabled ? "✅" : "⬜";
-    const idx = page * 10 + i + 1;
-    kb.text(`${icon} ${String(idx).padStart(2, "0")}. ${safeButtonText(g.title, 24)}`,
-      `grp:tgl:${accId}:${g.id}`).row();
-  });
-  if (page > 0) kb.text("⬅️ Prev", `grp:list:${accId}:${page - 1}`);
-  if (groups.length === 10) kb.text("Next ➡️", `grp:list:${accId}:${page + 1}`);
-  kb.row()
-    .text("🔄 Refresh Grup", `grp:rf:${accId}`)
-    .text("⬅️ Kembali", `acc:v:${accId}`);
-  return kb;
-}
-
-function adminMgmtMenu(isOwner) {
-  const kb = new InlineKeyboard();
-  if (isOwner) kb.text("➕ Tambah Admin", "adm:add").row();
-  kb.text("📋 Daftar Admin", "adm:list:0").row();
-  kb.text("🏠 Menu Utama", "home");
-  return kb;
-}
-
-function adminListMenu(rows, page, isOwner) {
-  const kb = new InlineKeyboard();
-  rows.forEach((a, i) => {
-    const idx = page * 10 + i + 1;
-    const icon = a.role === "owner" ? "👑" : "👤";
-    kb.text(`${icon} ${idx}. ${safeButtonText(a.note || a.telegram_user_id, 22)}`,
-      `adm:v:${a.telegram_user_id}`).row();
-  });
-  if (page > 0) kb.text("⬅️ Prev", `adm:list:${page - 1}`);
-  if (rows.length === 10) kb.text("Next ➡️", `adm:list:${page + 1}`);
-  kb.row().text("🏠 Menu Utama", "home");
-  return kb;
-}
-
-function historyMenu(accId, page, hasMore) {
-  const kb = new InlineKeyboard();
-  if (page > 0) kb.text("⬅️ Prev", `his:${accId}:${page - 1}`);
-  if (hasMore) kb.text("Next ➡️", `his:${accId}:${page + 1}`);
-  kb.row()
-    .text("⬅️ Kembali", `acc:v:${accId}`)
-    .text("🏠 Menu Utama", "home");
-  return kb;
-}
-
-/* =========================
-   TEXTS
-========================= */
-async function textHome(adminRow) {
-  const isOwner = adminRow.role === "owner";
-  let stats = { total_accounts: 0, connected_accounts: 0, running_promotions: 0 };
-  try {
-    const { data } = await sb.from("admin_dashboard_stats").select("*").maybeSingle();
-    if (data) stats = data;
-  } catch (_) {}
+function dashboardText(ctx, stats, extra = "") {
+  const first = String(ctx.from?.first_name || "").trim();
+  const last = String(ctx.from?.last_name || "").trim();
+  const name = [first, last].filter(Boolean).join(" ") || "Admin";
 
   return [
-    `🤖 <b>PROMOTION CONTROL CENTER</b>`,
-    `<i>Bot pusat kendali multi akun Telegram</i>`,
-    ``,
-    `<pre>👤 Admin     : ${escapeHtml(adminRow.note || String(adminRow.telegram_user_id))}
-🆔 Telegram ID: <code>${adminRow.telegram_user_id}</code>
-🛡 Role       : ${isOwner ? "OWNER" : "ADMIN"}
-🤖 Version    : v${escapeHtml(BOT_VERSION)}</pre>`,
-    ``,
-    `╭─ <b>STATISTIK</b> ─╮`,
-    `👥 Total Akun   : <b>${stats.total_accounts}</b>`,
-    `🟢 Terhubung    : <b>${stats.connected_accounts}</b>`,
-    `▶️ Promosi Jalan: <b>${stats.running_promotions}</b>`,
-    `╰──────────────╯`,
-    ``,
-    `👇 <b>Pilih menu:</b>`,
+    "🛡️ <b>ADMIN CONTROL CENTER</b>",
+    `<i>${escapeHtml(extra || `Halo ${name}, semua akun Telegram dan promosi dikontrol dari bot ini.`)}</i>`,
+    "",
+    `<pre>👤 Admin        : ${escapeHtml(name)}
+🆔 Telegram ID  : ${escapeHtml(ctx.from.id)}
+🤖 Bot Version  : v${escapeHtml(BOT_VERSION)}</pre>`,
+    "",
+    "📊 <b>STATUS SISTEM</b>",
+    `👥 Admin aktif  : <b>${stats.admins}</b>`,
+    `📱 Akun Telegram: <b>${stats.accounts}</b>`,
+    `🟢 Terhubung    : <b>${stats.connected}</b>`,
+    `▶️ Promosi jalan: <b>${stats.running}</b>`,
+    `👥 Target grup  : <b>${stats.groups}</b>`,
+    "",
+    "👇 <b>Pilih menu:</b>"
   ].join("\n");
 }
 
-/* =========================
-   DB: ACCOUNTS
-========================= */
-async function listAccounts(page = 0, perPage = 10) {
-  const from = page * perPage;
-  const to = from + perPage - 1;
+async function getDashboardStats() {
+  const [admins, accounts, connected, running, groups] = await Promise.all([
+    sb.from("admins").select("*", { count: "exact", head: true }).eq("active", true),
+    sb.from("telegram_accounts").select("*", { count: "exact", head: true }),
+    sb.from("telegram_accounts").select("*", { count: "exact", head: true }).eq("status", "connected"),
+    sb.from("account_settings").select("*", { count: "exact", head: true }).eq("promotion_enabled", true),
+    sb.from("account_groups").select("*", { count: "exact", head: true }).eq("enabled", true).eq("can_send", true)
+  ]);
+
+  for (const r of [admins, accounts, connected, running, groups]) {
+    if (r.error) throw r.error;
+  }
+
+  return {
+    admins: Number(admins.count || 0),
+    accounts: Number(accounts.count || 0),
+    connected: Number(connected.count || 0),
+    running: Number(running.count || 0),
+    groups: Number(groups.count || 0)
+  };
+}
+
+function ownerDashboardMenu() {
+  return new InlineKeyboard()
+    .text("📱 Akun Telegram", "accounts:list:0")
+    .row()
+    .text("👥 Admin", "admin:list:0")
+    .text("📊 Refresh", "menu:dashboard")
+    .row()
+    .text("➕ Tambah Akun", "account:add");
+}
+
+function adminDashboardMenu() {
+  return new InlineKeyboard()
+    .text("📱 Akun Telegram", "accounts:list:0")
+    .row()
+    .text("➕ Tambah Akun", "account:add")
+    .text("📊 Refresh", "menu:dashboard");
+}
+
+function backDashboardKeyboard() {
+  return new InlineKeyboard().text("🏠 Menu Utama", "menu:dashboard");
+}
+
+function accountListKeyboard(accounts, page, hasNext) {
+  const kb = new InlineKeyboard();
+
+  for (const account of accounts) {
+    kb
+      .text(
+        `${accountStatusIcon(account)} ${safeButtonText(account.label, 28)}`,
+        `account:open:${account.id}`
+      )
+      .row();
+  }
+
+  if (page > 0) kb.text("◀️", `accounts:list:${page - 1}`);
+  kb.text("🏠", "menu:dashboard");
+  if (hasNext) kb.text("▶️", `accounts:list:${page + 1}`);
+  kb.row();
+  kb.text("➕ Tambah Akun", "account:add");
+
+  return kb;
+}
+
+function accountMenu(account, settings) {
+  const kb = new InlineKeyboard();
+
+  kb
+    .text("📊 Status", `account:status:${account.id}`)
+    .text("⚙️ Setting", `account:settings:${account.id}`)
+    .row();
+
+  if (account.status === "connected") {
+    kb.text("🔌 Putuskan", `account:disconnect:${account.id}`);
+  } else {
+    kb.text("🔗 Connect", `account:connect:${account.id}`);
+  }
+
+  kb
+    .text("👥 Grup", `group:list:${account.id}:0`)
+    .row()
+    .text("📝 Format", `promo:format:${account.id}`)
+    .text("⏱ Jeda", `promo:delay:${account.id}`)
+    .row()
+    .text("📅 Durasi", `promo:duration:${account.id}`)
+    .text(
+      settings?.promotion_enabled ? "⏹ Stop" : "▶️ Start",
+      settings?.promotion_enabled
+        ? `promo:stop:${account.id}`
+        : `promo:start:${account.id}`
+    )
+    .row()
+    .text("📋 Riwayat", `history:list:${account.id}:0`)
+    .text("✏️ Label", `account:label:${account.id}`)
+    .row()
+    .text("🗑 Hapus", `account:remove:${account.id}`)
+    .row()
+    .text("◀️ Daftar Akun", "accounts:list:0");
+
+  return kb;
+}
+
+function settingsMenu(accountId) {
+  return new InlineKeyboard()
+    .text("✏️ Ubah Label", `account:label:${accountId}`)
+    .row()
+    .text("📝 Format Promosi", `promo:format:${accountId}`)
+    .row()
+    .text("⏱ Ubah Jeda", `promo:delay:${accountId}`)
+    .text("📅 Ubah Durasi", `promo:duration:${accountId}`)
+    .row()
+    .text("◀️ Account", `account:open:${accountId}`)
+    .text("🏠", "menu:dashboard");
+}
+
+function groupListKeyboard(rows, accountId, page, hasNext) {
+  const kb = new InlineKeyboard();
+
+  for (const group of rows) {
+    const label = `${group.enabled ? "✅" : "⬜"} ${safeButtonText(group.title, 24)}`;
+    kb
+      .text(label, `group:toggle:${group.id}`)
+      .text("🗑", `group:remove:${group.id}`)
+      .row();
+  }
+
+  if (page > 0) kb.text("◀️", `group:list:${accountId}:${page - 1}`);
+  kb.text("🏠", "menu:dashboard");
+  if (hasNext) kb.text("▶️", `group:list:${accountId}:${page + 1}`);
+  kb.row();
+  kb.text("🔄 Scan / Refresh", `group:refresh:${accountId}`);
+  kb.text("◀️ Account", `account:open:${accountId}`);
+
+  return kb;
+}
+
+function historyKeyboard(accountId, page, hasNext) {
+  const kb = new InlineKeyboard();
+
+  if (page > 0) kb.text("◀️", `history:list:${accountId}:${page - 1}`);
+  kb.text("🏠", "menu:dashboard");
+  if (hasNext) kb.text("▶️", `history:list:${accountId}:${page + 1}`);
+  kb.row();
+  kb.text("◀️ Account", `account:open:${accountId}`);
+
+  return kb;
+}
+
+function adminListKeyboard(admins, page, hasNext) {
+  const kb = new InlineKeyboard();
+
+  for (const a of admins) {
+    const role = a.role === "OWNER" ? "👑" : "👨‍💼";
+    const label = a.telegram_user_id
+      ? `${role} ${a.telegram_user_id}`
+      : `${role} -`;
+
+    kb.text(
+      safeButtonText(label, 32),
+      `admin:view:${a.id}`
+    ).row();
+  }
+
+  if (page > 0) kb.text("◀️", `admin:list:${page - 1}`);
+  kb.text("🏠", "menu:dashboard");
+  if (hasNext) kb.text("▶️", `admin:list:${page + 1}`);
+  kb.row();
+  kb.text("➕ Tambah Admin", "admin:add");
+  kb.text("❌ Hapus Admin", "admin:delete");
+
+  return kb;
+}
+
+function cancelKeyboard(ownerOnly = false) {
+  return new InlineKeyboard().text(
+    "❌ Batal",
+    ownerOnly ? "admin:cancel" : "flow:cancel"
+  );
+}
+
+/* =========================================================
+   ACCOUNT / SETTINGS DATABASE HELPERS
+========================================================= */
+
+async function getAccount(accountId) {
   const { data, error } = await sb
     .from("telegram_accounts")
     .select("*")
-    .order("created_at", { ascending: false })
-    .range(from, to);
+    .eq("id", accountId)
+    .maybeSingle();
+
   if (error) throw error;
-  return data || [];
+  return data || null;
 }
-async function getAccount(id) {
+
+async function getAccountSettings(accountId) {
   const { data, error } = await sb
-    .from("telegram_accounts").select("*").eq("id", id).maybeSingle();
+    .from("account_settings")
+    .select("*")
+    .eq("account_id", accountId)
+    .maybeSingle();
+
   if (error) throw error;
-  return data;
+  return data || null;
 }
-async function getSettings(accountId) {
-  const { data, error } = await sb
-    .from("account_settings").select("*").eq("account_id", accountId).maybeSingle();
-  if (error) throw error;
-  return data;
-}
-async function ensureSettings(accountId) {
-  const existing = await getSettings(accountId);
+
+async function ensureAccountSettings(accountId) {
+  const existing = await getAccountSettings(accountId);
   if (existing) return existing;
+
   const { data, error } = await sb
     .from("account_settings")
     .insert({ account_id: accountId })
-    .select("*").single();
+    .select("*")
+    .single();
+
   if (error) throw error;
   return data;
 }
 
-async function listGroups(accountId, page = 0, perPage = 10) {
-  const from = page * perPage, to = from + perPage - 1;
-  const { data, error } = await sb
-    .from("account_groups")
-    .select("*")
-    .eq("account_id", accountId)
-    .order("title", { ascending: true })
-    .range(from, to);
-  if (error) throw error;
-  return data || [];
+async function getAccountBundle(accountId) {
+  const [account, settings] = await Promise.all([
+    getAccount(accountId),
+    getAccountSettings(accountId)
+  ]);
+
+  return { account, settings: settings || null };
 }
 
-/* =========================
-   TELEGRAM CLIENT
-========================= */
+async function accountHasAccess(accountId) {
+  const account = await getAccount(accountId);
+  return account;
+}
+
+async function createAccountShell(label, adminId) {
+  const { data, error } = await sb
+    .from("telegram_accounts")
+    .insert({
+      label: label.trim(),
+      status: "disconnected",
+      created_by_admin_id: adminId,
+      phone: null,
+      session_encrypted: null
+    })
+    .select("*")
+    .single();
+
+  if (error) throw error;
+
+  await ensureAccountSettings(data.id);
+  return data;
+}
+
+async function listAccounts(page = 0) {
+  const offset = page * ACCOUNT_PAGE_SIZE;
+
+  const [{ data, error }, { count, error: countError }] = await Promise.all([
+    sb
+      .from("telegram_accounts")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .range(offset, offset + ACCOUNT_PAGE_SIZE),
+    sb.from("telegram_accounts").select("*", { count: "exact", head: true })
+  ]);
+
+  if (error) throw error;
+  if (countError) throw countError;
+
+  const rows = data || [];
+  const visible = rows.slice(0, ACCOUNT_PAGE_SIZE);
+
+  return {
+    rows: visible,
+    total: Number(count || 0),
+    page,
+    hasNext: offset + ACCOUNT_PAGE_SIZE < Number(count || 0)
+  };
+}
+
+async function listAdmins(page = 0) {
+  const offset = page * ADMIN_PAGE_SIZE;
+
+  const [{ data, error }, { count, error: countError }] = await Promise.all([
+    sb
+      .from("admins")
+      .select("*")
+      .eq("active", true)
+      .order("role", { ascending: true })
+      .order("created_at", { ascending: true })
+      .range(offset, offset + ADMIN_PAGE_SIZE),
+    sb.from("admins").select("*", { count: "exact", head: true }).eq("active", true)
+  ]);
+
+  if (error) throw error;
+  if (countError) throw countError;
+
+  return {
+    rows: (data || []).slice(0, ADMIN_PAGE_SIZE),
+    total: Number(count || 0),
+    hasNext: offset + ADMIN_PAGE_SIZE < Number(count || 0)
+  };
+}
+
+async function stopScheduler(accountId) {
+  const key = String(accountId);
+  const task = schedulerTasks.get(key);
+  if (!task) return;
+
+  task.running = false;
+  if (task.timeout) clearTimeout(task.timeout);
+  schedulerTasks.delete(key);
+}
+
+async function withAccountLock(accountId, fn) {
+  const key = String(accountId);
+  const previous = accountLocks.get(key) || Promise.resolve();
+  let release;
+
+  const current = new Promise(resolve => {
+    release = resolve;
+  });
+
+  accountLocks.set(key, current);
+
+  await previous.catch(() => {});
+
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (accountLocks.get(key) === current) {
+      accountLocks.delete(key);
+    }
+  }
+}
+
+/* =========================================================
+   TELEGRAM USER CLIENT
+========================================================= */
+
 async function createTelegramClient(sessionString = "") {
   return new TelegramClient(
     new StringSession(sessionString || ""),
     Number(process.env.API_ID),
     process.env.API_HASH,
-    { connectionRetries: 5, retryDelay: 2000, useWSS: false }
+    {
+      connectionRetries: 10,
+      retryDelay: 2000,
+      useWSS: false
+    }
   );
 }
 
-async function clientForAccount(acc) {
-  if (!acc) return null;
-  let c = clients.get(acc.id);
-  if (c) {
+async function markAccountStatus(accountId, status) {
+  const { error } = await sb
+    .from("telegram_accounts")
+    .update({ status })
+    .eq("id", accountId);
+
+  if (error) console.error("ACCOUNT STATUS UPDATE:", error);
+}
+
+async function clientFor(accountOrId) {
+  const accountId = String(
+    typeof accountOrId === "object" ? accountOrId?.id : accountOrId
+  );
+
+  if (!accountId || accountId === "undefined") return null;
+
+  const existing = clients.get(accountId);
+
+  if (existing) {
     try {
-      if (!c.connected) await c.connect();
-      if (await c.checkAuthorization()) return c;
+      if (!existing.connected) await existing.connect();
+      if (await existing.checkAuthorization()) return existing;
     } catch (_) {}
-    try { await c.disconnect(); } catch (_) {}
-    clients.delete(acc.id);
   }
-  if (!acc.session_string) return null;
-  try {
-    c = await createTelegramClient(acc.session_string);
-    await c.connect();
-    if (!(await c.checkAuthorization())) {
-      try { await c.disconnect(); } catch (_) {}
+
+  if (clientLoads.has(accountId)) {
+    return clientLoads.get(accountId);
+  }
+
+  const loadPromise = (async () => {
+    const account = await getAccount(accountId);
+    if (!account?.session_encrypted) return null;
+
+    let sessionString;
+    try {
+      sessionString = decryptSession(account.session_encrypted);
+    } catch (e) {
+      console.error(`ACCOUNT ${accountId} SESSION DECRYPT:`, safeErrorMessage(e));
+      await markAccountStatus(accountId, "error");
       return null;
     }
-    clients.set(acc.id, c);
-    return c;
-  } catch (e) {
-    console.error("CLIENT FOR ACCOUNT:", acc.id, e?.message || e);
-    return null;
-  }
-}
 
-/* =========================
-   LOGIN WAITER
-========================= */
-function waitForInput(userId, nextType, timeoutMs = 5 * 60 * 1000) {
-  return new Promise((resolve, reject) => {
-    const old = waiters.get(userId);
-    if (old) { try { old.reject(new Error("Dibatalkan.")); } catch (_) {} }
+    if (!sessionString) return null;
 
-    const timer = setTimeout(() => {
-      waiters.delete(userId);
-      flows.delete(userId);
-      reject(new Error("Waktu input habis."));
-    }, timeoutMs);
+    const client = await createTelegramClient(sessionString);
 
-    waiters.set(userId, {
-      type: nextType,
-      resolve: v => { clearTimeout(timer); waiters.delete(userId); resolve(v); },
-      reject: e => { clearTimeout(timer); waiters.delete(userId); reject(e); },
-    });
-  });
-}
+    try {
+      await client.connect();
 
-/* =========================
-   LOGIN FLOW (akun Telegram)
-========================= */
-async function runLogin(ctx, accId, phone) {
-  const adminUserId = ctx.from.id;
-  const c = await createTelegramClient("");
-  await c.connect();
+      if (!(await client.checkAuthorization())) {
+        await markAccountStatus(accountId, "error");
+        try { await client.disconnect(); } catch (_) {}
+        return null;
+      }
+
+      clients.set(accountId, client);
+      await markAccountStatus(accountId, "connected");
+      return client;
+    } catch (e) {
+      try { await client.disconnect(); } catch (_) {}
+      console.warn(`ACCOUNT ${accountId} RECONNECT:`, safeErrorMessage(e, 250));
+      return null;
+    }
+  })();
+
+  clientLoads.set(accountId, loadPromise);
 
   try {
-    await c.start({
-      phoneNumber: async () => phone,
-      phoneCode: async () => {
-        flows.set(adminUserId, { t: "login:code", accId });
-        await renderUi(adminUserId,
-          "📩 <b>Kode OTP Telegram sudah dikirim.</b>\n\nBalas dengan kode OTP-nya.",
-          cancelFlowMenu(), { parse_mode: "HTML" });
-        return await waitForInput(adminUserId, "code");
-      },
-      password: async () => {
-        flows.set(adminUserId, { t: "login:password", accId });
-        await renderUi(adminUserId,
-          "🔐 <b>Verifikasi 2 langkah</b>\n\nBalas dengan password Telegram.",
-          cancelFlowMenu(), { parse_mode: "HTML" });
-        return await waitForInput(adminUserId, "password");
-      },
-      onError: async err => console.error("LOGIN ERR:", err?.message || err),
-    });
-
-    const sessionString = c.session.save();
-    const me = await c.getMe().catch(() => null);
-
-    const { error } = await sb.from("telegram_accounts").update({
-      session_string: sessionString,
-      phone,
-      status: "connected",
-      telegram_user_id: me?.id ? Number(me.id) : null,
-      username: me?.username || null,
-    }).eq("id", accId);
-    if (error) throw error;
-
-    await ensureSettings(accId);
-    clients.set(accId, c);
-
-    await sb.from("promotion_history").insert({
-      account_id: accId,
-      action: "connect",
-      status: "success",
-      admin_id: adminUserId,
-    });
-
-    flows.delete(adminUserId);
-
-    await renderUi(adminUserId,
-      "✅ <b>Akun Telegram berhasil terhubung.</b>\n\nSession sudah disimpan.",
-      new InlineKeyboard()
-        .text("👤 Detail Akun", `acc:v:${accId}`)
-        .text("👥 Refresh Grup", `grp:rf:${accId}`)
-        .row().text("🏠 Menu Utama", "home"),
-      { parse_mode: "HTML" });
-  } catch (e) {
-    flows.delete(adminUserId);
-    try { await c.disconnect(); } catch (_) {}
-    try {
-      await sb.from("telegram_accounts")
-        .update({ status: "error" }).eq("id", accId);
-      await sb.from("promotion_history").insert({
-        account_id: accId, action: "connect", status: "failed",
-        admin_id: adminUserId, error: String(e?.message || e).slice(0, 500),
-      });
-    } catch (_) {}
-    throw e;
+    return await loadPromise;
+  } finally {
+    if (clientLoads.get(accountId) === loadPromise) {
+      clientLoads.delete(accountId);
+    }
   }
 }
 
-/* =========================
-   REFRESH GROUPS
-========================= */
-async function refreshGroupsFor(acc) {
-  const c = await clientForAccount(acc);
-  if (!c) throw new Error("Akun Telegram belum terhubung.");
+async function closeClient(accountId) {
+  const key = String(accountId);
+  const client = clients.get(key);
+  if (!client) return;
 
-  const dialogs = await c.getDialogs({ limit: 500 });
-  const rows = [];
+  try {
+    await client.disconnect();
+  } catch (_) {}
 
-  for (const d of dialogs) {
-    const entity = d.entity;
-    if (!entity) continue;
-    const isGroup = Boolean(d.isGroup);
-    const isChannel = Boolean(d.isChannel);
-    if (!isGroup && !isChannel) continue;
+  clients.delete(key);
+}
+
+async function getMeFromClient(client) {
+  const me = await client.getMe();
+  if (!me?.id) throw new Error("Telegram tidak mengembalikan identitas akun.");
+
+  return {
+    telegramUserId: Number(me.id),
+    username: me.username || null,
+    firstName: me.firstName || null,
+    lastName: me.lastName || null
+  };
+}
+
+/* =========================================================
+   GROUP MANAGEMENT
+========================================================= */
+
+function channelCanSend(entity, client) {
+  return (async () => {
+    const isGroup = Boolean(entity?.className === "Chat");
+    const isChannel = Boolean(entity?.className === "Channel");
+
+    if (!isGroup && !isChannel) return false;
 
     let canSend = true;
 
-    // heuristik sederhana: broadcast channel butuh cek admin
-    if (isChannel && entity.className === "Channel" && entity.broadcast) {
+    if (isChannel && entity.broadcast) {
       canSend = false;
+
       try {
-        const me = await c.getInputEntity("me");
-        const participant = await c.invoke(new Api.channels.GetParticipant({
-          channel: entity, userId: me,
-        }));
-        const p = participant.participant;
-        if (p?.className === "ChannelParticipantCreator" ||
-            p?.className === "ChannelParticipantAdmin") {
+        const me = await client.getInputEntity("me");
+        const participant = await client.invoke(
+          new Api.channels.GetParticipant({
+            channel: entity,
+            userId: me
+          })
+        );
+
+        const p = participant?.participant;
+        if (
+          p?.className === "ChannelParticipantCreator" ||
+          p?.className === "ChannelParticipantAdmin"
+        ) {
           canSend = true;
         }
-      } catch (_) { canSend = false; }
+      } catch (_) {
+        canSend = false;
+      }
     }
 
     if (isGroup || (isChannel && !entity.broadcast)) {
       canSend = true;
-      try {
-        if (entity.className === "Channel") {
-          const me = await c.getInputEntity("me");
-          const participant = await c.invoke(new Api.channels.GetParticipant({
-            channel: entity, userId: me,
-          }));
-          const p = participant.participant;
-          if (p?.className === "ChannelParticipantBanned" &&
-              p.bannedRights?.sendMessages === true) {
+
+      if (isChannel) {
+        try {
+          const me = await client.getInputEntity("me");
+          const participant = await client.invoke(
+            new Api.channels.GetParticipant({
+              channel: entity,
+              userId: me
+            })
+          );
+
+          const p = participant?.participant;
+          if (
+            p?.className === "ChannelParticipantBanned" &&
+            p.bannedRights?.sendMessages === true
+          ) {
             canSend = false;
           }
+        } catch (_) {
+          // Keep the old behavior: unknown permission is not enough to discard the group.
+          canSend = true;
         }
-      } catch (_) { canSend = true; }
+      }
     }
 
+    return canSend;
+  })();
+}
+
+async function refreshGroups(accountId) {
+  const client = await clientFor(accountId);
+
+  if (!client) {
+    throw new Error("Akun Telegram belum terhubung. Connect akun terlebih dahulu.");
+  }
+
+  const dialogs = await client.getDialogs({ limit: 500 });
+  const rows = [];
+
+  for (const dialog of dialogs) {
+    const entity = dialog?.entity;
+    if (!entity) continue;
+
+    const isGroup = Boolean(dialog.isGroup);
+    const isChannel = Boolean(dialog.isChannel);
+    if (!isGroup && !isChannel) continue;
+
+    const canSend = await channelCanSend(entity, client);
+    const telegramGroupId = String(entity.id?.value ?? entity.id ?? "");
+
+    if (!telegramGroupId) continue;
+
     rows.push({
-      account_id: acc.id,
-      telegram_group_id: String(entity.id?.value ?? entity.id),
-      title: d.title || entity.title || "Tanpa Nama",
+      account_id: accountId,
+      telegram_group_id: telegramGroupId,
+      title: dialog.title || entity.title || "Tanpa Nama",
       can_send: canSend,
+      last_seen_at: new Date().toISOString()
     });
   }
 
   if (rows.length) {
-    // upsert; enabled tidak diikutkan supaya toggle user tidak ketimpa
     const { error } = await sb
       .from("account_groups")
       .upsert(rows, { onConflict: "account_id,telegram_group_id" });
+
     if (error) throw error;
   }
+
   return rows;
 }
 
-/* =========================
-   DOWNLOAD PHOTO
-========================= */
+async function listGroups(accountId, page = 0) {
+  const offset = page * GROUP_PAGE_SIZE;
+
+  const [{ data, error }, { count, error: countError }] = await Promise.all([
+    sb
+      .from("account_groups")
+      .select("*")
+      .eq("account_id", accountId)
+      .order("title", { ascending: true })
+      .range(offset, offset + GROUP_PAGE_SIZE),
+    sb
+      .from("account_groups")
+      .select("*", { count: "exact", head: true })
+      .eq("account_id", accountId)
+  ]);
+
+  if (error) throw error;
+  if (countError) throw countError;
+
+  return {
+    rows: (data || []).slice(0, GROUP_PAGE_SIZE),
+    total: Number(count || 0),
+    hasNext: offset + GROUP_PAGE_SIZE < Number(count || 0)
+  };
+}
+
+/* =========================================================
+   PROMOTION FORMAT / MEDIA
+========================================================= */
+
 async function downloadBotPhoto(fileId) {
   const file = await bot.api.getFile(fileId);
-  if (!file?.file_path) throw new Error("Telegram tidak mengembalikan file_path.");
+  if (!file?.file_path) {
+    throw new Error("Telegram tidak mengembalikan file_path.");
+  }
+
   const url = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 30000);
-  let r;
-  try { r = await fetch(url, { signal: controller.signal }); }
-  finally { clearTimeout(t); }
-  if (!r.ok) throw new Error(`Download foto gagal: HTTP ${r.status}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  if (!buf.length) throw new Error("Foto kosong.");
-  buf.name = "photo.jpg";
-  return buf;
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(30000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Gagal download foto Telegram: HTTP ${response.status}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error("File foto Telegram kosong.");
+  if (buffer.length > 10 * 1024 * 1024) {
+    throw new Error("File foto terlalu besar.");
+  }
+
+  buffer.name = "photo.jpg";
+  return buffer;
 }
 
-/* =========================
-   PROMOTION SCHEDULER (per akun)
-========================= */
-function stopScheduler(accountId) {
-  const s = schedulers.get(accountId);
-  if (s?.timer) clearTimeout(s.timer);
-  schedulers.delete(accountId);
+function settingsFormatText(settings) {
+  if (!settings) return "Belum ada format.";
+
+  if (settings.format_type === "photo") {
+    return `🖼️ Foto${settings.caption ? " + caption" : " tanpa caption"}`;
+  }
+
+  return `📝 Teks${settings.message ? "" : " (kosong)"}`;
 }
 
-function scheduleAccount(accountId, delay = 0) {
-  // Jangan buat scheduler kedua
-  stopScheduler(accountId);
+function settingsSummary(account, settings) {
+  return [
+    `📱 <b>${escapeHtml(account.label)}</b>`,
+    `🆔 ID internal: <code>${escapeHtml(account.id)}</code>`,
+    `🔗 Telegram ID: <code>${escapeHtml(account.telegram_user_id || "belum")}</code>`,
+    `📌 Koneksi: <b>${escapeHtml(account.status || "-")}</b>`,
+    `▶️ Promosi: <b>${settings?.promotion_enabled ? "RUNNING" : "STOPPED"}</b>`,
+    `📝 Format: <b>${escapeHtml(settingsFormatText(settings))}</b>`,
+    `⏱ Jeda: <b>${escapeHtml(formatInterval(settings?.delay_minutes))}</b>`,
+    `📅 Durasi: <b>${escapeHtml(formatDuration(settings?.duration_hours))}</b>`,
+    settings?.promotion_expires_at
+      ? `⌛ Berakhir: <b>${escapeHtml(formatDate(settings.promotion_expires_at))}</b>`
+      : null,
+    account.phone
+      ? `☎️ Nomor: <code>${escapeHtml(account.phone)}</code>`
+      : null
+  ].filter(Boolean).join("\n");
+}
 
-  const handle = setTimeout(async () => {
-    schedulers.delete(accountId);
-    try { await fireAccount(accountId); }
-    catch (e) { console.error("FIRE:", accountId, e?.message || e); }
+/* =========================================================
+   HISTORY / AUDIT
+========================================================= */
 
-    // cek masih aktif?
-    let s = null;
-    try { s = await getSettings(accountId); } catch (_) {}
-    if (s?.active && s.expires_at && new Date(s.expires_at) > new Date()) {
-      const nextDelay = Math.max(1000, Number(s.interval_minutes || 10) * 60 * 1000);
-      scheduleAccount(accountId, nextDelay);
-    } else {
-      if (s?.active) {
-        try {
-          await sb.from("account_settings")
-            .update({ active: false }).eq("account_id", accountId);
-        } catch (_) {}
-      }
-      schedulers.delete(accountId);
+async function recordHistory(accountId, adminId, payload = {}) {
+  try {
+    let account = null;
+    if (accountId && !payload.accountLabel) {
+      account = await getAccount(accountId);
     }
-  }, Math.max(0, delay));
 
-  schedulers.set(accountId, { timer: handle });
+    let adminRow = null;
+    if (adminId && !payload.adminTelegramUserId) {
+      adminRow = await sb
+        .from("admins")
+        .select("id,telegram_user_id,first_name,username")
+        .eq("id", adminId)
+        .maybeSingle();
+
+      if (adminRow.error) throw adminRow.error;
+      adminRow = adminRow.data;
+    }
+
+    let groupTitle = payload.groupTitle || null;
+
+    if (payload.groupId && !groupTitle) {
+      const group = await sb
+        .from("account_groups")
+        .select("title")
+        .eq("id", payload.groupId)
+        .maybeSingle();
+
+      if (!group.error) groupTitle = group.data?.title || null;
+    }
+
+    const row = {
+      account_id: account?.id || accountId || null,
+      account_label: account?.label || payload.accountLabel || "Account",
+      admin_id: adminRow?.id || adminId || null,
+      admin_telegram_user_id: adminRow?.telegram_user_id || payload.adminTelegramUserId || null,
+      group_id: payload.groupId || null,
+      group_title: groupTitle,
+      action_type: payload.actionType,
+      status: payload.status || "success",
+      error: payload.error ? String(payload.error).slice(0, 1000) : null,
+      details: payload.details || {},
+      legacy_source: payload.legacySource || null,
+      legacy_source_id: payload.legacySourceId || null
+    };
+
+    const { error } = await sb.from("promotion_history").insert(row);
+    if (error) console.error("HISTORY INSERT:", error);
+  } catch (e) {
+    console.error("HISTORY:", safeErrorMessage(e));
+  }
 }
 
-function failureReason(error) {
+async function renderHistory(ctx, accountId, page = 0) {
+  const account = await accountHasAccess(accountId);
+  if (!account) {
+    return replaceUi(
+      ctx,
+      "❌ Account tidak ditemukan.",
+      backDashboardKeyboard(),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  const offset = page * HISTORY_PAGE_SIZE;
+
+  const [{ data: rows, error }, { count, error: countError }] = await Promise.all([
+    sb
+      .from("promotion_history")
+      .select(
+        "id,account_id,account_label,admin_id,admin_telegram_user_id,group_id,group_title,action_type,status,error,details,created_at"
+      )
+      .eq("account_id", accountId)
+      .order("created_at", { ascending: false })
+      .range(offset, offset + HISTORY_PAGE_SIZE),
+    sb
+      .from("promotion_history")
+      .select("*", { count: "exact", head: true })
+      .eq("account_id", accountId)
+  ]);
+
+  if (error) throw error;
+  if (countError) throw countError;
+
+  const visible = (rows || []).slice(0, HISTORY_PAGE_SIZE);
+  const total = Number(count || 0);
+  const hasNext = offset + HISTORY_PAGE_SIZE < total;
+
+  const adminIds = [...new Set(visible.map(x => x.admin_id).filter(Boolean))];
+  const groupIds = [...new Set(visible.map(x => x.group_id).filter(Boolean))];
+
+  const [adminsResult, groupsResult] = await Promise.all([
+    adminIds.length
+      ? sb.from("admins").select("id,telegram_user_id,first_name,username").in("id", adminIds)
+      : Promise.resolve({ data: [], error: null }),
+    groupIds.length
+      ? sb.from("account_groups").select("id,title").in("id", groupIds)
+      : Promise.resolve({ data: [], error: null })
+  ]);
+
+  if (adminsResult.error) throw adminsResult.error;
+  if (groupsResult.error) throw groupsResult.error;
+
+  const adminMap = new Map(
+    (adminsResult.data || []).map(x => [String(x.id), x])
+  );
+  const groupMap = new Map(
+    (groupsResult.data || []).map(x => [String(x.id), x.title])
+  );
+
+  const lines = [];
+
+  for (const [index, row] of visible.entries()) {
+    const status = row.status === "success" ? "✅" : row.status === "error" ? "❌" : "ℹ️";
+    const admin = adminMap.get(String(row.admin_id));
+    const adminLabel = row.admin_telegram_user_id
+      ? String(row.admin_telegram_user_id)
+      : admin?.telegram_user_id
+        ? String(admin.telegram_user_id)
+        : "legacy/unknown";
+    const groupTitle = row.group_title || groupMap.get(String(row.group_id)) || "-";
+
+    const errorLine = row.error
+      ? `\n⚠️ ${escapeHtml(String(row.error).slice(0, 120))}`
+      : "";
+
+    lines.push(
+      `${status} <b>#${offset + index + 1}</b> • <b>${escapeHtml(row.action_type)}</b>\n` +
+      `👤 Admin: <code>${escapeHtml(adminLabel)}</code>\n` +
+      `👥 Target: <b>${escapeHtml(groupTitle)}</b>\n` +
+      `🕐 ${escapeHtml(formatDate(row.created_at))}${errorLine}`
+    );
+  }
+
+  const text = [
+    `📋 <b>RIWAYAT • ${escapeHtml(account.label)}</b>`,
+    `Total log: <b>${total}</b>`,
+    `Halaman: <b>${page + 1}</b>`,
+    "",
+    lines.length ? lines.join("\n\n") : "<i>Belum ada riwayat.</i>"
+  ].join("\n");
+
+  return replaceUi(
+    ctx,
+    text,
+    historyKeyboard(accountId, page, hasNext),
+    { parse_mode: "HTML" }
+  );
+}
+
+/* =========================================================
+   SCHEDULER / PROMOTION ENGINE
+========================================================= */
+
+function extractFloodWaitMs(error) {
+  if (!error) return 0;
+  const direct = Number(error.seconds || error.value || 0);
+  if (Number.isFinite(direct) && direct > 0 && direct < 86400) {
+    return direct * 1000 + 1000;
+  }
+
+  const text = String(error.message || error || "");
+  const match = text.match(/(?:FLOOD_WAIT|wait of)\s*(\d+)\s*(?:seconds?|s)?/i);
+  if (!match) return 0;
+
+  const seconds = Number(match[1]);
+  if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 86400) return 0;
+  return seconds * 1000 + 1000;
+}
+
+function classifySendError(error) {
   const raw = String(error?.message || error || "").trim();
   const msg = raw.toLowerCase();
-  if (msg.includes("chat_write_forbidden") || msg.includes("chat_send_plain_forbidden") ||
-      msg.includes("not enough rights") || msg.includes("can't write") ||
-      msg.includes("can't send") || msg.includes("forbidden"))
+
+  if (
+    msg.includes("chat_write_forbidden") ||
+    msg.includes("chat_send_plain_forbidden") ||
+    msg.includes("not enough rights") ||
+    msg.includes("can't write") ||
+    msg.includes("can't send") ||
+    msg.includes("forbidden")
+  ) {
     return "Tidak diizinkan mengirim pesan";
-  if (msg.includes("user_banned_in_channel") || msg.includes("banned"))
-    return "Akun tidak diizinkan mengirim";
-  if (msg.includes("chat_admin_required") || msg.includes("admin required") ||
-      msg.includes("administrator"))
-    return "Butuh izin admin";
-  if (msg.includes("chat_restricted") || msg.includes("restricted"))
-    return "Grup dibatasi";
-  if (msg.includes("channel_private") || msg.includes("chat_id_invalid") ||
-      msg.includes("chat not found") || msg.includes("group not found"))
-    return "Grup tidak dapat diakses";
-  if (msg.includes("flood_wait") || msg.includes("floodwait") || msg.includes("a wait of"))
-    return "Telegram minta tunggu (flood)";
-  return raw ? raw.replace(/\s+/g, " ").slice(0, 120) : "Kesalahan tidak diketahui";
+  }
+
+  if (
+    msg.includes("user_banned_in_channel") ||
+    msg.includes("banned")
+  ) {
+    return "Akun tidak diizinkan mengirim pesan";
+  }
+
+  if (
+    msg.includes("chat_admin_required") ||
+    msg.includes("admin required") ||
+    msg.includes("administrator")
+  ) {
+    return "Tidak memiliki izin yang diperlukan";
+  }
+
+  if (
+    msg.includes("chat_restricted") ||
+    msg.includes("restricted")
+  ) {
+    return "Group sedang dibatasi";
+  }
+
+  if (
+    msg.includes("channel_private") ||
+    msg.includes("chat_id_invalid") ||
+    msg.includes("chat not found") ||
+    msg.includes("group not found") ||
+    msg.includes("entity") && msg.includes("not found")
+  ) {
+    return "Group tidak dapat diakses";
+  }
+
+  if (extractFloodWaitMs(error) > 0) {
+    return "Telegram meminta menunggu sebelum mengirim lagi";
+  }
+
+  return raw ? raw.replace(/\s+/g, " ").slice(0, 160) : "Kesalahan tidak diketahui";
 }
 
 async function fireAccount(accountId) {
-  const settings = await getSettings(accountId);
-  if (!settings || !settings.active) return;
-  if (!settings.expires_at || new Date(settings.expires_at) <= new Date()) {
-    await sb.from("account_settings").update({ active: false }).eq("account_id", accountId);
-    return;
-  }
-  const acc = await getAccount(accountId);
-  if (!acc) return;
+  const account = await getAccount(accountId);
+  const settings = await getAccountSettings(accountId);
 
-  const cl = await clientForAccount(acc);
-  if (!cl) {
-    await sb.from("promotion_history").insert({
-      account_id: accountId, account_label: acc.label,
-      action: "send", status: "failed",
-      error: "Akun Telegram tidak terhubung.",
+  if (!account || !settings?.promotion_enabled) {
+    return { shouldContinue: false, delayMs: 0 };
+  }
+
+  const now = new Date();
+  if (
+    !settings.promotion_expires_at ||
+    new Date(settings.promotion_expires_at) <= now
+  ) {
+    await sb
+      .from("account_settings")
+      .update({
+        promotion_enabled: false,
+        promotion_expires_at: null,
+        promotion_started_at: null,
+        started_by_admin_id: null
+      })
+      .eq("account_id", accountId);
+
+    return { shouldContinue: false, delayMs: 0 };
+  }
+
+  let starterAdminTelegramId = null;
+  if (settings.started_by_admin_id) {
+    const starter = await sb
+      .from("admins")
+      .select("telegram_user_id")
+      .eq("id", settings.started_by_admin_id)
+      .maybeSingle();
+    if (!starter.error) starterAdminTelegramId = starter.data?.telegram_user_id || null;
+  }
+
+  const client = await clientFor(accountId);
+  if (!client) {
+    await markAccountStatus(accountId, "error");
+    await recordHistory(accountId, settings.started_by_admin_id, {
+      accountLabel: account.label,
+      adminTelegramUserId: starterAdminTelegramId,
+      actionType: "promotion_send",
+      status: "error",
+      error: "Akun Telegram tidak terhubung atau session tidak valid.",
+      details: { retryInSeconds: 120 }
     });
-    return;
+
+    return { shouldContinue: true, delayMs: 120000 };
   }
 
-  // Ambil group enabled
-  const { data: groups, error: gErr } = await sb
-    .from("account_groups").select("*")
-    .eq("account_id", accountId).eq("enabled", true).eq("can_send", true);
-  if (gErr) { console.error("FIRE GROUPS:", gErr); return; }
-  if (!groups?.length) return;
+  let groupsResult = await sb
+    .from("account_groups")
+    .select("id,telegram_group_id,title,can_send,enabled")
+    .eq("account_id", accountId)
+    .eq("enabled", true)
+    .eq("can_send", true)
+    .order("title", { ascending: true });
 
-  // Map entity
-  let dialogs = [];
-  try { dialogs = await cl.getDialogs({ limit: 500 }); }
-  catch (e) { console.error("DIALOG FETCH:", e?.message || e); }
+  if (groupsResult.error) throw groupsResult.error;
 
+  const groups = groupsResult.data || [];
+
+  if (!groups.length) {
+    await recordHistory(accountId, settings.started_by_admin_id, {
+      accountLabel: account.label,
+      adminTelegramUserId: starterAdminTelegramId,
+      actionType: "promotion_send",
+      status: "skipped",
+      error: "Tidak ada target grup aktif.",
+      details: {}
+    });
+
+    return {
+      shouldContinue: true,
+      delayMs: Number(settings.delay_minutes || 10) * 60 * 1000
+    };
+  }
+
+  const dialogs = await client.getDialogs({ limit: 500 });
   const entityMap = new Map();
-  for (const d of dialogs) {
-    if (!d.entity || (!d.isGroup && !d.isChannel)) continue;
-    const rawId = String(d.entity.id?.value ?? d.entity.id);
-    entityMap.set(rawId, d.entity);
+
+  for (const dialog of dialogs) {
+    const entity = dialog?.entity;
+    if (!entity) continue;
+    if (!dialog.isGroup && !dialog.isChannel) continue;
+
+    const rawId = String(entity.id?.value ?? entity.id ?? "");
+    if (rawId) entityMap.set(rawId, entity);
   }
 
-  // Siapkan foto
   let photoBuffer = null;
-  if (settings.media_file_id) {
-    try { photoBuffer = await downloadBotPhoto(settings.media_file_id); }
-    catch (e) {
-      console.error("FOTO:", e?.message || e);
-      return;
+  if (settings.format_type === "photo" && settings.media_file_id) {
+    try {
+      photoBuffer = await downloadBotPhoto(settings.media_file_id);
+    } catch (e) {
+      const reason = safeErrorMessage(e);
+      await recordHistory(accountId, settings.started_by_admin_id, {
+        accountLabel: account.label,
+        adminTelegramUserId: starterAdminTelegramId,
+        actionType: "promotion_send",
+        status: "error",
+        error: `Foto format gagal diambil: ${reason}`,
+        details: { media: true }
+      });
+
+      return {
+        shouldContinue: true,
+        delayMs: Number(settings.delay_minutes || 10) * 60 * 1000
+      };
     }
   }
 
-  let success = 0, failed = 0;
+  let successCount = 0;
+  let failCount = 0;
+  let skippedCount = 0;
+  let floodWaitMs = 0;
+  const failures = new Map();
 
-  for (const g of groups) {
-    let ok = false, errMsg = null;
+  for (const group of groups) {
+    const target = entityMap.get(String(group.telegram_group_id));
+
+    if (!target) {
+      skippedCount++;
+      const reason = "Entity grup tidak ditemukan di dialog Telegram";
+      failures.set(reason, (failures.get(reason) || 0) + 1);
+      await recordHistory(accountId, settings.started_by_admin_id, {
+        accountLabel: account.label,
+        adminTelegramUserId: starterAdminTelegramId,
+        actionType: "promotion_send",
+        status: "error",
+        groupId: group.id,
+        groupTitle: group.title,
+        error: reason,
+        details: { telegram_group_id: group.telegram_group_id }
+      });
+      continue;
+    }
+
     try {
-      const target = entityMap.get(String(g.telegram_group_id));
-      if (!target) throw new Error(`Entity ${g.telegram_group_id} tidak ditemukan di dialog.`);
-      if (settings.media_file_id && photoBuffer) {
-        await cl.sendFile(target, {
+      if (settings.format_type === "photo" && photoBuffer) {
+        await client.sendFile(target, {
           file: photoBuffer,
           caption: settings.caption || "",
-          forceDocument: false,
+          forceDocument: false
         });
       } else {
-        await cl.sendMessage(target, { message: settings.message || "" });
-      }
-      ok = true;
-    } catch (e) {
-      errMsg = failureReason(e);
-    }
+        const message = String(settings.message || "").trim();
+        if (!message) {
+          throw new Error("Format teks kosong.");
+        }
 
-    if (ok) {
-      success++;
-      try {
-        await sb.from("promotion_history").insert({
-          account_id: accountId, account_label: acc.label,
-          group_id: g.id, group_title: g.title,
-          action: "send", status: "success",
-        });
-      } catch (e) { console.error("LOG SUCCESS:", e?.message || e); }
-    } else {
-      failed++;
-      try {
-        await sb.from("promotion_history").insert({
-          account_id: accountId, account_label: acc.label,
-          group_id: g.id, group_title: g.title,
-          action: "send", status: "failed",
-          error: errMsg ? String(errMsg).slice(0, 500) : null,
-        });
-      } catch (e) { console.error("LOG FAIL:", e?.message || e); }
+        await client.sendMessage(target, { message });
+      }
+
+      successCount++;
+      await recordHistory(accountId, settings.started_by_admin_id, {
+        accountLabel: account.label,
+        adminTelegramUserId: starterAdminTelegramId,
+        actionType: "promotion_send",
+        status: "success",
+        groupId: group.id,
+        groupTitle: group.title,
+        details: {
+          format: settings.format_type,
+          telegram_group_id: group.telegram_group_id
+        }
+      });
+    } catch (e) {
+      failCount++;
+      const reason = classifySendError(e);
+      failures.set(reason, (failures.get(reason) || 0) + 1);
+      floodWaitMs = Math.max(floodWaitMs, extractFloodWaitMs(e));
+
+      await recordHistory(accountId, settings.started_by_admin_id, {
+        accountLabel: account.label,
+        adminTelegramUserId: starterAdminTelegramId,
+        actionType: "promotion_send",
+        status: "error",
+        groupId: group.id,
+        groupTitle: group.title,
+        error: safeErrorMessage(e, 1000),
+        details: {
+          reason,
+          telegram_group_id: group.telegram_group_id
+        }
+      });
     }
   }
 
-  // Ringkasan singkat ke chat admin yang membuat akun
-  if (acc.created_by) {
+  const reportLines = [
+    `📊 <b>${escapeHtml(account.label)}</b>`,
+    `✅ Berhasil: <b>${successCount}</b>`,
+    `❌ Gagal: <b>${failCount}</b>`,
+    `ℹ️ Dilewati: <b>${skippedCount}</b>`
+  ];
+
+  if (failures.size) {
+    reportLines.push("", "⚠️ <b>Alasan:</b>");
+    for (const [reason, count] of failures) {
+      reportLines.push(`• ${count} × ${escapeHtml(reason)}`);
+    }
+  }
+
+  if (starterAdminTelegramId) {
     try {
       await bot.api.sendMessage(
-        acc.created_by,
-        `📊 <b>Laporan Promosi</b>\n\n` +
-        `👤 Akun  : <b>${escapeHtml(acc.label)}</b>\n` +
-        `✅ Sukses: <b>${success}</b>\n` +
-        `❌ Gagal : <b>${failed}</b>\n` +
-        `📅 ${new Date().toLocaleString("id-ID")}`,
+        starterAdminTelegramId,
+        reportLines.join("\n"),
         { parse_mode: "HTML" }
       );
     } catch (_) {}
   }
+
+  const baseDelay = Number(settings.delay_minutes || 10) * 60 * 1000;
+  const delayMs = Math.max(baseDelay, floodWaitMs);
+
+  return { shouldContinue: true, delayMs };
 }
 
-/* =========================
-   RESTORE ON STARTUP
-========================= */
-async function seedAdminsFromEnv() {
-  if (!SEED_ADMIN_IDS.length) return;
-  const { count } = await sb.from("admins")
-    .select("*", { count: "exact", head: true });
-  if (count && count > 0) return;
+function scheduleAccount(accountId, delayMs = 0) {
+  const key = String(accountId);
+  const oldTask = schedulerTasks.get(key);
 
-  const primary = SEED_ADMIN_IDS[0];
-  const rows = SEED_ADMIN_IDS.map((id, i) => ({
-    telegram_user_id: Number(id),
-    role: i === 0 ? "owner" : "admin",
-    note: i === 0 ? "Owner (seed)" : "Admin (seed)",
-  }));
-  const { error } = await sb.from("admins").insert(rows);
-  if (error) console.error("SEED ADMIN:", error);
-  else console.log(`Seeded ${rows.length} admin(s). Owner=${primary}`);
-}
+  if (oldTask?.timeout) clearTimeout(oldTask.timeout);
 
-async function restoreSessions() {
-  const { data, error } = await sb
-    .from("telegram_accounts").select("*").eq("status", "connected");
-  if (error) { console.error("RESTORE SESSIONS:", error); return; }
-  for (const acc of data || []) {
+  const task = {
+    running: true,
+    timeout: null
+  };
+
+  schedulerTasks.set(key, task);
+
+  task.timeout = setTimeout(async () => {
+    if (schedulerTasks.get(key) !== task || !task.running) return;
+
+    let nextDelay = 60000;
+    let shouldContinue = true;
+
     try {
-      const c = await createTelegramClient(acc.session_string);
-      await c.connect();
-      if (await c.checkAuthorization()) clients.set(acc.id, c);
-      else {
-        try { await c.disconnect(); } catch (_) {}
-        console.warn(`Session akun ${acc.id} tidak authorized.`);
-      }
+      const result = await fireAccount(accountId);
+      nextDelay = Number(result?.delayMs || 60000);
+      shouldContinue = result?.shouldContinue !== false;
     } catch (e) {
-      console.warn(`Reconnect akun ${acc.id} gagal:`, e?.message || e);
-    }
-  }
-}
+      console.error(`PROMOTION ${key}:`, safeErrorMessage(e));
+      const settings = await getAccountSettings(accountId).catch(() => null);
 
-async function restoreSchedules() {
-  const { data, error } = await sb
-    .from("account_settings").select("*").eq("active", true);
-  if (error) { console.error("RESTORE SCHED:", error); return; }
-  for (const s of data || []) {
-    if (s.expires_at && new Date(s.expires_at) > new Date()) {
-      scheduleAccount(s.account_id, 0);
-    } else {
-      await sb.from("account_settings").update({ active: false }).eq("account_id", s.account_id);
-    }
-  }
-}
-
-/* =========================
-   CALLBACK: HOME / STATS / INFO
-========================= */
-bot.callbackQuery("home", async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  return renderStart(ctx, await textHome(a), homeMenu(a.role === "owner"));
-});
-
-bot.callbackQuery("stats", async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-
-  const { data } = await sb.from("admin_dashboard_stats").select("*").maybeSingle();
-  const s = data || {};
-  const text = [
-    `📊 <b>STATISTIK SISTEM</b>`, ``,
-    `👨‍💼 Admin            : <b>${s.total_admins || 0}</b>`,
-    `👑 Owner            : <b>${s.total_owners || 0}</b>`,
-    `👤 Akun Telegram    : <b>${s.total_accounts || 0}</b>`,
-    `🟢 Akun Terhubung   : <b>${s.connected_accounts || 0}</b>`,
-    `▶️ Promosi Aktif    : <b>${s.running_promotions || 0}</b>`,
-    `👥 Total Grup       : <b>${s.total_groups || 0}</b>`,
-    `✅ Grup Enabled     : <b>${s.enabled_groups || 0}</b>`,
-    `📋 Total Riwayat    : <b>${s.total_history || 0}</b>`,
-    `✅ Sukses           : <b>${s.success_history || 0}</b>`,
-    `❌ Gagal            : <b>${s.failed_history || 0}</b>`,
-  ].join("\n");
-  return renderUi(ctx.from.id, text, backHomeMenu(), { parse_mode: "HTML" });
-});
-
-bot.callbackQuery("info", async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const text = [
-    `ℹ️ <b>INFO BOT</b>`, ``,
-    `Version  : <b>v${escapeHtml(BOT_VERSION)}</b>`,
-    `Runtime  : Node ${process.version}`,
-    `Mode     : Single Admin Bot · Multi Telegram Account`,
-    ``,
-    `Fitur    :`,
-    `• Multi akun Telegram unlimited`,
-    `• Grup per akun`,
-    `• Format per akun (teks / foto + caption)`,
-    `• Delay & durasi per akun`,
-    `• Start/Stop independen`,
-    `• Scheduler aman (tidak dobel)`,
-    `• Riwayat promosi`,
-  ].join("\n");
-  return renderUi(ctx.from.id, text, backHomeMenu(), { parse_mode: "HTML" });
-});
-
-/* =========================
-   CALLBACK: AKUN
-========================= */
-bot.callbackQuery(/^acc:list:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-
-  const page = Number(ctx.match[1] || 0);
-  try {
-    const rows = await listAccounts(page, 10);
-    if (!rows.length && page === 0) {
-      return renderUi(ctx.from.id,
-        "👤 <b>Daftar Akun Telegram</b>\n\nBelum ada akun.\nTambahkan akun Telegram untuk mulai.",
-        new InlineKeyboard().text("➕ Tambah Akun", "acc:add")
-          .row().text("🏠 Menu Utama", "home"),
-        { parse_mode: "HTML" });
-    }
-    const lines = rows.map((x, i) => {
-      const idx = page * 10 + i + 1;
-      const icon = x.status === "connected" ? "🟢" : x.status === "error" ? "🔴" : "⚪";
-      return `${icon} <b>${idx}. ${escapeHtml(x.label)}</b>\n   📱 ${escapeHtml(x.phone || "-")} · 🆔 <code>${x.id}</code>`;
-    });
-    const text = `👤 <b>Daftar Akun Telegram</b>\n\nHalaman ${page + 1}\n\n` +
-      lines.join("\n\n") + "\n\n👇 Pilih akun untuk kelola.";
-    return renderUi(ctx.from.id, text, accountListMenu(rows, page), { parse_mode: "HTML" });
-  } catch (e) {
-    return renderUi(ctx.from.id,
-      `❌ Gagal memuat akun: ${escapeHtml(String(e.message || e).slice(0, 400))}`,
-      backHomeMenu(), { parse_mode: "HTML" });
-  }
-});
-
-bot.callbackQuery("acc:add", async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  flows.set(ctx.from.id, { t: "acc:add:label" });
-  return renderUi(ctx.from.id,
-    "➕ <b>Tambah Akun Telegram</b>\n\nLangkah 1/2\nKirim <b>nama/label</b> akun.\n\nContoh: <i>Akun Promosi 1</i>",
-    cancelFlowMenu(), { parse_mode: "HTML" });
-});
-
-bot.callbackQuery(/^acc:v:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-
-  const id = Number(ctx.match[1]);
-  try {
-    const acc = await getAccount(id);
-    if (!acc) return renderUi(ctx.from.id, "❌ Akun tidak ditemukan.", backHomeMenu());
-
-    const settings = await getSettings(id);
-    const { count: grpCount } = await sb
-      .from("account_groups").select("*", { count: "exact", head: true }).eq("account_id", id);
-    const { count: enabledCount } = await sb
-      .from("account_groups").select("*", { count: "exact", head: true })
-      .eq("account_id", id).eq("enabled", true);
-
-    const statusIcon = acc.status === "connected" ? "🟢 Terhubung" :
-                       acc.status === "error" ? "🔴 Error" : "⚪ Terputus";
-
-    let fmt;
-    if (!settings) fmt = "Belum dibuat";
-    else if (settings.media_file_id) fmt = `🖼 Foto${settings.caption ? " + caption" : ""}`;
-    else if (settings.message) fmt = `📝 Teks`;
-    else fmt = "Belum dibuat";
-
-    const text = [
-      `👤 <b>${escapeHtml(acc.label)}</b>`,
-      `<pre>🆔 ID Internal : ${acc.id}
-📱 Phone       : ${escapeHtml(acc.phone || "-")}
-🔗 Username    : ${escapeHtml(acc.username || "-")}
-🤖 TG User ID  : ${escapeHtml(acc.telegram_user_id || "-")}
-🔌 Status      : ${statusIcon}</pre>`,
-      ``,
-      `╭─ <b>SETTING</b> ─╮`,
-      `📝 Format   : ${fmt}`,
-      `⏱ Delay    : <b>${formatInterval(settings?.interval_minutes)}</b>`,
-      `📅 Durasi   : <b>${formatDuration(settings?.duration_hours)}</b>`,
-      `📌 Promosi  : <b>${settings?.active ? "RUNNING" : "STOPPED"}</b>`,
-      `👥 Grup     : <b>${enabledCount || 0}</b>/${grpCount || 0} aktif`,
-      `╰──────────────╯`,
-    ].join("\n");
-    return renderUi(ctx.from.id, text,
-      accountDetailMenu(id, settings?.active), { parse_mode: "HTML" });
-  } catch (e) {
-    return renderUi(ctx.from.id,
-      `❌ ${escapeHtml(String(e.message || e).slice(0, 400))}`,
-      backHomeMenu(), { parse_mode: "HTML" });
-  }
-});
-
-bot.callbackQuery(/^acc:del:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const id = Number(ctx.match[1]);
-  const acc = await getAccount(id).catch(() => null);
-  if (!acc) return renderUi(ctx.from.id, "❌ Akun tidak ditemukan.", backHomeMenu());
-  return renderUi(ctx.from.id,
-    `⚠️ <b>Hapus Akun?</b>\n\n${escapeHtml(acc.label)}\n\nSemua grup & setting akan dihapus.`,
-    new InlineKeyboard()
-      .text("🗑 Ya, Hapus", `acc:delc:${id}`)
-      .row().text("⬅️ Batal", `acc:v:${id}`),
-    { parse_mode: "HTML" });
-});
-
-bot.callbackQuery(/^acc:delc:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery("Menghapus...");
-  const id = Number(ctx.match[1]);
-
-  // stop scheduler + client
-  stopScheduler(id);
-  const c = clients.get(id);
-  if (c) {
-    try { await c.disconnect(); } catch (_) {}
-    clients.delete(id);
-  }
-
-  try {
-    const acc = await getAccount(id);
-    await sb.from("telegram_accounts").delete().eq("id", id);
-    try {
-      await sb.from("promotion_history").insert({
-        account_label: acc?.label || `#${id}`,
-        action: "delete", status: "success", admin_id: a.telegram_user_id,
+      await recordHistory(accountId, settings?.started_by_admin_id || null, {
+        actionType: "promotion_send",
+        status: "error",
+        error: safeErrorMessage(e, 1000)
       });
-    } catch (_) {}
-    return renderUi(ctx.from.id, "✅ Akun berhasil dihapus.",
-      new InlineKeyboard().text("⬅️ Daftar Akun", "acc:list:0")
-        .row().text("🏠 Menu Utama", "home"));
-  } catch (e) {
-    return renderUi(ctx.from.id,
-      `❌ Gagal hapus: ${escapeHtml(String(e.message || e).slice(0, 400))}`,
-      backHomeMenu(), { parse_mode: "HTML" });
-  }
-});
 
-bot.callbackQuery(/^acc:disc:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery("Memutuskan...");
-  const id = Number(ctx.match[1]);
-
-  const c = clients.get(id);
-  if (c) { try { await c.disconnect(); } catch (_) {} clients.delete(id); }
-  stopScheduler(id);
-
-  try {
-    await sb.from("telegram_accounts").update({
-      status: "disconnected", session_string: null,
-    }).eq("id", id);
-    await sb.from("account_settings").update({ active: false }).eq("account_id", id);
-    await sb.from("promotion_history").insert({
-      account_id: id, action: "disconnect", status: "success",
-      admin_id: a.telegram_user_id,
-    });
-  } catch (e) { console.error("DISC:", e); }
-
-  return renderUi(ctx.from.id,
-    "🔌 Akun diputuskan dan session dihapus.",
-    new InlineKeyboard().text("👤 Detail", `acc:v:${id}`)
-      .row().text("⬅️ Daftar Akun", "acc:list:0"),
-    { parse_mode: "HTML" });
-});
-
-/* =========================
-   CALLBACK: GROUP
-========================= */
-bot.callbackQuery(/^grp:list:(\d+):(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const accId = Number(ctx.match[1]);
-  const page = Number(ctx.match[2] || 0);
-
-  try {
-    const acc = await getAccount(accId);
-    if (!acc) return renderUi(ctx.from.id, "❌ Akun tidak ditemukan.", backHomeMenu());
-    const rows = await listGroups(accId, page, 10);
-    if (!rows.length && page === 0) {
-      return renderUi(ctx.from.id,
-        `👥 <b>Grup — ${escapeHtml(acc.label)}</b>\n\nBelum ada grup tersimpan.\nTekan Refresh untuk scan grup.`,
-        new InlineKeyboard()
-          .text("🔄 Refresh Grup", `grp:rf:${accId}`)
-          .row().text("⬅️ Kembali", `acc:v:${accId}`),
-        { parse_mode: "HTML" });
-    }
-    const enabled = rows.filter(x => x.enabled).length;
-    const text = `👥 <b>Grup — ${escapeHtml(acc.label)}</b>\n\n` +
-      `Halaman ${page + 1} · Aktif <b>${enabled}</b>/${rows.length}\n\n` +
-      `Klik untuk ON/OFF.`;
-    return renderUi(ctx.from.id, text, groupMenu(rows, accId, page), { parse_mode: "HTML" });
-  } catch (e) {
-    return renderUi(ctx.from.id,
-      `❌ ${escapeHtml(String(e.message || e).slice(0, 400))}`,
-      backHomeMenu(), { parse_mode: "HTML" });
-  }
-});
-
-bot.callbackQuery(/^grp:rf:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery("Scan grup...");
-  const accId = Number(ctx.match[1]);
-
-  try {
-    const acc = await getAccount(accId);
-    if (!acc) return renderUi(ctx.from.id, "❌ Akun tidak ditemukan.", backHomeMenu());
-    const count = (await refreshGroupsFor(acc)).length;
-    return renderUi(ctx.from.id,
-      `✅ Berhasil scan <b>${count}</b> grup.\nSilakan atur target.`,
-      new InlineKeyboard()
-        .text("👥 Lihat Grup", `grp:list:${accId}:0`)
-        .row().text("⬅️ Kembali", `acc:v:${accId}`),
-      { parse_mode: "HTML" });
-  } catch (e) {
-    return renderUi(ctx.from.id,
-      `❌ Gagal scan: ${escapeHtml(String(e.message || e).slice(0, 400))}`,
-      new InlineKeyboard().text("⬅️ Kembali", `acc:v:${accId}`)
-        .row().text("🏠 Menu Utama", "home"),
-      { parse_mode: "HTML" });
-  }
-});
-
-bot.callbackQuery(/^grp:tgl:(\d+):(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const accId = Number(ctx.match[1]);
-  const grpId = Number(ctx.match[2]);
-
-  try {
-    const { data: g } = await sb.from("account_groups")
-      .select("*").eq("id", grpId).eq("account_id", accId).maybeSingle();
-    if (!g) return ctx.answerCallbackQuery({ text: "Grup tidak ditemukan.", show_alert: true });
-
-    await sb.from("account_groups").update({ enabled: !g.enabled }).eq("id", grpId);
-    await ctx.answerCallbackQuery(g.enabled ? "Dinonaktifkan" : "Diaktifkan");
-
-    const rows = await listGroups(accId, 0, 10);
-    const text = `👥 <b>Grup</b>\n\nKlik untuk ON/OFF.`;
-    return renderUi(ctx.from.id, text, groupMenu(rows, accId, 0), { parse_mode: "HTML" });
-  } catch (e) {
-    return ctx.answerCallbackQuery({ text: "Gagal update.", show_alert: true });
-  }
-});
-
-/* =========================
-   CALLBACK: FORMAT
-========================= */
-bot.callbackQuery(/^fmt:show:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const accId = Number(ctx.match[1]);
-  const s = await getSettings(accId).catch(() => null);
-
-  let body = "Belum dibuat.";
-  if (s?.media_file_id) body = `🖼 <b>Foto</b>${s.caption ? ` + caption\n\n${escapeHtml(s.caption).slice(0, 500)}` : ""}`;
-  else if (s?.message) body = `📝 <b>Teks</b>\n\n${escapeHtml(s.message).slice(0, 800)}`;
-
-  return renderUi(ctx.from.id,
-    `📝 <b>Format Promosi</b>\n\n${body}\n\nKirim format baru untuk mengganti:`,
-    new InlineKeyboard()
-      .text("✏️ Set Format Baru", `fmt:set:${accId}`)
-      .row().text("⬅️ Kembali", `acc:v:${accId}`),
-    { parse_mode: "HTML" });
-});
-
-bot.callbackQuery(/^fmt:set:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const accId = Number(ctx.match[1]);
-  flows.set(ctx.from.id, { t: "fmt:set", accId });
-  return renderUi(ctx.from.id,
-    "📝 <b>Set Format Promosi</b>\n\nKirim salah satu:\n\n• Teks biasa\n• Foto saja\n• Foto + caption",
-    cancelFlowMenu(), { parse_mode: "HTML" });
-});
-
-/* =========================
-   CALLBACK: DELAY & DURATION
-========================= */
-bot.callbackQuery(/^dly:set:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const accId = Number(ctx.match[1]);
-  flows.set(ctx.from.id, { t: "dly:set", accId });
-  return renderUi(ctx.from.id,
-    "⏱ <b>Set Delay</b>\n\nContoh: <b>10 menit</b> · <b>1 jam</b> · <b>30 menit</b>\n\nMinimal 1 menit.",
-    cancelFlowMenu(), { parse_mode: "HTML" });
-});
-
-bot.callbackQuery(/^dur:set:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const accId = Number(ctx.match[1]);
-  flows.set(ctx.from.id, { t: "dur:set", accId });
-  return renderUi(ctx.from.id,
-    "📅 <b>Set Durasi</b>\n\nContoh: <b>1 hari</b> · <b>12 jam</b> · <b>3 hari</b>",
-    cancelFlowMenu(), { parse_mode: "HTML" });
-});
-
-/* =========================
-   CALLBACK: START / STOP PROMOSI
-========================= */
-bot.callbackQuery(/^prm:start:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const accId = Number(ctx.match[1]);
-
-  try {
-    const acc = await getAccount(accId);
-    if (!acc) return renderUi(ctx.from.id, "❌ Akun tidak ditemukan.", backHomeMenu());
-    if (acc.status !== "connected")
-      return renderUi(ctx.from.id,
-        "❌ Akun Telegram belum terhubung.\nSilakan login ulang akun ini.",
-        new InlineKeyboard().text("⬅️ Kembali", `acc:v:${accId}`),
-        { parse_mode: "HTML" });
-
-    const s = await ensureSettings(accId);
-    if (!s.message && !s.media_file_id)
-      return renderUi(ctx.from.id, "❌ Format promosi belum dibuat.",
-        new InlineKeyboard().text("📝 Set Format", `fmt:set:${accId}`)
-          .row().text("⬅️ Kembali", `acc:v:${accId}`),
-        { parse_mode: "HTML" });
-    if (!s.interval_minutes || s.interval_minutes < 1)
-      return renderUi(ctx.from.id, "❌ Set delay dulu.",
-        new InlineKeyboard().text("⏱ Set Delay", `dly:set:${accId}`)
-          .row().text("⬅️ Kembali", `acc:v:${accId}`),
-        { parse_mode: "HTML" });
-    if (!s.duration_hours || s.duration_hours < 1)
-      return renderUi(ctx.from.id, "❌ Set durasi dulu.",
-        new InlineKeyboard().text("📅 Set Durasi", `dur:set:${accId}`)
-          .row().text("⬅️ Kembali", `acc:v:${accId}`),
-        { parse_mode: "HTML" });
-
-    const { count: enabledCount } = await sb
-      .from("account_groups").select("*", { count: "exact", head: true })
-      .eq("account_id", accId).eq("enabled", true).eq("can_send", true);
-    if (!enabledCount)
-      return renderUi(ctx.from.id, "❌ Belum ada grup target aktif.",
-        new InlineKeyboard().text("👥 Atur Grup", `grp:list:${accId}:0`)
-          .row().text("⬅️ Kembali", `acc:v:${accId}`),
-        { parse_mode: "HTML" });
-
-    // Cek scheduler dobel
-    if (schedulers.has(accId)) {
-      return renderUi(ctx.from.id,
-        "ℹ️ Promosi akun ini <b>sudah berjalan</b>.",
-        new InlineKeyboard().text("⏹ Stop", `prm:stop:${accId}`)
-          .row().text("⬅️ Kembali", `acc:v:${accId}`),
-        { parse_mode: "HTML" });
+      nextDelay = Math.max(
+        60000,
+        Number(settings?.delay_minutes || 10) * 60 * 1000
+      );
     }
 
-    const now = new Date();
-    const exp = new Date(now.getTime() + s.duration_hours * 3600 * 1000);
-    await sb.from("account_settings").update({
-      active: true, started_at: now.toISOString(), expires_at: exp.toISOString(),
-    }).eq("account_id", accId);
+    const latest = schedulerTasks.get(key);
+    if (latest !== task || !task.running) return;
 
-    // fire pertama langsung
-    try { await fireAccount(accId); } catch (e) { console.error("FIRST FIRE:", e); }
-    // jadwalkan berikutnya
-    scheduleAccount(accId, Math.max(1000, s.interval_minutes * 60 * 1000));
-
-    await sb.from("promotion_history").insert({
-      account_id: accId, account_label: acc.label,
-      action: "start", status: "success", admin_id: a.telegram_user_id,
-    });
-
-    return renderUi(ctx.from.id,
-      `▶️ <b>Promosi dimulai.</b>\n\n` +
-      `👤 Akun  : <b>${escapeHtml(acc.label)}</b>\n` +
-      `⏱ Delay : ${formatInterval(s.interval_minutes)}\n` +
-      `📅 Durasi: ${formatDuration(s.duration_hours)}\n` +
-      `👥 Grup  : ${enabledCount}`,
-      new InlineKeyboard().text("⏹ Stop", `prm:stop:${accId}`)
-        .row().text("⬅️ Kembali", `acc:v:${accId}`),
-      { parse_mode: "HTML" });
-  } catch (e) {
-    return renderUi(ctx.from.id,
-      `❌ Gagal memulai: ${escapeHtml(String(e.message || e).slice(0, 400))}`,
-      backHomeMenu(), { parse_mode: "HTML" });
-  }
-});
-
-bot.callbackQuery(/^prm:stop:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery("Menghentikan...");
-  const accId = Number(ctx.match[1]);
-
-  stopScheduler(accId);
-  try {
-    await sb.from("account_settings").update({ active: false }).eq("account_id", accId);
-    const acc = await getAccount(accId);
-    await sb.from("promotion_history").insert({
-      account_id: accId, account_label: acc?.label,
-      action: "stop", status: "success", admin_id: a.telegram_user_id,
-    });
-  } catch (e) { console.error("STOP:", e); }
-
-  return renderUi(ctx.from.id,
-    "⏹ <b>Promosi dihentikan.</b>",
-    new InlineKeyboard().text("▶️ Start Lagi", `prm:start:${accId}`)
-      .row().text("⬅️ Kembali", `acc:v:${accId}`),
-    { parse_mode: "HTML" });
-});
-
-/* =========================
-   CALLBACK: HISTORY
-========================= */
-bot.callbackQuery(/^his:(\d+):(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const accId = Number(ctx.match[1]);
-  const page = Number(ctx.match[2] || 0);
-  const perPage = 10;
-  const from = page * perPage, to = from + perPage - 1;
-
-  try {
-    const acc = await getAccount(accId);
-    if (!acc) return renderUi(ctx.from.id, "❌ Akun tidak ditemukan.", backHomeMenu());
-
-    const { data, error } = await sb
-      .from("promotion_history").select("*")
-      .eq("account_id", accId)
-      .order("created_at", { ascending: false })
-      .range(from, to);
-    if (error) throw error;
-
-    if (!data?.length && page === 0) {
-      return renderUi(ctx.from.id,
-        `📋 <b>Riwayat — ${escapeHtml(acc.label)}</b>\n\nBelum ada riwayat.`,
-        new InlineKeyboard().text("⬅️ Kembali", `acc:v:${accId}`)
-          .row().text("🏠 Menu Utama", "home"),
-        { parse_mode: "HTML" });
-    }
-
-    const lines = data.map((h, i) => {
-      const idx = page * perPage + i + 1;
-      const icon = h.status === "success" ? "✅" : h.status === "failed" ? "❌" : "ℹ️";
-      const when = new Date(h.created_at).toLocaleString("id-ID");
-      let line = `${icon} <b>#${idx}</b> · ${escapeHtml(h.action.toUpperCase())}\n` +
-                 `   📢 ${escapeHtml(h.group_title || "-")}\n` +
-                 `   🕐 ${escapeHtml(when)}`;
-      if (h.error) line += `\n   ⚠️ ${escapeHtml(String(h.error).slice(0, 80))}`;
-      return line;
-    });
-
-    const text = `📋 <b>Riwayat — ${escapeHtml(acc.label)}</b>\n\nHalaman ${page + 1}\n\n${lines.join("\n\n")}`;
-    return renderUi(ctx.from.id, text, historyMenu(accId, page, data.length === perPage), { parse_mode: "HTML" });
-  } catch (e) {
-    return renderUi(ctx.from.id,
-      `❌ ${escapeHtml(String(e.message || e).slice(0, 400))}`,
-      backHomeMenu(), { parse_mode: "HTML" });
-  }
-});
-
-/* =========================
-   CALLBACK: ADMIN MANAGEMENT (owner only)
-========================= */
-bot.callbackQuery("adm:list:0", async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  return showAdminList(ctx, 0);
-});
-
-bot.callbackQuery(/^adm:list:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  return showAdminList(ctx, Number(ctx.match[1]));
-});
-
-async function showAdminList(ctx, page) {
-  const a = await getAdmin(ctx.from.id);
-  if (!a) return;
-  const perPage = 10;
-  const from = page * perPage, to = from + perPage - 1;
-  try {
-    const { data, error } = await sb.from("admins")
-      .select("*").order("created_at", { ascending: true }).range(from, to);
-    if (error) throw error;
-    const lines = (data || []).map((x, i) => {
-      const idx = page * perPage + i + 1;
-      const icon = x.role === "owner" ? "👑" : "👤";
-      return `${icon} <b>${idx}. ${escapeHtml(x.note || "Admin")}</b>\n   🆔 <code>${x.telegram_user_id}</code> · ${x.role}`;
-    });
-    const text = `👨‍💼 <b>Daftar Admin</b>\n\nHalaman ${page + 1}\n\n${lines.join("\n\n") || "<i>Kosong</i>"}`;
-    const kb = adminListMenu(data || [], page, a.role === "owner");
-    if (a.role === "owner") {
-      kb.row().text("➕ Tambah Admin", "adm:add");
-    }
-    return renderUi(ctx.from.id, text, kb, { parse_mode: "HTML" });
-  } catch (e) {
-    return renderUi(ctx.from.id,
-      `❌ ${escapeHtml(String(e.message || e).slice(0, 400))}`,
-      backHomeMenu(), { parse_mode: "HTML" });
-  }
-}
-
-bot.callbackQuery(/^adm:v:(\d+)$/, async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery();
-  const tgId = Number(ctx.match[1]);
-  try {
-    const { data: target } = await sb.from("admins")
-      .select("*").eq("telegram_user_id", tgId).maybeSingle();
-    if (!target) return renderUi(ctx.from.id, "❌ Admin tidak ditemukan.",
-      new InlineKeyboard().text("⬅️ Daftar Admin", "adm:list:0"));
-
-    const text = [
-      `👤 <b>Detail Admin</b>`, ``,
-      `<pre>🆔 Telegram ID: ${target.telegram_user_id}
-🛡 Role       : ${target.role}
-📝 Note       : ${escapeHtml(target.note || "-")}
-🕐 Created    : ${new Date(target.created_at).toLocaleString("id-ID")}
-👤 Created By : ${escapeHtml(target.created_by || "-")}</pre>`,
-    ].join("\n");
-
-    const kb = new InlineKeyboard()
-      .text("⬅️ Daftar Admin", "adm:list:0")
-      .text("🏠 Menu Utama", "home");
-    if (a.role === "owner" && target.role !== "owner") {
-      kb.row().text("🗑 Hapus Admin", `adm:del:${tgId}`);
-    }
-    return renderUi(ctx.from.id, text, kb, { parse_mode: "HTML" });
-  } catch (e) {
-    return renderUi(ctx.from.id,
-      `❌ ${escapeHtml(String(e.message || e).slice(0, 400))}`,
-      backHomeMenu(), { parse_mode: "HTML" });
-  }
-});
-
-bot.callbackQuery("adm:add", async ctx => {
-  const owner = await requireOwner(ctx);
-  if (!owner) return;
-  await ctx.answerCallbackQuery();
-  flows.set(ctx.from.id, { t: "adm:add" });
-  return renderUi(ctx.from.id,
-    "➕ <b>Tambah Admin Baru</b>\n\nKirim Telegram User ID admin baru.\n\n" +
-    "Contoh: <code>7607446655</code>\n\n" +
-    "⚠️ Admin baru akan mendapat role <b>admin</b> (bukan owner).",
-    cancelFlowMenu(), { parse_mode: "HTML" });
-});
-
-bot.callbackQuery(/^adm:del:(\d+)$/, async ctx => {
-  const owner = await requireOwner(ctx);
-  if (!owner) return;
-  await ctx.answerCallbackQuery();
-  const tgId = Number(ctx.match[1]);
-  return renderUi(ctx.from.id,
-    `⚠️ <b>Hapus Admin</b>\n\nTelegram ID: <code>${tgId}</code>\n\nYakin?`,
-    new InlineKeyboard()
-      .text("🗑 Ya, Hapus", `adm:delc:${tgId}`)
-      .row().text("⬅️ Batal", `adm:v:${tgId}`),
-    { parse_mode: "HTML" });
-});
-
-bot.callbackQuery(/^adm:delc:(\d+)$/, async ctx => {
-  const owner = await requireOwner(ctx);
-  if (!owner) return;
-  await ctx.answerCallbackQuery();
-  const tgId = Number(ctx.match[1]);
-  if (tgId === owner.telegram_user_id) {
-    return ctx.answerCallbackQuery({ text: "Tidak bisa hapus diri sendiri.", show_alert: true });
-  }
-  try {
-    const { data: t } = await sb.from("admins")
-      .select("*").eq("telegram_user_id", tgId).maybeSingle();
-    if (t?.role === "owner") {
-      return ctx.answerCallbackQuery({ text: "Owner tidak bisa dihapus.", show_alert: true });
-    }
-    await sb.from("admins").delete().eq("telegram_user_id", tgId);
-    return renderUi(ctx.from.id, "✅ Admin dihapus.",
-      new InlineKeyboard().text("⬅️ Daftar Admin", "adm:list:0")
-        .row().text("🏠 Menu Utama", "home"));
-  } catch (e) {
-    return renderUi(ctx.from.id,
-      `❌ ${escapeHtml(String(e.message || e).slice(0, 400))}`,
-      backHomeMenu(), { parse_mode: "HTML" });
-  }
-});
-
-/* =========================
-   CALLBACK: FLOW CANCEL
-========================= */
-bot.callbackQuery("flow:cancel", async ctx => {
-  const a = await requireAdmin(ctx);
-  if (!a) return;
-  await ctx.answerCallbackQuery("Dibatalkan");
-
-  const w = waiters.get(ctx.from.id);
-  if (w) { try { w.reject(new Error("Dibatalkan.")); } catch (_) {} }
-  flows.delete(ctx.from.id);
-  uiMessages.delete(ctx.from.id);
-
-  return renderStart(ctx, await textHome(a), homeMenu(a.role === "owner"));
-});
-
-/* =========================
-   MESSAGE HANDLER
-========================= */
-bot.on("message", async ctx => {
-  const userId = ctx.from.id;
-  const a = await getAdmin(userId);
-  if (!a) return; // bukan admin
-
-  // 1) Waiter (OTP / password login)
-  const w = waiters.get(userId);
-  if (w && (w.type === "code" || w.type === "password")) {
-    const text = String(ctx.message.text || "").trim();
-    if (!text) return renderUi(userId, "❌ Kirim teks.", cancelFlowMenu());
-    w.resolve(text);
-    return;
-  }
-
-  // 2) Flow
-  const f = flows.get(userId);
-  if (!f) return;
-
-  try {
-    /* ---------- TAMBAH AKUN: label ---------- */
-    if (f.t === "acc:add:label") {
-      const label = String(ctx.message.text || "").trim();
-      if (!label || label.length > 60)
-        return renderUi(userId, "❌ Label tidak valid (1-60 karakter).", cancelFlowMenu());
-      flows.set(userId, { t: "acc:add:phone", label });
-      return renderUi(userId,
-        `➕ <b>${escapeHtml(label)}</b>\n\nLangkah 2/2\nKirim nomor Telegram.\n\nContoh: <b>+628123456789</b>`,
-        cancelFlowMenu(), { parse_mode: "HTML" });
-    }
-
-    /* ---------- TAMBAH AKUN: phone + start login ---------- */
-    if (f.t === "acc:add:phone") {
-      const phone = String(ctx.message.text || "").trim();
-      if (!/^\+\d{7,15}$/.test(phone))
-        return renderUi(userId,
-          "❌ Nomor tidak valid.\nGunakan format internasional: +628123456789",
-          cancelFlowMenu());
-      flows.delete(userId);
-
-      // Buat baris akun dulu
-      const { data: acc, error } = await sb.from("telegram_accounts").insert({
-        label: f.label, phone, status: "disconnected",
-        created_by: a.telegram_user_id,
-      }).select("*").single();
-      if (error) throw error;
-      await ensureSettings(acc.id);
-
-      // Jalankan login
-      await renderUi(userId,
-        `🔐 Memulai login untuk <b>${escapeHtml(f.label)}</b>...\n\nTunggu kode OTP dari Telegram.`,
-        cancelFlowMenu(), { parse_mode: "HTML" });
-      await runLogin(ctx, acc.id, phone);
+    const settings = await getAccountSettings(accountId).catch(() => null);
+    if (!settings?.promotion_enabled) {
+      schedulerTasks.delete(key);
       return;
     }
 
-    /* ---------- SET FORMAT ---------- */
-    if (f.t === "fmt:set") {
-      const accId = f.accId;
+    if (
+      settings.promotion_expires_at &&
+      new Date(settings.promotion_expires_at) <= new Date()
+    ) {
+      await sb
+        .from("account_settings")
+        .update({
+          promotion_enabled: false,
+          promotion_expires_at: null,
+          promotion_started_at: null,
+          started_by_admin_id: null
+        })
+        .eq("account_id", accountId);
 
-      // Foto?
-      if (ctx.message.photo && ctx.message.photo.length) {
-        const photo = ctx.message.photo[ctx.message.photo.length - 1];
-        const caption = ctx.message.caption || "";
-        await sb.from("account_settings").update({
-          media_type: "photo",
-          media_file_id: photo.file_id,
-          caption,
-          message: null,
-        }).eq("account_id", accId);
-        flows.delete(userId);
-        return renderUi(userId, "✅ Format foto disimpan.",
-          new InlineKeyboard().text("👤 Detail Akun", `acc:v:${accId}`)
-            .row().text("🏠 Menu Utama", "home"));
+      schedulerTasks.delete(key);
+      return;
+    }
+
+    if (!shouldContinue) {
+      schedulerTasks.delete(key);
+      return;
+    }
+
+    task.timeout = setTimeout(() => {
+      if (schedulerTasks.get(key) !== task || !task.running) return;
+
+      // Re-use the exact task; scheduleAccount would otherwise replace it.
+      task.timeout = null;
+      scheduleAccount(key, 0);
+    }, Math.max(1000, nextDelay));
+  }, Math.max(0, delayMs));
+}
+
+async function startPromotion(accountId, adminId) {
+  return withAccountLock(accountId, async () => {
+    const account = await getAccount(accountId);
+    const settings = await getAccountSettings(accountId);
+
+    if (!account) throw new Error("Account tidak ditemukan.");
+    if (!settings) throw new Error("Setting account belum tersedia.");
+
+    if (settings.promotion_enabled && schedulerTasks.has(String(accountId))) {
+      return { alreadyRunning: true, account, settings };
+    }
+
+    const client = await clientFor(accountId);
+    if (!client) {
+      throw new Error("Account belum connected atau session tidak valid.");
+    }
+
+    const formatReady =
+      (settings.format_type === "text" && String(settings.message || "").trim()) ||
+      (settings.format_type === "photo" && settings.media_file_id);
+
+    if (!formatReady) {
+      throw new Error("Format promosi belum dibuat.");
+    }
+
+    const { count, error: countError } = await sb
+      .from("account_groups")
+      .select("*", { count: "exact", head: true })
+      .eq("account_id", accountId)
+      .eq("enabled", true)
+      .eq("can_send", true);
+
+    if (countError) throw countError;
+    if (!Number(count || 0)) {
+      throw new Error("Belum ada target grup aktif yang bisa dikirimi.");
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(
+      now.getTime() + Number(settings.duration_hours || 1) * 60 * 60 * 1000
+    );
+
+    const { data: updated, error } = await sb
+      .from("account_settings")
+      .update({
+        promotion_enabled: true,
+        promotion_started_at: now.toISOString(),
+        promotion_expires_at: expiresAt.toISOString(),
+        started_by_admin_id: adminId
+      })
+      .eq("account_id", accountId)
+      .select("*")
+      .single();
+
+    if (error) throw error;
+
+    await recordHistory(accountId, adminId, {
+      actionType: "promotion_start",
+      status: "success",
+      details: {
+        delay_minutes: updated.delay_minutes,
+        duration_hours: updated.duration_hours
       }
+    });
 
-      // Teks?
-      if (ctx.message.text) {
-        const text = ctx.message.text.trim();
-        if (!text) return renderUi(userId, "❌ Format kosong.", cancelFlowMenu());
-        await sb.from("account_settings").update({
-          message: text, media_type: null, media_file_id: null, caption: null,
-        }).eq("account_id", accId);
-        flows.delete(userId);
-        return renderUi(userId, "✅ Format teks disimpan.",
-          new InlineKeyboard().text("👤 Detail Akun", `acc:v:${accId}`)
-            .row().text("🏠 Menu Utama", "home"));
+    // Exactly one scheduler per account. Immediate first fire is retained from old bot behavior.
+    scheduleAccount(accountId, 0);
+
+    return { alreadyRunning: false, account, settings: updated };
+  });
+}
+
+async function stopPromotion(accountId, adminId) {
+  return withAccountLock(accountId, async () => {
+    const account = await getAccount(accountId);
+    if (!account) throw new Error("Account tidak ditemukan.");
+
+    await stopScheduler(accountId);
+
+    const { data: settings, error } = await sb
+      .from("account_settings")
+      .select("*")
+      .eq("account_id", accountId)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const wasRunning = Boolean(settings?.promotion_enabled);
+
+    const { error: updateError } = await sb
+      .from("account_settings")
+      .update({
+        promotion_enabled: false,
+        promotion_expires_at: null,
+        promotion_started_at: null,
+        started_by_admin_id: null
+      })
+      .eq("account_id", accountId);
+
+    if (updateError) throw updateError;
+
+    await recordHistory(accountId, adminId, {
+      actionType: "promotion_stop",
+      status: "success",
+      details: { was_running: wasRunning }
+    });
+
+    return { wasRunning };
+  });
+}
+
+/* =========================================================
+   ACCOUNT LOGIN / CONNECT
+========================================================= */
+
+function waitForInput(adminTelegramId, nextType, timeoutMs = 5 * 60 * 1000) {
+  const userId = String(adminTelegramId);
+
+  return new Promise((resolve, reject) => {
+    const old = waiters.get(userId);
+    if (old) old.reject(new Error("Input sebelumnya dibatalkan."));
+
+    const timer = setTimeout(() => {
+      waiters.delete(userId);
+      flows.delete(userId);
+      reject(new Error("Waktu input habis. Silakan mulai lagi."));
+    }, timeoutMs);
+
+    waiters.set(userId, {
+      type: nextType,
+      timer,
+      resolve(value) {
+        clearTimeout(timer);
+        waiters.delete(userId);
+        resolve(value);
+      },
+      reject(error) {
+        clearTimeout(timer);
+        waiters.delete(userId);
+        reject(error);
       }
+    });
+  });
+}
 
-      return renderUi(userId,
-        "❌ Kirim teks atau foto (+caption).",
-        cancelFlowMenu());
+async function startLogin(ctx, accountId, phone, options = {}) {
+  const adminTelegramId = ctx.from.id;
+  const client = await createTelegramClient("");
+  await client.connect();
+
+  try {
+    await client.start({
+      phoneNumber: async () => phone,
+
+      phoneCode: async () => {
+        flows.set(String(adminTelegramId), {
+          t: "login_code",
+          accountId: String(accountId)
+        });
+
+        await renderUi(
+          adminTelegramId,
+          "📩 <b>Kode Telegram sudah dikirim.</b>\n\nBalas dengan kode OTP.",
+          cancelKeyboard(false),
+          { parse_mode: "HTML" }
+        );
+
+        return waitForInput(adminTelegramId, "code");
+      },
+
+      password: async () => {
+        flows.set(String(adminTelegramId), {
+          t: "login_password",
+          accountId: String(accountId)
+        });
+
+        await renderUi(
+          adminTelegramId,
+          "🔐 <b>Verifikasi 2 langkah</b>\n\nBalas dengan password Telegram kamu.",
+          cancelKeyboard(false),
+          { parse_mode: "HTML" }
+        );
+
+        return waitForInput(adminTelegramId, "password");
+      },
+
+      onError: async error => {
+        console.error("LOGIN ERROR:", safeErrorMessage(error, 300));
+      }
+    });
+
+    const identity = await getMeFromClient(client);
+    const { data: other, error: otherError } = await sb
+      .from("telegram_accounts")
+      .select("id,label")
+      .eq("telegram_user_id", identity.telegramUserId)
+      .neq("id", accountId)
+      .maybeSingle();
+
+    if (otherError) throw otherError;
+
+    if (other) {
+      throw new Error(
+        `Akun Telegram tersebut sudah dikaitkan sebagai "${other.label}".`
+      );
     }
 
-    /* ---------- SET DELAY ---------- */
-    if (f.t === "dly:set") {
-      const m = parseMinutes(ctx.message.text);
-      if (!m || m < 1)
-        return renderUi(userId, "❌ Format delay tidak valid.\nContoh: 10 menit / 1 jam.", cancelFlowMenu());
-      await sb.from("account_settings").update({ interval_minutes: m }).eq("account_id", f.accId);
-      flows.delete(userId);
-      return renderUi(userId,
-        `✅ Delay disimpan: <b>${formatInterval(m)}</b>`,
-        new InlineKeyboard().text("👤 Detail Akun", `acc:v:${f.accId}`)
-          .row().text("🏠 Menu Utama", "home"),
-        { parse_mode: "HTML" });
-    }
+    const sessionString = client.session.save();
+    const sessionEncrypted = encryptSession(sessionString);
 
-    /* ---------- SET DURASI ---------- */
-    if (f.t === "dur:set") {
-      const h = parseHours(ctx.message.text);
-      if (!h || h < 1)
-        return renderUi(userId, "❌ Format durasi tidak valid.\nContoh: 1 hari / 12 jam.", cancelFlowMenu());
-      await sb.from("account_settings").update({ duration_hours: h }).eq("account_id", f.accId);
-      flows.delete(userId);
-      return renderUi(userId,
-        `✅ Durasi disimpan: <b>${formatDuration(h)}</b>`,
-        new InlineKeyboard().text("👤 Detail Akun", `acc:v:${f.accId}`)
-          .row().text("🏠 Menu Utama", "home"),
-        { parse_mode: "HTML" });
-    }
+    const { data: updated, error } = await sb
+      .from("telegram_accounts")
+      .update({
+        telegram_user_id: identity.telegramUserId,
+        phone,
+        session_encrypted: sessionEncrypted,
+        session_version: 1,
+        status: "connected",
+        connected_at: new Date().toISOString()
+      })
+      .eq("id", accountId)
+      .select("*")
+      .single();
 
-    /* ---------- TAMBAH ADMIN ---------- */
-    if (f.t === "adm:add") {
-      if (a.role !== "owner")
-        return renderUi(userId, "❌ Hanya owner.", backHomeMenu());
-      const raw = String(ctx.message.text || "").trim();
-      if (!/^\d+$/.test(raw))
-        return renderUi(userId, "❌ Telegram ID harus angka.", cancelFlowMenu());
-      const id = Number(raw);
-      const { error } = await sb.from("admins").upsert({
-        telegram_user_id: id, role: "admin",
-        created_by: a.telegram_user_id, note: "Admin",
-      }, { onConflict: "telegram_user_id" });
-      if (error) throw error;
-      flows.delete(userId);
-      return renderUi(userId,
-        `✅ Admin <code>${id}</code> ditambahkan.`,
-        new InlineKeyboard().text("⬅️ Daftar Admin", "adm:list:0")
-          .row().text("🏠 Menu Utama", "home"),
-        { parse_mode: "HTML" });
-    }
+    if (error) throw error;
 
-    return;
+    clients.set(String(accountId), client);
+    flows.delete(String(adminTelegramId));
+
+    await recordHistory(accountId, options.adminId || null, {
+      actionType: "account_connect",
+      status: "success",
+      details: {
+        telegram_user_id: identity.telegramUserId,
+        username: identity.username
+      }
+    });
+
+    await showAccount(ctx, updated.id, "✅ Account Telegram berhasil terhubung.");
   } catch (e) {
-    console.error("FLOW:", e);
-    flows.delete(userId);
-    return renderUi(userId,
-      `❌ ${escapeHtml(String(e.message || e).slice(0, 500))}`,
-      backHomeMenu(), { parse_mode: "HTML" });
-  }
-});
+    flows.delete(String(adminTelegramId));
+    try { await client.disconnect(); } catch (_) {}
 
-/* =========================
-   /start COMMAND
-========================= */
-bot.command("start", async ctx => {
-  const a = await getAdmin(ctx.from.id);
-  if (!a) {
-    return ctx.reply(
-      "❌ Akses ditolak.\n\nAkun ini belum terdaftar sebagai admin.\n" +
-      "Hubungi owner bot untuk menambahkan Anda."
+    if (options.deleteOnFailure) {
+      try {
+        await sb.from("telegram_accounts").delete().eq("id", accountId);
+      } catch (_) {}
+    }
+
+    throw e;
+  }
+}
+
+async function connectStoredAccount(ctx, accountId, adminId) {
+  const client = await clientFor(accountId);
+
+  if (!client) return false;
+
+  const identity = await getMeFromClient(client);
+  const { error } = await sb
+    .from("telegram_accounts")
+    .update({
+      telegram_user_id: identity.telegramUserId,
+      status: "connected",
+      connected_at: new Date().toISOString()
+    })
+    .eq("id", accountId);
+
+  if (error) throw error;
+
+  await recordHistory(accountId, adminId, {
+    actionType: "account_connect",
+    status: "success",
+    details: { reconnect: true, telegram_user_id: identity.telegramUserId }
+  });
+
+  return true;
+}
+
+/* =========================================================
+   LEGACY MIGRATION
+   Tabel lama tetap dipertahankan. Server mengimpor satu kali,
+   termasuk encrypt session lama di level aplikasi.
+========================================================= */
+
+async function tableExists(tableName) {
+  try {
+    const { error } = await sb
+      .from(tableName)
+      .select("*", { count: "exact", head: true });
+
+    if (!error) return true;
+    const message = String(error.message || "").toLowerCase();
+    const code = String(error.code || "");
+    if (code === "PGRST205") return false;
+    if (message.includes("schema cache")) return false;
+    if (message.includes("does not exist")) return false;
+    if (message.includes("relation") && message.includes("not found")) return false;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function getMigrationState(key) {
+  const { data, error } = await sb
+    .from("system_migrations")
+    .select("*")
+    .eq("key", key)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data || null;
+}
+
+async function markMigrationComplete(key, details = {}) {
+  const { error } = await sb
+    .from("system_migrations")
+    .upsert({
+      key,
+      completed_at: new Date().toISOString(),
+      details
+    }, { onConflict: "key" });
+
+  if (error) throw error;
+}
+
+async function migrateLegacyData() {
+  const key = "legacy_import_v1";
+  const state = await getMigrationState(key);
+  if (state?.completed_at) return;
+
+  const hasUsers = await tableExists("app_users");
+  const hasSessions = await tableExists("telegram_sessions");
+  const hasGroups = await tableExists("groups");
+  const hasCampaigns = await tableExists("campaigns");
+  const hasCampaignGroups = await tableExists("campaign_groups");
+  const hasSendLogs = await tableExists("send_logs");
+
+  if (!hasUsers) {
+    await markMigrationComplete(key, { skipped: true, reason: "legacy app_users not found" });
+    return;
+  }
+
+  const owner = await sb
+    .from("admins")
+    .select("id,telegram_user_id")
+    .eq("role", "OWNER")
+    .eq("active", true)
+    .order("id", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (owner.error) throw owner.error;
+  const ownerId = owner.data?.id || null;
+
+  const { data: legacyUsers, error: usersError } = await sb
+    .from("app_users")
+    .select("*")
+    .order("id", { ascending: true });
+
+  if (usersError) throw usersError;
+
+  const accountByLegacyUserId = new Map();
+  const accountByTelegramId = new Map();
+  const legacyUserById = new Map();
+  let migratedAccounts = 0;
+
+  for (const legacyUser of legacyUsers || []) {
+    legacyUserById.set(String(legacyUser.id), legacyUser);
+
+    const tgId = legacyUser.telegram_user_id;
+    if (!tgId) continue;
+
+    const existing = await sb
+      .from("telegram_accounts")
+      .select("*")
+      .eq("telegram_user_id", tgId)
+      .maybeSingle();
+
+    if (existing.error) throw existing.error;
+
+    let account = existing.data;
+
+    if (!account) {
+      const label =
+        String(legacyUser.first_name || legacyUser.username || "").trim() ||
+        `Legacy Account ${tgId}`;
+
+      const inserted = await sb
+        .from("telegram_accounts")
+        .insert({
+          telegram_user_id: tgId,
+          label,
+          status: "disconnected",
+          created_by_admin_id: ownerId
+        })
+        .select("*")
+        .single();
+
+      if (inserted.error) throw inserted.error;
+      account = inserted.data;
+      migratedAccounts++;
+    }
+
+    await ensureAccountSettings(account.id);
+    accountByLegacyUserId.set(String(legacyUser.id), account);
+    accountByTelegramId.set(String(tgId), account);
+  }
+
+  if (hasSessions && legacyUsers?.length) {
+    const { data: legacySessions, error: sessionsError } = await sb
+      .from("telegram_sessions")
+      .select("*");
+
+    if (sessionsError) throw sessionsError;
+
+    for (const session of legacySessions || []) {
+      const legacyUser = legacyUserById.get(String(session.user_id));
+      const account = accountByLegacyUserId.get(String(session.user_id));
+      if (!account) continue;
+
+      const update = {};
+      if (session.phone) update.phone = session.phone;
+      if (
+        session.status === "connected" &&
+        legacyUser?.status === "active"
+      ) {
+        update.status = "connected";
+      } else if (session.status) {
+        update.status = "disconnected";
+      }
+
+      const existingAccount = await getAccount(account.id);
+      if (!existingAccount?.session_encrypted && session.session_string) {
+        update.session_encrypted = encryptSession(session.session_string);
+        update.session_version = 1;
+      }
+
+      if (Object.keys(update).length) {
+        const { error } = await sb
+          .from("telegram_accounts")
+          .update(update)
+          .eq("id", account.id);
+        if (error) throw error;
+      }
+    }
+  }
+
+  if (hasGroups) {
+    const { data: legacyGroups, error: groupsError } = await sb
+      .from("groups")
+      .select("*")
+      .order("id", { ascending: true });
+
+    if (groupsError) throw groupsError;
+
+    for (const group of legacyGroups || []) {
+      const account = accountByLegacyUserId.get(String(group.user_id));
+      if (!account) continue;
+
+      const { error } = await sb
+        .from("account_groups")
+        .upsert({
+          account_id: account.id,
+          telegram_group_id: String(group.telegram_group_id),
+          title: group.title || "Tanpa Nama",
+          can_send: group.can_send !== false,
+          enabled: group.enabled === true,
+          last_seen_at: group.updated_at || group.created_at || new Date().toISOString()
+        }, {
+          onConflict: "account_id,telegram_group_id"
+        });
+
+      if (error) throw error;
+    }
+  }
+
+  const latestCampaignByLegacyUser = new Map();
+
+  if (hasCampaigns) {
+    const { data: campaigns, error: campaignsError } = await sb
+      .from("campaigns")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (campaignsError) throw campaignsError;
+
+    for (const campaign of campaigns || []) {
+      const keyUser = String(campaign.user_id);
+      if (!latestCampaignByLegacyUser.has(keyUser)) {
+        latestCampaignByLegacyUser.set(keyUser, campaign);
+      }
+    }
+
+    for (const [legacyUserId, campaign] of latestCampaignByLegacyUser) {
+      const account = accountByLegacyUserId.get(legacyUserId);
+      if (!account) continue;
+
+      const update = {
+        delay_minutes: Number(campaign.interval_minutes || 10),
+        duration_hours: Number(campaign.duration_hours || 1),
+        format_type: campaign.media_file_id ? "photo" : "text",
+        message: campaign.message || "",
+        media_file_id: campaign.media_file_id || null,
+        caption: campaign.caption || null,
+        promotion_enabled: campaign.active === true,
+        promotion_started_at: campaign.started_at || null,
+        promotion_expires_at: campaign.expires_at || null
+      };
+
+      // The migration runs before normal new-version use, so legacy settings
+      // are intentionally copied as the starting per-account configuration.
+      const { error } = await sb
+        .from("account_settings")
+        .update(update)
+        .eq("account_id", account.id);
+
+      if (error) throw error;
+
+      if (hasCampaignGroups) {
+        const links = await sb
+          .from("campaign_groups")
+          .select("group_id")
+          .eq("campaign_id", campaign.id);
+
+        if (links.error) throw links.error;
+
+        const targetGroupLegacyIds = new Set(
+          (links.data || []).map(x => String(x.group_id))
+        );
+
+        for (const legacyGroupId of targetGroupLegacyIds) {
+          // Legacy groups are uniquely identifiable by their old integer id.
+          const legacyGroup = await sb
+            .from("groups")
+            .select("id,telegram_group_id")
+            .eq("id", legacyGroupId)
+            .maybeSingle();
+
+          if (legacyGroup.error || !legacyGroup.data) continue;
+
+          await sb
+            .from("account_groups")
+            .update({ enabled: true })
+            .eq("account_id", account.id)
+            .eq("telegram_group_id", String(legacyGroup.data.telegram_group_id));
+        }
+      }
+    }
+  }
+
+  if (hasSendLogs) {
+    let offset = 0;
+    const batchSize = 500;
+
+    while (true) {
+      const { data: logs, error: logsError } = await sb
+        .from("send_logs")
+        .select("*")
+        .order("id", { ascending: true })
+        .range(offset, offset + batchSize - 1);
+
+      if (logsError) throw logsError;
+      if (!logs?.length) break;
+
+      for (const log of logs) {
+        const account = accountByLegacyUserId.get(String(log.user_id));
+        if (!account) continue;
+
+        let groupId = null;
+        let groupTitle = null;
+
+        if (log.group_id) {
+          const legacyGroup = await sb
+            .from("groups")
+            .select("id,title,telegram_group_id")
+            .eq("id", log.group_id)
+            .maybeSingle();
+
+          if (!legacyGroup.error && legacyGroup.data) {
+            const currentGroup = await sb
+              .from("account_groups")
+              .select("id,title")
+              .eq("account_id", account.id)
+              .eq("telegram_group_id", String(legacyGroup.data.telegram_group_id))
+              .maybeSingle();
+
+            if (!currentGroup.error && currentGroup.data) {
+              groupId = currentGroup.data.id;
+              groupTitle = currentGroup.data.title;
+            }
+          }
+        }
+
+        const status = ["sent", "success", "ok"].includes(String(log.status).toLowerCase())
+          ? "success"
+          : "error";
+
+        await recordHistory(account.id, null, {
+          actionType: "legacy_send",
+          status,
+          groupId,
+          groupTitle,
+          error: log.error || null,
+          accountLabel: account.label,
+          details: {
+            legacy_campaign_id: log.campaign_id || null,
+            legacy_user_id: log.user_id || null
+          },
+          legacySource: "send_logs",
+          legacySourceId: log.id
+        });
+      }
+
+      if (logs.length < batchSize) break;
+      offset += batchSize;
+    }
+  }
+
+  await markMigrationComplete(key, {
+    migrated_accounts: migratedAccounts,
+    legacy_users: legacyUsers?.length || 0
+  });
+}
+
+/* =========================================================
+   ACCOUNT VIEWS / MENUS
+========================================================= */
+
+async function showAccount(ctx, accountId, prefixMessage = "") {
+  const { account, settings } = await getAccountBundle(accountId);
+
+  if (!account) {
+    return replaceUi(
+      ctx,
+      "❌ Account tidak ditemukan.",
+      backDashboardKeyboard(),
+      { parse_mode: "HTML" }
     );
   }
-  return renderStart(ctx, await textHome(a), homeMenu(a.role === "owner"));
+
+  const safeSettings = settings || await ensureAccountSettings(account.id);
+  const message = [
+    prefixMessage,
+    settingsSummary(account, safeSettings),
+    "",
+    account.status === "error"
+      ? "⚠️ Status error berarti session perlu dicoba Connect kembali."
+      : ""
+  ].filter(Boolean).join("\n");
+
+  return replaceUi(
+    ctx,
+    message,
+    accountMenu(account, safeSettings),
+    { parse_mode: "HTML" }
+  );
+}
+
+/* =========================================================
+   START / DASHBOARD
+========================================================= */
+
+bot.command("start", async ctx => {
+  try {
+    const adminRow = await getAdminByTelegramId(ctx.from.id);
+
+    if (!adminRow) {
+      return renderUi(
+        ctx.from.id,
+        "⛔ <b>Akses ditolak.</b>\n\nBot ini sekarang hanya digunakan oleh admin yang terdaftar.",
+        new InlineKeyboard(),
+        { parse_mode: "HTML" }
+      );
+    }
+
+    const stats = await getDashboardStats().catch(() => ({
+      admins: 0,
+      accounts: 0,
+      connected: 0,
+      running: 0,
+      groups: 0
+    }));
+
+    const text = dashboardText(ctx, stats);
+    const menu = adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu();
+    return renderStart(ctx, text, menu);
+  } catch (e) {
+    console.error("START:", safeErrorMessage(e));
+    return ctx.reply("❌ Terjadi kesalahan saat membuka dashboard.");
+  }
 });
 
-/* =========================
-   ERROR HANDLER
-========================= */
+bot.callbackQuery("menu:dashboard", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const stats = await getDashboardStats().catch(() => ({
+    admins: 0,
+    accounts: 0,
+    connected: 0,
+    running: 0,
+    groups: 0
+  }));
+
+  const menu = adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu();
+  return replaceUi(ctx, dashboardText(ctx, stats), menu, { parse_mode: "HTML" });
+});
+
+/* =========================================================
+   ACCOUNT LIST / ADD
+========================================================= */
+
+bot.callbackQuery(/^accounts:list:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const rawPage = Number(ctx.match[1]);
+
+  try {
+    const result = await listAccounts(rawPage);
+    const page = ensurePage(rawPage, Math.floor(Math.max(0, result.total - 1) / ACCOUNT_PAGE_SIZE));
+
+    // Re-load if the requested page was beyond current max.
+    const current = page === rawPage ? result : await listAccounts(page);
+
+    const lines = [
+      "📱 <b>AKUN TELEGRAM</b>",
+      `Total: <b>${current.total}</b>`,
+      `Halaman: <b>${page + 1}</b>`,
+      "",
+      current.rows.length
+        ? current.rows.map((x, i) =>
+            `${String(page * ACCOUNT_PAGE_SIZE + i + 1).padStart(2, "0")}. ${accountStatusIcon(x)} <b>${escapeHtml(x.label)}</b>\n   🆔 <code>${escapeHtml(x.telegram_user_id || "belum login")}</code>`
+          ).join("\n\n")
+        : "<i>Belum ada akun Telegram.</i>",
+      "",
+      "Tekan nama akun untuk membuka semua kontrol account."
+    ].join("\n");
+
+    return replaceUi(
+      ctx,
+      lines,
+      accountListKeyboard(current.rows, page, current.hasNext),
+      { parse_mode: "HTML" }
+    );
+  } catch (e) {
+    return replaceUi(
+      ctx,
+      `❌ Gagal mengambil daftar akun.\n\n${escapeHtml(safeErrorMessage(e))}`,
+      backDashboardKeyboard(),
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
+bot.callbackQuery("account:add", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  flows.set(String(ctx.from.id), { t: "account_label" });
+
+  return replaceUi(
+    ctx,
+    "➕ <b>Tambah Akun Telegram</b>\n\nKirim <b>label/nama akun</b> yang akan tampil di dashboard.\n\nContoh: <code>Account A</code>",
+    cancelKeyboard(false),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery(/^account:open:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  return showAccount(ctx, String(ctx.match[1]));
+});
+
+bot.callbackQuery(/^account:status:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  return showAccount(ctx, String(ctx.match[1]));
+});
+
+/* =========================================================
+   ACCOUNT CONNECT / DISCONNECT / REMOVE
+========================================================= */
+
+bot.callbackQuery(/^account:connect:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery("Mengecek session...").catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
+
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  try {
+    const reconnected = await connectStoredAccount(ctx, accountId, adminRow.id);
+    if (reconnected) {
+      return showAccount(ctx, accountId, "✅ Session tersimpan berhasil digunakan kembali.");
+    }
+  } catch (e) {
+    console.error("CONNECT STORED:", safeErrorMessage(e));
+  }
+
+  flows.set(String(ctx.from.id), {
+    t: "account_phone",
+    accountId,
+    adminId: adminRow.id
+  });
+
+  return replaceUi(
+    ctx,
+    "🔗 <b>Connect Ulang</b>\n\nSession lama tidak dapat dipakai saat ini.\n\nKirim nomor Telegram dalam format internasional.\nContoh: <code>+628123456789</code>",
+    cancelKeyboard(false),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery(/^account:disconnect:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+
+  try {
+    await stopScheduler(accountId);
+    await stopPromotion(accountId, adminRow.id);
+    await closeClient(accountId);
+
+    const { error } = await sb
+      .from("telegram_accounts")
+      .update({ status: "disconnected" })
+      .eq("id", accountId);
+
+    if (error) throw error;
+
+    await recordHistory(accountId, adminRow.id, {
+      actionType: "account_disconnect",
+      status: "success"
+    });
+
+    return showAccount(ctx, accountId, "✅ Account diputuskan. Session terenkripsi tetap disimpan untuk reconnect.");
+  } catch (e) {
+    return replaceUi(
+      ctx,
+      `❌ Gagal memutus account.\n\n${escapeHtml(safeErrorMessage(e))}`,
+      backDashboardKeyboard(),
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
+bot.callbackQuery(/^account:remove:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
+
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  return replaceUi(
+    ctx,
+    `⚠️ <b>HAPUS ACCOUNT?</b>\n\n` +
+      `📱 Account: <b>${escapeHtml(account.label)}</b>\n` +
+      `🆔 Telegram ID: <code>${escapeHtml(account.telegram_user_id || "-")}</code>\n\n` +
+      `Data account, setting, dan target grup akan dihapus. Riwayat tetap disimpan sebagai audit log.`,
+    new InlineKeyboard()
+      .text("✅ Ya, Hapus", `account:remove:confirm:${accountId}`)
+      .row()
+      .text("❌ Batal", `account:open:${accountId}`),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery(/^account:remove:confirm:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery("Menghapus account...").catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
+
+  if (!account) {
+    return replaceUi(ctx, "❌ Account sudah tidak ada.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  try {
+    await stopScheduler(accountId);
+    await closeClient(accountId);
+
+    await recordHistory(accountId, adminRow.id, {
+      actionType: "account_remove",
+      status: "success",
+      details: { deleted_label: account.label }
+    });
+
+    const { error } = await sb
+      .from("telegram_accounts")
+      .delete()
+      .eq("id", accountId);
+
+    if (error) throw error;
+
+    return replaceUi(
+      ctx,
+      `✅ <b>Account dihapus.</b>\n\n${escapeHtml(account.label)} sudah tidak lagi berada di sistem.`,
+      new InlineKeyboard().text("📱 Daftar Akun", "accounts:list:0"),
+      { parse_mode: "HTML" }
+    );
+  } catch (e) {
+    return replaceUi(
+      ctx,
+      `❌ Gagal menghapus account.\n\n${escapeHtml(safeErrorMessage(e))}`,
+      backDashboardKeyboard(),
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
+/* =========================================================
+   ACCOUNT SETTINGS / LABEL
+========================================================= */
+
+bot.callbackQuery(/^account:settings:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const { account, settings } = await getAccountBundle(accountId);
+
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  return replaceUi(
+    ctx,
+    `⚙️ <b>SETTING ACCOUNT</b>\n\n${settingsSummary(account, settings)}`,
+    settingsMenu(accountId),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery(/^account:label:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
+
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  flows.set(String(ctx.from.id), {
+    t: "account_label_edit",
+    accountId
+  });
+
+  return replaceUi(
+    ctx,
+    `✏️ <b>Ubah Label</b>\n\nLabel saat ini: <b>${escapeHtml(account.label)}</b>\n\nKirim label baru.`,
+    cancelKeyboard(false),
+    { parse_mode: "HTML" }
+  );
+});
+
+/* =========================================================
+   PROMOTION FORMAT / DELAY / DURATION
+========================================================= */
+
+bot.callbackQuery(/^promo:format:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
+
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  flows.set(String(ctx.from.id), {
+    t: "format",
+    accountId,
+    adminId: adminRow.id
+  });
+
+  return replaceUi(
+    ctx,
+    `📝 <b>FORMAT PROMOSI • ${escapeHtml(account.label)}</b>\n\n` +
+      `Kirim salah satu:\n` +
+      `• Teks biasa\n` +
+      `• Foto saja\n` +
+      `• Foto + caption\n\n` +
+      `Format ini hanya berlaku untuk account yang sedang dipilih.`,
+    cancelKeyboard(false),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery(/^promo:delay:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
+
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  flows.set(String(ctx.from.id), {
+    t: "delay",
+    accountId,
+    adminId: adminRow.id
+  });
+
+  return replaceUi(
+    ctx,
+    `⏱ <b>SET JEDA • ${escapeHtml(account.label)}</b>\n\n` +
+      `Contoh: <code>10 menit</code>, <code>30 menit</code>, <code>1 jam</code>.\n\nMinimal 1 menit.`,
+    cancelKeyboard(false),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery(/^promo:duration:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
+
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  flows.set(String(ctx.from.id), {
+    t: "duration",
+    accountId,
+    adminId: adminRow.id
+  });
+
+  return replaceUi(
+    ctx,
+    `📅 <b>SET DURASI • ${escapeHtml(account.label)}</b>\n\n` +
+      `Contoh: <code>3 hari</code>, <code>12 jam</code>.`,
+    cancelKeyboard(false),
+    { parse_mode: "HTML" }
+  );
+});
+
+/* =========================================================
+   PROMOTION START / STOP
+========================================================= */
+
+bot.callbackQuery(/^promo:start:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery("Menjalankan promosi...").catch(() => {});
+  const accountId = String(ctx.match[1]);
+
+  try {
+    const result = await startPromotion(accountId, adminRow.id);
+
+    if (result.alreadyRunning) {
+      return showAccount(ctx, accountId, "ℹ️ Promosi account ini sudah berjalan. Scheduler kedua tidak dibuat.");
+    }
+
+    return showAccount(
+      ctx,
+      accountId,
+      `▶️ <b>Promosi dimulai.</b>\nJeda: <b>${escapeHtml(formatInterval(result.settings.delay_minutes))}</b>\nDurasi: <b>${escapeHtml(formatDuration(result.settings.duration_hours))}</b>`
+    );
+  } catch (e) {
+    return showAccount(ctx, accountId, `❌ ${escapeHtml(safeErrorMessage(e))}`);
+  }
+});
+
+bot.callbackQuery(/^promo:stop:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery("Menghentikan promosi...").catch(() => {});
+  const accountId = String(ctx.match[1]);
+
+  try {
+    const result = await stopPromotion(accountId, adminRow.id);
+    return showAccount(
+      ctx,
+      accountId,
+      result.wasRunning
+        ? "⏹ <b>Promosi dihentikan.</b>"
+        : "ℹ️ Account tidak sedang menjalankan promosi."
+    );
+  } catch (e) {
+    return showAccount(ctx, accountId, `❌ ${escapeHtml(safeErrorMessage(e))}`);
+  }
+});
+
+/* =========================================================
+   GROUP MANAGEMENT
+========================================================= */
+
+bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const requestedPage = Number(ctx.match[2]);
+  const account = await getAccount(accountId);
+
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  try {
+    const offset = requestedPage * GROUP_PAGE_SIZE;
+    const { count } = await sb
+      .from("account_groups")
+      .select("*", { count: "exact", head: true })
+      .eq("account_id", accountId);
+
+    const total = Number(count || 0);
+    const maxPage = Math.floor(Math.max(0, total - 1) / GROUP_PAGE_SIZE);
+    const page = ensurePage(requestedPage, maxPage);
+    const result = page === requestedPage
+      ? await listGroups(accountId, page)
+      : await listGroups(accountId, page);
+
+    const activeCountResult = await sb
+      .from("account_groups")
+      .select("*", { count: "exact", head: true })
+      .eq("account_id", accountId)
+      .eq("enabled", true)
+      .eq("can_send", true);
+
+    if (activeCountResult.error) throw activeCountResult.error;
+
+    const lines = [
+      `👥 <b>GRUP • ${escapeHtml(account.label)}</b>`,
+      `Total: <b>${result.total}</b> • Target aktif: <b>${activeCountResult.count || 0}</b>`,
+      `Halaman: <b>${page + 1}</b>`,
+      "",
+      result.rows.length
+        ? result.rows.map((g, i) =>
+            `${String(page * GROUP_PAGE_SIZE + i + 1).padStart(2, "0")}. ${g.enabled ? "✅" : "⬜"} <b>${escapeHtml(g.title)}</b>\n   ${g.can_send ? "🟢 Bisa kirim" : "🔴 Tidak bisa kirim"}`
+          ).join("\n\n")
+        : "<i>Belum ada grup yang tersimpan. Gunakan Scan / Refresh.</i>",
+      "",
+      "Tap nama grup untuk ON/OFF target. Tombol 🗑 menghapus target dari database bot."
+    ].join("\n");
+
+    return replaceUi(
+      ctx,
+      lines,
+      groupListKeyboard(result.rows, accountId, page, result.hasNext),
+      { parse_mode: "HTML" }
+    );
+  } catch (e) {
+    return replaceUi(
+      ctx,
+      `❌ Gagal mengambil grup.\n\n${escapeHtml(safeErrorMessage(e))}`,
+      new InlineKeyboard().text("◀️ Account", `account:open:${accountId}`),
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
+bot.callbackQuery(/^group:refresh:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery("Scanning dialog Telegram...").catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
+
+  if (!account) return;
+
+  try {
+    const rows = await refreshGroups(accountId);
+    await recordHistory(accountId, adminRow.id, {
+      actionType: "group_refresh",
+      status: "success",
+      details: { scanned: rows.length }
+    });
+
+    return renderGroupPageDirect(ctx, accountId, 0, `✅ Scan selesai. ${rows.length} dialog group/channel terbaca.`);
+  } catch (e) {
+    return replaceUi(
+      ctx,
+      `❌ Scan grup gagal.\n\n${escapeHtml(safeErrorMessage(e))}`,
+      new InlineKeyboard().text("◀️ Account", `account:open:${accountId}`),
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
+async function renderGroupPageDirect(ctx, accountId, page, prefix = "") {
+  const result = await listGroups(accountId, page);
+  const activeCountResult = await sb
+    .from("account_groups")
+    .select("*", { count: "exact", head: true })
+    .eq("account_id", accountId)
+    .eq("enabled", true)
+    .eq("can_send", true);
+
+  if (activeCountResult.error) throw activeCountResult.error;
+
+  const account = await getAccount(accountId);
+  if (!account) throw new Error("Account tidak ditemukan.");
+
+  const text = [
+    prefix,
+    `👥 <b>GRUP • ${escapeHtml(account.label)}</b>`,
+    `Total: <b>${result.total}</b> • Target aktif: <b>${activeCountResult.count || 0}</b>`,
+    "",
+    result.rows.length
+      ? result.rows.map((g, i) =>
+          `${String(page * GROUP_PAGE_SIZE + i + 1).padStart(2, "0")}. ${g.enabled ? "✅" : "⬜"} <b>${escapeHtml(g.title)}</b>\n   ${g.can_send ? "🟢 Bisa kirim" : "🔴 Tidak bisa kirim"}`
+        ).join("\n\n")
+      : "<i>Belum ada grup.</i>"
+  ].filter(Boolean).join("\n");
+
+  return replaceUi(
+    ctx,
+    text,
+    groupListKeyboard(result.rows, accountId, page, result.hasNext),
+    { parse_mode: "HTML" }
+  );
+}
+
+bot.callbackQuery(/^group:toggle:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  const groupId = String(ctx.match[1]);
+  const group = await sb
+    .from("account_groups")
+    .select("*")
+    .eq("id", groupId)
+    .maybeSingle();
+
+  if (group.error || !group.data) {
+    return ctx.answerCallbackQuery("Grup tidak ditemukan.", { show_alert: true });
+  }
+
+  if (!group.data.can_send && !group.data.enabled) {
+    return ctx.answerCallbackQuery(
+      "Telegram menandai group ini tidak bisa menerima pesan.",
+      { show_alert: true }
+    );
+  }
+
+  await ctx.answerCallbackQuery().catch(() => {});
+
+  const nextEnabled = !group.data.enabled;
+  const { error } = await sb
+    .from("account_groups")
+    .update({ enabled: nextEnabled })
+    .eq("id", groupId)
+    .eq("account_id", group.data.account_id);
+
+  if (error) {
+    return ctx.answerCallbackQuery("Gagal menyimpan setting group.", { show_alert: true });
+  }
+
+  await recordHistory(group.data.account_id, adminRow.id, {
+    actionType: nextEnabled ? "group_enable" : "group_disable",
+    status: "success",
+    groupId: groupId
+  });
+
+  return renderGroupPageDirect(ctx, group.data.account_id, 0);
+});
+
+bot.callbackQuery(/^group:remove:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  const groupId = String(ctx.match[1]);
+  const { data: group, error: groupError } = await sb
+    .from("account_groups")
+    .select("*")
+    .eq("id", groupId)
+    .maybeSingle();
+
+  if (groupError || !group) {
+    return ctx.answerCallbackQuery("Grup tidak ditemukan.", { show_alert: true });
+  }
+
+  await ctx.answerCallbackQuery().catch(() => {});
+
+  const { error } = await sb
+    .from("account_groups")
+    .delete()
+    .eq("id", groupId)
+    .eq("account_id", group.account_id);
+
+  if (error) {
+    return ctx.answerCallbackQuery("Gagal menghapus grup.", { show_alert: true });
+  }
+
+  await recordHistory(group.account_id, adminRow.id, {
+    actionType: "group_remove",
+    status: "success",
+    groupId: groupId,
+    groupTitle: group.title
+  });
+
+  return renderGroupPageDirect(ctx, group.account_id, 0, `🗑 <b>${escapeHtml(group.title)}</b> dihapus dari daftar target.`);
+});
+
+/* =========================================================
+   HISTORY
+========================================================= */
+
+bot.callbackQuery(/^history:list:(\d+):(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const page = Number(ctx.match[2]);
+
+  try {
+    return await renderHistory(ctx, accountId, Math.max(0, page));
+  } catch (e) {
+    return replaceUi(
+      ctx,
+      `❌ Gagal mengambil riwayat.\n\n${escapeHtml(safeErrorMessage(e))}`,
+      new InlineKeyboard().text("◀️ Account", `account:open:${accountId}`),
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
+/* =========================================================
+   ADMIN MANAGEMENT - OWNER ONLY
+========================================================= */
+
+bot.callbackQuery(/^admin:list:(\d+)$/, async ctx => {
+  const owner = await requireAdmin(ctx, { ownerOnly: true });
+  if (!owner) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const page = Number(ctx.match[1]);
+
+  try {
+    const result = await listAdmins(Math.max(0, page));
+    const lines = [
+      "👥 <b>DAFTAR ADMIN</b>",
+      `Total aktif: <b>${result.total}</b>`,
+      `Halaman: <b>${Math.max(0, page) + 1}</b>`,
+      "",
+      result.rows.length
+        ? result.rows.map((a, i) =>
+            `${String(Math.max(0, page) * ADMIN_PAGE_SIZE + i + 1).padStart(2, "0")}. ${a.role === "OWNER" ? "👑" : "👨‍💼"} <b>${escapeHtml(a.role)}</b>\n   🆔 <code>${escapeHtml(a.telegram_user_id)}</code>`
+          ).join("\n\n")
+        : "<i>Belum ada admin.</i>",
+      "",
+      "ADMIN UTAMA dapat menambah/menghapus admin anak."
+    ].join("\n");
+
+    return replaceUi(
+      ctx,
+      lines,
+      adminListKeyboard(result.rows, Math.max(0, page), result.hasNext),
+      { parse_mode: "HTML" }
+    );
+  } catch (e) {
+    return replaceUi(
+      ctx,
+      `❌ Gagal mengambil daftar admin.\n\n${escapeHtml(safeErrorMessage(e))}`,
+      backDashboardKeyboard(),
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
+bot.callbackQuery("admin:add", async ctx => {
+  const owner = await requireAdmin(ctx, { ownerOnly: true });
+  if (!owner) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  flows.set(String(ctx.from.id), {
+    t: "admin_add",
+    adminId: owner.id
+  });
+
+  return replaceUi(
+    ctx,
+    "➕ <b>TAMBAH ADMIN ANAK</b>\n\nKirim Telegram user ID admin baru.\n\nContoh: <code>7607446655</code>",
+    cancelKeyboard(true),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery("admin:delete", async ctx => {
+  const owner = await requireAdmin(ctx, { ownerOnly: true });
+  if (!owner) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  flows.set(String(ctx.from.id), {
+    t: "admin_delete",
+    adminId: owner.id
+  });
+
+  return replaceUi(
+    ctx,
+    "❌ <b>HAPUS ADMIN ANAK</b>\n\nKirim Telegram user ID admin anak yang akan dihapus.\n\nOwner/ADMIN UTAMA tidak dapat dihapus.",
+    cancelKeyboard(true),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery(/^admin:view:(\d+)$/, async ctx => {
+  const owner = await requireAdmin(ctx, { ownerOnly: true });
+  if (!owner) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const adminId = String(ctx.match[1]);
+
+  const { data, error } = await sb
+    .from("admins")
+    .select("*")
+    .eq("id", adminId)
+    .maybeSingle();
+
+  if (error || !data) {
+    return replaceUi(ctx, "❌ Admin tidak ditemukan.", new InlineKeyboard().text("◀️ Admin", "admin:list:0"), { parse_mode: "HTML" });
+  }
+
+  return replaceUi(
+    ctx,
+    `👨‍💼 <b>DETAIL ADMIN</b>\n\n` +
+      `Role: <b>${escapeHtml(data.role)}</b>\n` +
+      `Telegram ID: <code>${escapeHtml(data.telegram_user_id)}</code>\n` +
+      `Username: ${escapeHtml(data.username ? `@${data.username}` : "-")}\n` +
+      `Status: <b>${data.active ? "active" : "disabled"}</b>`,
+    new InlineKeyboard().text("◀️ Admin", "admin:list:0").text("🏠", "menu:dashboard"),
+    { parse_mode: "HTML" }
+  );
+});
+
+/* =========================================================
+   CANCEL FLOW
+========================================================= */
+
+bot.callbackQuery("flow:cancel", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery("Dibatalkan").catch(() => {});
+  flows.delete(String(ctx.from.id));
+
+  const waiter = waiters.get(String(ctx.from.id));
+  if (waiter) waiter.reject(new Error("Login dibatalkan."));
+
+  return replaceUi(
+    ctx,
+    "🏠 <b>Menu utama</b>\n\nSemua input yang sedang berjalan dibatalkan.",
+    adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu(),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery("admin:cancel", async ctx => {
+  const owner = await requireAdmin(ctx, { ownerOnly: true });
+  if (!owner) return;
+
+  await ctx.answerCallbackQuery("Dibatalkan").catch(() => {});
+  flows.delete(String(ctx.from.id));
+  return replaceUi(
+    ctx,
+    "🏠 <b>Dashboard Admin</b>",
+    ownerDashboardMenu(),
+    { parse_mode: "HTML" }
+  );
+});
+
+/* =========================================================
+   MESSAGE FLOW HANDLER
+========================================================= */
+
+bot.on("message", async ctx => {
+  const telegramUserId = ctx.from?.id;
+  if (!telegramUserId) return;
+
+  const adminRow = await getAdminByTelegramId(telegramUserId).catch(() => null);
+  if (!adminRow) return;
+
+  const userKey = String(telegramUserId);
+  const waiter = waiters.get(userKey);
+  const flow = flows.get(userKey);
+
+  // OTP / 2FA password
+  if (waiter && ["code", "password"].includes(waiter.type)) {
+    if (!ctx.message.text) {
+      return renderUi(
+        telegramUserId,
+        "❌ Input ini harus berupa teks.",
+        cancelKeyboard(false)
+      );
+    }
+
+    const text = ctx.message.text.trim();
+    if (!text) {
+      return renderUi(
+        telegramUserId,
+        "❌ Input tidak boleh kosong.",
+        cancelKeyboard(false)
+      );
+    }
+
+    // Try to reduce exposure of OTP/password in the admin chat.
+    try {
+      await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
+    } catch (_) {}
+
+    waiter.resolve(text);
+    return;
+  }
+
+  if (!flow) return;
+
+  try {
+    /* -------------------------
+       ADD ACCOUNT: LABEL
+    -------------------------- */
+    if (flow.t === "account_label") {
+      if (!ctx.message.text) {
+        return renderUi(
+          telegramUserId,
+          "❌ Label account harus berupa teks.",
+          cancelKeyboard(false)
+        );
+      }
+
+      const label = ctx.message.text.trim().replace(/\s+/g, " ").slice(0, 80);
+      if (label.length < 2) {
+        return renderUi(
+          telegramUserId,
+          "❌ Label terlalu pendek. Minimal 2 karakter.",
+          cancelKeyboard(false)
+        );
+      }
+
+      const account = await createAccountShell(label, adminRow.id);
+      flows.set(userKey, {
+        t: "account_phone_new",
+        accountId: String(account.id),
+        adminId: adminRow.id
+      });
+
+      return renderUi(
+        telegramUserId,
+        `🔐 <b>${escapeHtml(label)}</b>\n\nKirim nomor Telegram dalam format internasional.\nContoh: <code>+628123456789</code>`,
+        cancelKeyboard(false),
+        { parse_mode: "HTML" }
+      );
+    }
+
+    /* -------------------------
+       NEW ACCOUNT: PHONE
+    -------------------------- */
+    if (flow.t === "account_phone_new") {
+      if (!ctx.message.text) {
+        return renderUi(
+          telegramUserId,
+          "❌ Nomor Telegram harus berupa teks.",
+          cancelKeyboard(false)
+        );
+      }
+
+      const phone = ctx.message.text.trim();
+      if (!/^\+\d{7,15}$/.test(phone)) {
+        return renderUi(
+          telegramUserId,
+          "❌ Nomor tidak valid. Gunakan format internasional, contoh <code>+628123456789</code>.",
+          cancelKeyboard(false),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      flows.delete(userKey);
+      return startLogin(ctx, flow.accountId, phone, {
+        adminId: adminRow.id,
+        deleteOnFailure: true
+      });
+    }
+
+    /* -------------------------
+       EXISTING ACCOUNT: PHONE
+    -------------------------- */
+    if (flow.t === "account_phone") {
+      if (!ctx.message.text) {
+        return renderUi(
+          telegramUserId,
+          "❌ Nomor Telegram harus berupa teks.",
+          cancelKeyboard(false)
+        );
+      }
+
+      const phone = ctx.message.text.trim();
+      if (!/^\+\d{7,15}$/.test(phone)) {
+        return renderUi(
+          telegramUserId,
+          "❌ Nomor tidak valid. Gunakan format internasional.",
+          cancelKeyboard(false)
+        );
+      }
+
+      flows.delete(userKey);
+      return startLogin(ctx, flow.accountId, phone, {
+        adminId: adminRow.id,
+        deleteOnFailure: false
+      });
+    }
+
+    /* -------------------------
+       LABEL EDIT
+    -------------------------- */
+    if (flow.t === "account_label_edit") {
+      if (!ctx.message.text) {
+        return renderUi(
+          telegramUserId,
+          "❌ Label harus berupa teks.",
+          cancelKeyboard(false)
+        );
+      }
+
+      const label = ctx.message.text.trim().replace(/\s+/g, " ").slice(0, 80);
+      if (label.length < 2) {
+        return renderUi(
+          telegramUserId,
+          "❌ Label terlalu pendek.",
+          cancelKeyboard(false)
+        );
+      }
+
+      const { error } = await sb
+        .from("telegram_accounts")
+        .update({ label })
+        .eq("id", flow.accountId);
+
+      if (error) throw error;
+
+      await recordHistory(flow.accountId, adminRow.id, {
+        actionType: "label_update",
+        status: "success",
+        details: { label }
+      });
+
+      flows.delete(userKey);
+      return showAccount(ctx, flow.accountId, "✅ Label berhasil diperbarui.");
+    }
+
+    /* -------------------------
+       FORMAT
+    -------------------------- */
+    if (flow.t === "format") {
+      if (ctx.message.photo?.length) {
+        const photo = ctx.message.photo[ctx.message.photo.length - 1];
+        const caption = ctx.message.caption || "";
+
+        const { error } = await sb
+          .from("account_settings")
+          .update({
+            format_type: "photo",
+            message: "",
+            media_file_id: photo.file_id,
+            caption
+          })
+          .eq("account_id", flow.accountId);
+
+        if (error) throw error;
+
+        await recordHistory(flow.accountId, adminRow.id, {
+          actionType: "format_update",
+          status: "success",
+          details: { type: "photo", has_caption: Boolean(caption) }
+        });
+
+        flows.delete(userKey);
+        return showAccount(ctx, flow.accountId, "✅ Format foto berhasil disimpan.");
+      }
+
+      if (ctx.message.text) {
+        const message = ctx.message.text.trim();
+        if (!message) {
+          return renderUi(
+            telegramUserId,
+            "❌ Format teks tidak boleh kosong.",
+            cancelKeyboard(false)
+          );
+        }
+
+        const { error } = await sb
+          .from("account_settings")
+          .update({
+            format_type: "text",
+            message,
+            media_file_id: null,
+            caption: null
+          })
+          .eq("account_id", flow.accountId);
+
+        if (error) throw error;
+
+        await recordHistory(flow.accountId, adminRow.id, {
+          actionType: "format_update",
+          status: "success",
+          details: { type: "text" }
+        });
+
+        flows.delete(userKey);
+        return showAccount(ctx, flow.accountId, "✅ Format teks berhasil disimpan.");
+      }
+
+      return renderUi(
+        telegramUserId,
+        "❌ Format tidak didukung. Kirim teks atau foto.",
+        cancelKeyboard(false)
+      );
+    }
+
+    /* -------------------------
+       DELAY
+    -------------------------- */
+    if (flow.t === "delay") {
+      const minutes = parseMinutes(ctx.message.text);
+      if (!minutes) {
+        return renderUi(
+          telegramUserId,
+          "❌ Jeda tidak valid. Contoh: <code>10 menit</code> atau <code>1 jam</code>.",
+          cancelKeyboard(false),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      const { error } = await sb
+        .from("account_settings")
+        .update({ delay_minutes: minutes })
+        .eq("account_id", flow.accountId);
+
+      if (error) throw error;
+
+      const settings = await getAccountSettings(flow.accountId);
+
+      // Apply new delay to a running scheduler without creating a second task.
+      if (settings?.promotion_enabled && schedulerTasks.has(String(flow.accountId))) {
+        scheduleAccount(
+          flow.accountId,
+          Math.max(1000, minutes * 60 * 1000)
+        );
+      }
+
+      await recordHistory(flow.accountId, adminRow.id, {
+        actionType: "delay_update",
+        status: "success",
+        details: { delay_minutes: minutes }
+      });
+
+      flows.delete(userKey);
+      return showAccount(
+        ctx,
+        flow.accountId,
+        `✅ Jeda disimpan: <b>${escapeHtml(formatInterval(minutes))}</b>`
+      );
+    }
+
+    /* -------------------------
+       DURATION
+    -------------------------- */
+    if (flow.t === "duration") {
+      const hours = parseHours(ctx.message.text);
+      if (!hours) {
+        return renderUi(
+          telegramUserId,
+          "❌ Durasi tidak valid. Contoh: <code>3 hari</code> atau <code>12 jam</code>.",
+          cancelKeyboard(false),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      const current = await getAccountSettings(flow.accountId);
+      const update = { duration_hours: hours };
+
+      if (current?.promotion_enabled) {
+        update.promotion_expires_at = new Date(
+          Date.now() + hours * 60 * 60 * 1000
+        ).toISOString();
+      }
+
+      const { error } = await sb
+        .from("account_settings")
+        .update(update)
+        .eq("account_id", flow.accountId);
+
+      if (error) throw error;
+
+      await recordHistory(flow.accountId, adminRow.id, {
+        actionType: "duration_update",
+        status: "success",
+        details: { duration_hours: hours }
+      });
+
+      flows.delete(userKey);
+      return showAccount(
+        ctx,
+        flow.accountId,
+        `✅ Durasi disimpan: <b>${escapeHtml(formatDuration(hours))}</b>`
+      );
+    }
+
+    /* -------------------------
+       ADMIN ADD
+    -------------------------- */
+    if (flow.t === "admin_add") {
+      if (adminRow.role !== "OWNER") {
+        flows.delete(userKey);
+        return renderUi(
+          telegramUserId,
+          "⛔ Akses ditolak.",
+          backDashboardKeyboard(),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      const targetId = parsePositiveTelegramId(ctx.message.text);
+      if (!targetId) {
+        return renderUi(
+          telegramUserId,
+          "❌ Telegram ID harus berupa angka positif.",
+          cancelKeyboard(true),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      const existing = await sb
+        .from("admins")
+        .select("*")
+        .eq("telegram_user_id", targetId)
+        .maybeSingle();
+
+      if (existing.error) throw existing.error;
+
+      if (existing.data) {
+        if (existing.data.active) {
+          flows.delete(userKey);
+          return replaceUi(
+            ctx,
+            `ℹ️ Telegram ID <code>${targetId}</code> sudah terdaftar sebagai <b>${escapeHtml(existing.data.role)}</b>.`,
+            new InlineKeyboard().text("👥 Admin", "admin:list:0"),
+            { parse_mode: "HTML" }
+          );
+        }
+
+        const { error } = await sb
+          .from("admins")
+          .update({ role: "ADMIN", active: true })
+          .eq("id", existing.data.id);
+        if (error) throw error;
+      } else {
+        const { error } = await sb
+          .from("admins")
+          .insert({
+            telegram_user_id: targetId,
+            role: "ADMIN",
+            active: true
+          });
+        if (error) throw error;
+      }
+
+      flows.delete(userKey);
+      return replaceUi(
+        ctx,
+        `✅ <b>ADMIN ANAK DITAMBAHKAN</b>\n\nTelegram ID <code>${targetId}</code> sekarang dapat mengelola akun Telegram dan promosi.\n\nMenu manajemen admin tetap hanya tersedia untuk OWNER.`,
+        new InlineKeyboard().text("👥 Daftar Admin", "admin:list:0").row().text("🏠 Dashboard", "menu:dashboard"),
+        { parse_mode: "HTML" }
+      );
+    }
+
+    /* -------------------------
+       ADMIN DELETE
+    -------------------------- */
+    if (flow.t === "admin_delete") {
+      if (adminRow.role !== "OWNER") {
+        flows.delete(userKey);
+        return renderUi(
+          telegramUserId,
+          "⛔ Akses ditolak.",
+          backDashboardKeyboard(),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      const targetId = parsePositiveTelegramId(ctx.message.text);
+      if (!targetId) {
+        return renderUi(
+          telegramUserId,
+          "❌ Telegram ID harus berupa angka positif.",
+          cancelKeyboard(true)
+        );
+      }
+
+      if (isOwnerId(targetId)) {
+        return renderUi(
+          telegramUserId,
+          "⛔ Telegram ID OWNER dari ENV tidak dapat dihapus dari sistem.",
+          cancelKeyboard(true),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      const existing = await sb
+        .from("admins")
+        .select("*")
+        .eq("telegram_user_id", targetId)
+        .maybeSingle();
+
+      if (existing.error) throw existing.error;
+
+      if (!existing.data || existing.data.role !== "ADMIN") {
+        flows.delete(userKey);
+        return replaceUi(
+          ctx,
+          `❌ Admin anak dengan Telegram ID <code>${targetId}</code> tidak ditemukan.`,
+          new InlineKeyboard().text("👥 Admin", "admin:list:0"),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      const { error } = await sb
+        .from("admins")
+        .delete()
+        .eq("id", existing.data.id)
+        .eq("role", "ADMIN");
+
+      if (error) throw error;
+
+      flows.delete(userKey);
+      return replaceUi(
+        ctx,
+        `✅ Admin anak <code>${targetId}</code> telah dihapus.\n\nAkun Telegram dan promosi tidak ikut dihentikan karena admin hanya merupakan controller.`,
+        new InlineKeyboard().text("👥 Daftar Admin", "admin:list:0").row().text("🏠 Dashboard", "menu:dashboard"),
+        { parse_mode: "HTML" }
+      );
+    }
+  } catch (e) {
+    console.error("MESSAGE FLOW:", safeErrorMessage(e));
+
+    // Do not leak session material or internal credentials.
+    const message = safeErrorMessage(e, 700);
+    return renderUi(
+      telegramUserId,
+      `❌ <b>Gagal memproses input.</b>\n\n${escapeHtml(message)}`,
+      cancelKeyboard(false),
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
+/* =========================================================
+   UNKNOWN CALLBACK SAFETY NET
+========================================================= */
+
+bot.on("callback_query:data", async ctx => {
+  await ctx.answerCallbackQuery(
+    "Menu tidak tersedia atau sudah kedaluwarsa.",
+    { show_alert: true }
+  ).catch(() => {});
+});
+
+/* =========================================================
+   RESTORE RUNNING PROMOTIONS / SESSIONS
+========================================================= */
+
+async function restoreSessions() {
+  const { data, error } = await sb
+    .from("telegram_accounts")
+    .select("id,status,session_encrypted")
+    .eq("status", "connected");
+
+  if (error) throw error;
+
+  for (const row of data || []) {
+    if (!row.session_encrypted) continue;
+
+    try {
+      const client = await clientFor(row.id);
+      if (client) {
+        clients.set(String(row.id), client);
+      }
+    } catch (e) {
+      console.warn(
+        `ACCOUNT ${row.id} RESTORE SESSION:`,
+        safeErrorMessage(e, 250)
+      );
+    }
+  }
+}
+
+async function restoreRunningPromotions() {
+  const { data, error } = await sb
+    .from("account_settings")
+    .select("account_id,promotion_enabled,promotion_expires_at,delay_minutes")
+    .eq("promotion_enabled", true);
+
+  if (error) throw error;
+
+  for (const row of data || []) {
+    if (
+      !row.promotion_expires_at ||
+      new Date(row.promotion_expires_at) <= new Date()
+    ) {
+      await sb
+        .from("account_settings")
+        .update({
+          promotion_enabled: false,
+          promotion_expires_at: null,
+          promotion_started_at: null,
+          started_by_admin_id: null
+        })
+        .eq("account_id", row.account_id);
+      continue;
+    }
+
+    // Each account gets its own independent task.
+    scheduleAccount(row.account_id, 0);
+  }
+}
+
+/* =========================================================
+   ERROR HANDLING / BOT START
+========================================================= */
+
 bot.catch(err => {
-  console.error("BOT ERROR:", err.error || err);
+  console.error("BOT:", err?.error || err);
 });
 
-/* =========================
-   INIT
-========================= */
-(async () => {
-  console.log("Seeding admins from env...");
-  await seedAdminsFromEnv();
-
-  console.log("Restoring Telegram sessions...");
-  await restoreSessions();
-
-  console.log("Restoring active schedules...");
-  await restoreSchedules();
-
-  await bot.start();
-  console.log("Telegram bot started.");
-})().catch(err => {
-  console.error("FATAL:", err);
-  process.exit(1);
-});
-
-/* =========================
-   HTTP SERVER (healthcheck)
-========================= */
 const app = express();
-app.get("/", (_, res) => res.json({
-  ok: true, service: "telegram-auto-bot", version: BOT_VERSION,
-}));
-app.get("/health", (_, res) => res.json({ ok: true }));
-app.listen(PORT, () => console.log(`HTTP listening on :${PORT}`));
 
-/* =========================
-   GRACEFUL SHUTDOWN
-========================= */
-function shutdown() {
-  for (const s of schedulers.values()) if (s?.timer) clearTimeout(s.timer);
-  schedulers.clear();
+app.get("/", (_, res) => {
+  res.json({
+    ok: true,
+    service: "telegram-admin-bot",
+    version: BOT_VERSION
+  });
+});
+
+app.get("/health", (_, res) => {
+  res.json({
+    ok: true,
+    accountsLoaded: clients.size,
+    schedulersRunning: schedulerTasks.size
+  });
+});
+
+app.listen(
+  Number(process.env.PORT || 3000),
+  () => {
+    console.log(
+      `HTTP server listening on ${process.env.PORT || 3000}`
+    );
+  }
+);
+
+async function gracefulShutdown(signal) {
+  console.log(`${signal}: shutting down without Telegram logout...`);
+
+  for (const task of schedulerTasks.values()) {
+    task.running = false;
+    if (task.timeout) clearTimeout(task.timeout);
+  }
+  schedulerTasks.clear();
+
+  // Intentionally disconnect local sockets only. The Telegram session is NOT logged out
+  // and encrypted session remains in the database for reconnect after restart.
+  for (const [accountId, client] of clients.entries()) {
+    try {
+      await client.disconnect();
+    } catch (_) {}
+    clients.delete(accountId);
+  }
+
   process.exit(0);
 }
-process.once("SIGINT", shutdown);
-process.once("SIGTERM", shutdown);
+
+process.once("SIGINT", () => {
+  void gracefulShutdown("SIGINT");
+});
+
+process.once("SIGTERM", () => {
+  void gracefulShutdown("SIGTERM");
+});
+
+(async () => {
+  try {
+    await ensureBootstrapOwners();
+
+    // Legacy import must never prevent the new bot from starting.
+    // If an old table/schema differs from the expected legacy shape,
+    // the warning is logged and the migration can be retried on a later restart.
+    try {
+      await migrateLegacyData();
+    } catch (e) {
+      console.error(
+        "LEGACY MIGRATION WARNING:",
+        safeErrorMessage(e, 800)
+      );
+    }
+
+    await restoreSessions();
+    await restoreRunningPromotions();
+    await bot.start();
+    console.log("Telegram admin bot started.");
+  } catch (e) {
+    console.error("FATAL:", e);
+    process.exit(1);
+  }
+})();
