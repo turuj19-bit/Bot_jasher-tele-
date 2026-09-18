@@ -217,7 +217,7 @@ function accountStatusIcon(account) {
 }
 
 function promotionStatusIcon(settings) {
-  if (settings?.promotion_enabled) return "▶️";
+  if (settings?.active) return "▶️";
   return "⏹";
 }
 
@@ -470,6 +470,12 @@ async function replaceUi(ctx, text, keyboard, options = {}) {
 
 async function renderStart(ctx, text, keyboard) {
   const userId = ctx.from.id;
+  const saved = uiMessages.get(String(userId));
+
+  // Reuse the existing dashboard UI instead of stacking new messages.
+  if (saved) {
+    return renderUi(userId, text, keyboard, { parse_mode: "HTML" });
+  }
 
   if (START_BANNER_FILE_ID) {
     try {
@@ -568,7 +574,7 @@ async function getDashboardStats() {
     sb.from("admins").select("*", { count: "exact", head: true }).eq("active", true),
     sb.from("telegram_accounts").select("*", { count: "exact", head: true }),
     sb.from("telegram_accounts").select("*", { count: "exact", head: true }).eq("status", "connected"),
-    sb.from("account_settings").select("*", { count: "exact", head: true }).eq("promotion_enabled", true),
+    sb.from("account_settings").select("*", { count: "exact", head: true }).eq("active", true),
     sb.from("account_groups").select("*", { count: "exact", head: true }).eq("enabled", true).eq("can_send", true)
   ]);
 
@@ -650,8 +656,8 @@ function accountMenu(account, settings) {
     .row()
     .text("📅 Durasi", `promo:duration:${account.id}`)
     .text(
-      settings?.promotion_enabled ? "⏹ Stop" : "▶️ Start",
-      settings?.promotion_enabled
+      settings?.active ? "⏹ Stop" : "▶️ Start",
+      settings?.active
         ? `promo:stop:${account.id}`
         : `promo:start:${account.id}`
     )
@@ -798,15 +804,15 @@ async function accountHasAccess(accountId) {
   return account;
 }
 
-async function createAccountShell(label, adminId) {
+async function createAccountShell(label, adminId, phone = null) {
   const { data, error } = await sb
     .from("telegram_accounts")
     .insert({
-      label: label.trim(),
+      label: String(label || "Telegram Account").trim(),
       status: "disconnected",
-      created_by_admin_id: adminId,
-      phone: null,
-      session_encrypted: null
+      created_by: adminId,
+      phone: phone || null,
+      session_string: null
     })
     .select("*")
     .single();
@@ -948,11 +954,11 @@ async function clientFor(accountOrId) {
 
   const loadPromise = (async () => {
     const account = await getAccount(accountId);
-    if (!account?.session_encrypted) return null;
+    if (!account?.session_string) return null;
 
     let sessionString;
     try {
-      sessionString = decryptSession(account.session_encrypted);
+      sessionString = decryptSession(account.session_string);
     } catch (e) {
       console.error(`ACCOUNT ${accountId} SESSION DECRYPT:`, safeErrorMessage(e));
       await markAccountStatus(accountId, "error");
@@ -1003,6 +1009,32 @@ async function closeClient(accountId) {
   } catch (_) {}
 
   clients.delete(key);
+}
+
+async function deleteAccountAfterLoginFailure(accountId) {
+  const key = String(accountId);
+
+  await stopScheduler(key);
+  await closeClient(key);
+
+  // Remove child rows first so the account FK can be deleted cleanly.
+  const groupsResult = await sb
+    .from("account_groups")
+    .delete()
+    .eq("account_id", key);
+  if (groupsResult.error) throw groupsResult.error;
+
+  const settingsResult = await sb
+    .from("account_settings")
+    .delete()
+    .eq("account_id", key);
+  if (settingsResult.error) throw settingsResult.error;
+
+  const accountResult = await sb
+    .from("telegram_accounts")
+    .delete()
+    .eq("id", key);
+  if (accountResult.error) throw accountResult.error;
 }
 
 async function getMeFromClient(client) {
@@ -1112,8 +1144,7 @@ async function refreshGroups(accountId) {
       account_id: accountId,
       telegram_group_id: telegramGroupId,
       title: dialog.title || entity.title || "Tanpa Nama",
-      can_send: canSend,
-      last_seen_at: new Date().toISOString()
+      can_send: canSend
     });
   }
 
@@ -1186,7 +1217,7 @@ async function downloadBotPhoto(fileId) {
 function settingsFormatText(settings) {
   if (!settings) return "Belum ada format.";
 
-  if (settings.format_type === "photo") {
+  if (settings.media_type === "photo") {
     return `🖼️ Foto${settings.caption ? " + caption" : " tanpa caption"}`;
   }
 
@@ -1199,12 +1230,12 @@ function settingsSummary(account, settings) {
     `🆔 ID internal: <code>${escapeHtml(account.id)}</code>`,
     `🔗 Telegram ID: <code>${escapeHtml(account.telegram_user_id || "belum")}</code>`,
     `📌 Koneksi: <b>${escapeHtml(account.status || "-")}</b>`,
-    `▶️ Promosi: <b>${settings?.promotion_enabled ? "RUNNING" : "STOPPED"}</b>`,
+    `▶️ Promosi: <b>${settings?.active ? "RUNNING" : "STOPPED"}</b>`,
     `📝 Format: <b>${escapeHtml(settingsFormatText(settings))}</b>`,
-    `⏱ Jeda: <b>${escapeHtml(formatInterval(settings?.delay_minutes))}</b>`,
+    `⏱ Jeda: <b>${escapeHtml(formatInterval(settings?.interval_minutes))}</b>`,
     `📅 Durasi: <b>${escapeHtml(formatDuration(settings?.duration_hours))}</b>`,
-    settings?.promotion_expires_at
-      ? `⌛ Berakhir: <b>${escapeHtml(formatDate(settings.promotion_expires_at))}</b>`
+    settings?.expires_at
+      ? `⌛ Berakhir: <b>${escapeHtml(formatDate(settings.expires_at))}</b>`
       : null,
     account.phone
       ? `☎️ Nomor: <code>${escapeHtml(account.phone)}</code>`
@@ -1223,43 +1254,15 @@ async function recordHistory(accountId, adminId, payload = {}) {
       account = await getAccount(accountId);
     }
 
-    let adminRow = null;
-    if (adminId && !payload.adminTelegramUserId) {
-      adminRow = await sb
-        .from("admins")
-        .select("id,telegram_user_id,first_name,username")
-        .eq("id", adminId)
-        .maybeSingle();
-
-      if (adminRow.error) throw adminRow.error;
-      adminRow = adminRow.data;
-    }
-
-    let groupTitle = payload.groupTitle || null;
-
-    if (payload.groupId && !groupTitle) {
-      const group = await sb
-        .from("account_groups")
-        .select("title")
-        .eq("id", payload.groupId)
-        .maybeSingle();
-
-      if (!group.error) groupTitle = group.data?.title || null;
-    }
-
     const row = {
       account_id: account?.id || accountId || null,
       account_label: account?.label || payload.accountLabel || "Account",
-      admin_id: adminRow?.id || adminId || null,
-      admin_telegram_user_id: adminRow?.telegram_user_id || payload.adminTelegramUserId || null,
+      admin_id: adminId || null,
       group_id: payload.groupId || null,
-      group_title: groupTitle,
-      action_type: payload.actionType,
+      group_title: payload.groupTitle || null,
+      action: payload.action || payload.actionType || "unknown",
       status: payload.status || "success",
-      error: payload.error ? String(payload.error).slice(0, 1000) : null,
-      details: payload.details || {},
-      legacy_source: payload.legacySource || null,
-      legacy_source_id: payload.legacySourceId || null
+      error: payload.error ? String(payload.error).slice(0, 1000) : null
     };
 
     const { error } = await sb.from("promotion_history").insert(row);
@@ -1286,7 +1289,7 @@ async function renderHistory(ctx, accountId, page = 0) {
     sb
       .from("promotion_history")
       .select(
-        "id,account_id,account_label,admin_id,admin_telegram_user_id,group_id,group_title,action_type,status,error,details,created_at"
+        "id,account_id,account_label,admin_id,group_id,group_title,action,status,error,created_at"
       )
       .eq("account_id", accountId)
       .order("created_at", { ascending: false })
@@ -1329,21 +1332,27 @@ async function renderHistory(ctx, accountId, page = 0) {
   const lines = [];
 
   for (const [index, row] of visible.entries()) {
-    const status = row.status === "success" ? "✅" : row.status === "error" ? "❌" : "ℹ️";
+    const status =
+      row.status === "success" ? "✅" :
+      row.status === "error" ? "❌" :
+      row.status === "skipped" ? "⏭️" : "ℹ️";
+
     const admin = adminMap.get(String(row.admin_id));
-    const adminLabel = row.admin_telegram_user_id
-      ? String(row.admin_telegram_user_id)
-      : admin?.telegram_user_id
-        ? String(admin.telegram_user_id)
-        : "legacy/unknown";
-    const groupTitle = row.group_title || groupMap.get(String(row.group_id)) || "-";
+    const adminLabel = admin?.telegram_user_id
+      ? String(admin.telegram_user_id)
+      : "system";
+
+    const groupTitle =
+      row.group_title ||
+      groupMap.get(String(row.group_id)) ||
+      "-";
 
     const errorLine = row.error
       ? `\n⚠️ ${escapeHtml(String(row.error).slice(0, 120))}`
       : "";
 
     lines.push(
-      `${status} <b>#${offset + index + 1}</b> • <b>${escapeHtml(row.action_type)}</b>\n` +
+      `${status} <b>#${offset + index + 1}</b> • <b>${escapeHtml(row.action || "-")}</b>\n` +
       `👤 Admin: <code>${escapeHtml(adminLabel)}</code>\n` +
       `👥 Target: <b>${escapeHtml(groupTitle)}</b>\n` +
       `🕐 ${escapeHtml(formatDate(row.created_at))}${errorLine}`
@@ -1444,45 +1453,35 @@ async function fireAccount(accountId) {
   const account = await getAccount(accountId);
   const settings = await getAccountSettings(accountId);
 
-  if (!account || !settings?.promotion_enabled) {
+  if (!account || !settings?.active) {
     return { shouldContinue: false, delayMs: 0 };
   }
 
   const now = new Date();
   if (
-    !settings.promotion_expires_at ||
-    new Date(settings.promotion_expires_at) <= now
+    !settings.expires_at ||
+    new Date(settings.expires_at) <= now
   ) {
     await sb
       .from("account_settings")
       .update({
-        promotion_enabled: false,
-        promotion_expires_at: null,
-        promotion_started_at: null,
-        started_by_admin_id: null
+        active: false,
+        expires_at: null,
+        started_at: null,
       })
       .eq("account_id", accountId);
 
     return { shouldContinue: false, delayMs: 0 };
   }
 
-  let starterAdminTelegramId = null;
-  if (settings.started_by_admin_id) {
-    const starter = await sb
-      .from("admins")
-      .select("telegram_user_id")
-      .eq("id", settings.started_by_admin_id)
-      .maybeSingle();
-    if (!starter.error) starterAdminTelegramId = starter.data?.telegram_user_id || null;
-  }
-
+  const starterAdminTelegramId = null;
   const client = await clientFor(accountId);
   if (!client) {
     await markAccountStatus(accountId, "error");
-    await recordHistory(accountId, settings.started_by_admin_id, {
+    await recordHistory(accountId, null, {
       accountLabel: account.label,
       adminTelegramUserId: starterAdminTelegramId,
-      actionType: "promotion_send",
+      action: "promotion_send",
       status: "error",
       error: "Akun Telegram tidak terhubung atau session tidak valid.",
       details: { retryInSeconds: 120 }
@@ -1504,10 +1503,10 @@ async function fireAccount(accountId) {
   const groups = groupsResult.data || [];
 
   if (!groups.length) {
-    await recordHistory(accountId, settings.started_by_admin_id, {
+    await recordHistory(accountId, null, {
       accountLabel: account.label,
       adminTelegramUserId: starterAdminTelegramId,
-      actionType: "promotion_send",
+      action: "promotion_send",
       status: "skipped",
       error: "Tidak ada target grup aktif.",
       details: {}
@@ -1515,7 +1514,7 @@ async function fireAccount(accountId) {
 
     return {
       shouldContinue: true,
-      delayMs: Number(settings.delay_minutes || 10) * 60 * 1000
+      delayMs: Number(settings.interval_minutes || 10) * 60 * 1000
     };
   }
 
@@ -1532,15 +1531,15 @@ async function fireAccount(accountId) {
   }
 
   let photoBuffer = null;
-  if (settings.format_type === "photo" && settings.media_file_id) {
+  if (settings.media_type === "photo" && settings.media_file_id) {
     try {
       photoBuffer = await downloadBotPhoto(settings.media_file_id);
     } catch (e) {
       const reason = safeErrorMessage(e);
-      await recordHistory(accountId, settings.started_by_admin_id, {
+      await recordHistory(accountId, null, {
         accountLabel: account.label,
         adminTelegramUserId: starterAdminTelegramId,
-        actionType: "promotion_send",
+        action: "promotion_send",
         status: "error",
         error: `Foto format gagal diambil: ${reason}`,
         details: { media: true }
@@ -1548,7 +1547,7 @@ async function fireAccount(accountId) {
 
       return {
         shouldContinue: true,
-        delayMs: Number(settings.delay_minutes || 10) * 60 * 1000
+        delayMs: Number(settings.interval_minutes || 10) * 60 * 1000
       };
     }
   }
@@ -1566,10 +1565,10 @@ async function fireAccount(accountId) {
       skippedCount++;
       const reason = "Entity grup tidak ditemukan di dialog Telegram";
       failures.set(reason, (failures.get(reason) || 0) + 1);
-      await recordHistory(accountId, settings.started_by_admin_id, {
+      await recordHistory(accountId, null, {
         accountLabel: account.label,
         adminTelegramUserId: starterAdminTelegramId,
-        actionType: "promotion_send",
+        action: "promotion_send",
         status: "error",
         groupId: group.id,
         groupTitle: group.title,
@@ -1580,7 +1579,7 @@ async function fireAccount(accountId) {
     }
 
     try {
-      if (settings.format_type === "photo" && photoBuffer) {
+      if (settings.media_type === "photo" && photoBuffer) {
         await client.sendFile(target, {
           file: photoBuffer,
           caption: settings.caption || "",
@@ -1596,15 +1595,15 @@ async function fireAccount(accountId) {
       }
 
       successCount++;
-      await recordHistory(accountId, settings.started_by_admin_id, {
+      await recordHistory(accountId, null, {
         accountLabel: account.label,
         adminTelegramUserId: starterAdminTelegramId,
-        actionType: "promotion_send",
+        action: "promotion_send",
         status: "success",
         groupId: group.id,
         groupTitle: group.title,
         details: {
-          format: settings.format_type,
+          format: settings.media_type,
           telegram_group_id: group.telegram_group_id
         }
       });
@@ -1614,10 +1613,10 @@ async function fireAccount(accountId) {
       failures.set(reason, (failures.get(reason) || 0) + 1);
       floodWaitMs = Math.max(floodWaitMs, extractFloodWaitMs(e));
 
-      await recordHistory(accountId, settings.started_by_admin_id, {
+      await recordHistory(accountId, null, {
         accountLabel: account.label,
         adminTelegramUserId: starterAdminTelegramId,
-        actionType: "promotion_send",
+        action: "promotion_send",
         status: "error",
         groupId: group.id,
         groupTitle: group.title,
@@ -1654,7 +1653,7 @@ async function fireAccount(accountId) {
     } catch (_) {}
   }
 
-  const baseDelay = Number(settings.delay_minutes || 10) * 60 * 1000;
+  const baseDelay = Number(settings.interval_minutes || 10) * 60 * 1000;
   const delayMs = Math.max(baseDelay, floodWaitMs);
 
   return { shouldContinue: true, delayMs };
@@ -1687,15 +1686,15 @@ function scheduleAccount(accountId, delayMs = 0) {
       console.error(`PROMOTION ${key}:`, safeErrorMessage(e));
       const settings = await getAccountSettings(accountId).catch(() => null);
 
-      await recordHistory(accountId, settings?.started_by_admin_id || null, {
-        actionType: "promotion_send",
+      await recordHistory(accountId, null, {
+        action: "promotion_send",
         status: "error",
         error: safeErrorMessage(e, 1000)
       });
 
       nextDelay = Math.max(
         60000,
-        Number(settings?.delay_minutes || 10) * 60 * 1000
+        Number(settings?.interval_minutes || 10) * 60 * 1000
       );
     }
 
@@ -1703,22 +1702,21 @@ function scheduleAccount(accountId, delayMs = 0) {
     if (latest !== task || !task.running) return;
 
     const settings = await getAccountSettings(accountId).catch(() => null);
-    if (!settings?.promotion_enabled) {
+    if (!settings?.active) {
       schedulerTasks.delete(key);
       return;
     }
 
     if (
-      settings.promotion_expires_at &&
-      new Date(settings.promotion_expires_at) <= new Date()
+      settings.expires_at &&
+      new Date(settings.expires_at) <= new Date()
     ) {
       await sb
         .from("account_settings")
         .update({
-          promotion_enabled: false,
-          promotion_expires_at: null,
-          promotion_started_at: null,
-          started_by_admin_id: null
+          active: false,
+          expires_at: null,
+          started_at: null,
         })
         .eq("account_id", accountId);
 
@@ -1749,7 +1747,7 @@ async function startPromotion(accountId, adminId) {
     if (!account) throw new Error("Account tidak ditemukan.");
     if (!settings) throw new Error("Setting account belum tersedia.");
 
-    if (settings.promotion_enabled && schedulerTasks.has(String(accountId))) {
+    if (settings.active && schedulerTasks.has(String(accountId))) {
       return { alreadyRunning: true, account, settings };
     }
 
@@ -1759,8 +1757,8 @@ async function startPromotion(accountId, adminId) {
     }
 
     const formatReady =
-      (settings.format_type === "text" && String(settings.message || "").trim()) ||
-      (settings.format_type === "photo" && settings.media_file_id);
+      (settings.media_type === "text" && String(settings.message || "").trim()) ||
+      (settings.media_type === "photo" && settings.media_file_id);
 
     if (!formatReady) {
       throw new Error("Format promosi belum dibuat.");
@@ -1786,10 +1784,9 @@ async function startPromotion(accountId, adminId) {
     const { data: updated, error } = await sb
       .from("account_settings")
       .update({
-        promotion_enabled: true,
-        promotion_started_at: now.toISOString(),
-        promotion_expires_at: expiresAt.toISOString(),
-        started_by_admin_id: adminId
+        active: true,
+        started_at: now.toISOString(),
+        expires_at: expiresAt.toISOString(),
       })
       .eq("account_id", accountId)
       .select("*")
@@ -1798,10 +1795,10 @@ async function startPromotion(accountId, adminId) {
     if (error) throw error;
 
     await recordHistory(accountId, adminId, {
-      actionType: "promotion_start",
+      action: "promotion_start",
       status: "success",
       details: {
-        delay_minutes: updated.delay_minutes,
+        interval_minutes: updated.interval_minutes,
         duration_hours: updated.duration_hours
       }
     });
@@ -1828,22 +1825,21 @@ async function stopPromotion(accountId, adminId) {
 
     if (error) throw error;
 
-    const wasRunning = Boolean(settings?.promotion_enabled);
+    const wasRunning = Boolean(settings?.active);
 
     const { error: updateError } = await sb
       .from("account_settings")
       .update({
-        promotion_enabled: false,
-        promotion_expires_at: null,
-        promotion_started_at: null,
-        started_by_admin_id: null
+        active: false,
+        expires_at: null,
+        started_at: null,
       })
       .eq("account_id", accountId);
 
     if (updateError) throw updateError;
 
     await recordHistory(accountId, adminId, {
-      actionType: "promotion_stop",
+      action: "promotion_stop",
       status: "success",
       details: { was_running: wasRunning }
     });
@@ -1875,7 +1871,22 @@ function waitForInput(adminTelegramId, nextType, timeoutMs = 5 * 60 * 1000) {
       resolve(value) {
         clearTimeout(timer);
         waiters.delete(userId);
-        resolve(value);
+
+        const normalized =
+          nextType === "code"
+            ? String(value ?? "").replace(/\s+/g, "").trim()
+            : String(value ?? "").trim();
+
+        if (!normalized) {
+          reject(new Error(
+            nextType === "code"
+              ? "Kode OTP tidak boleh kosong."
+              : "Password 2FA tidak boleh kosong."
+          ));
+          return;
+        }
+
+        resolve(normalized);
       },
       reject(error) {
         clearTimeout(timer);
@@ -1887,8 +1898,12 @@ function waitForInput(adminTelegramId, nextType, timeoutMs = 5 * 60 * 1000) {
 }
 
 async function createAnimatedLoginStatus(ctx, phone) {
+  const userId = String(ctx.from.id);
   const chatId = ctx.chat?.id || ctx.from.id;
   const safePhone = escapeHtml(phone);
+
+  // Keep the bot UI to a single editable message while login is running.
+  await deleteSavedUi(userId);
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
   let index = 0;
   let stopped = false;
@@ -1907,6 +1922,7 @@ async function createAnimatedLoginStatus(ctx, phone) {
     parse_mode: "HTML",
     reply_markup: markup
   });
+  await saveUiMessage(userId, message, false);
 
   const schedule = () => {
     if (stopped) return;
@@ -1958,6 +1974,7 @@ async function createAnimatedLoginStatus(ctx, phone) {
 
 async function startLogin(ctx, accountId, phone, options = {}) {
   const adminTelegramId = ctx.from.id;
+  const userKey = String(adminTelegramId);
   const client = await createTelegramClient("");
   let loginStatus = null;
 
@@ -1978,10 +1995,13 @@ async function startLogin(ctx, accountId, phone, options = {}) {
       phoneNumber: async () => phone,
 
       phoneCode: async () => {
-        flows.set(String(adminTelegramId), {
+        // Register the waiter BEFORE editing Telegram UI so a fast OTP message
+        // cannot arrive between the prompt and wait registration.
+        flows.set(userKey, {
           t: "login_code",
           accountId: String(accountId)
         });
+        const codePromise = waitForInput(adminTelegramId, "code");
 
         await loginStatus.update(
           [
@@ -1995,14 +2015,15 @@ async function startLogin(ctx, accountId, phone, options = {}) {
           cancelKeyboard(false)
         );
 
-        return waitForInput(adminTelegramId, "code");
+        return codePromise;
       },
 
       password: async () => {
-        flows.set(String(adminTelegramId), {
+        flows.set(userKey, {
           t: "login_password",
           accountId: String(accountId)
         });
+        const passwordPromise = waitForInput(adminTelegramId, "password");
 
         await loginStatus.update(
           [
@@ -2016,7 +2037,7 @@ async function startLogin(ctx, accountId, phone, options = {}) {
           cancelKeyboard(false)
         );
 
-        return waitForInput(adminTelegramId, "password");
+        return passwordPromise;
       },
 
       onError: async error => {
@@ -2025,11 +2046,13 @@ async function startLogin(ctx, accountId, phone, options = {}) {
     });
 
     const identity = await getMeFromClient(client);
+
     const { data: other, error: otherError } = await sb
       .from("telegram_accounts")
       .select("id,label")
       .eq("telegram_user_id", identity.telegramUserId)
       .neq("id", accountId)
+      .limit(1)
       .maybeSingle();
 
     if (otherError) throw otherError;
@@ -2040,18 +2063,23 @@ async function startLogin(ctx, accountId, phone, options = {}) {
       );
     }
 
+    const derivedLabel =
+      [identity.firstName, identity.lastName].filter(Boolean).join(" ").trim() ||
+      identity.username ||
+      phone;
+
     const sessionString = client.session.save();
     const sessionEncrypted = encryptSession(sessionString);
 
     const { data: updated, error } = await sb
       .from("telegram_accounts")
       .update({
+        label: derivedLabel.slice(0, 80),
         telegram_user_id: identity.telegramUserId,
+        username: identity.username || null,
         phone,
-        session_encrypted: sessionEncrypted,
-        session_version: 1,
-        status: "connected",
-        connected_at: new Date().toISOString()
+        session_string: sessionEncrypted,
+        status: "connected"
       })
       .eq("id", accountId)
       .select("*")
@@ -2060,10 +2088,10 @@ async function startLogin(ctx, accountId, phone, options = {}) {
     if (error) throw error;
 
     clients.set(String(accountId), client);
-    flows.delete(String(adminTelegramId));
+    flows.delete(userKey);
 
     await recordHistory(accountId, options.adminId || null, {
-      actionType: "account_connect",
+      action: "account_connect",
       status: "success",
       details: {
         telegram_user_id: identity.telegramUserId,
@@ -2076,31 +2104,50 @@ async function startLogin(ctx, accountId, phone, options = {}) {
         "✅ <b>Login berhasil</b>",
         "",
         `📱 Nomor <code>${escapeHtml(phone)}</code>`,
-        `👤 Akun <code>${escapeHtml(identity.firstName || identity.username || "Telegram")}</code>`,
+        `👤 Akun <code>${escapeHtml(derivedLabel)}</code>`,
         "🔒 Session berhasil disimpan."
       ].join("\n")
     );
 
     await showAccount(ctx, updated.id, "✅ Account Telegram berhasil terhubung.");
   } catch (e) {
-    flows.delete(String(adminTelegramId));
+    flows.delete(userKey);
+
+    const waiter = waiters.get(userKey);
+    if (waiter) waiter.reject(e);
+
     loginStatus?.stop();
-    if (loginStatus) await loginStatus.update(
-      [
-        "❌ <b>Login gagal</b>",
-        "",
-        `📱 Nomor <code>${escapeHtml(phone)}</code>`,
-        escapeHtml(safeErrorMessage(e, 300))
-      ].join("\n"),
-      cancelKeyboard(false)
-    );
+
+    // flow:cancel already rendered the dashboard; don't overwrite it with
+    // a second "login failed" message for the expected cancellation path.
+    const cancelled = safeErrorMessage(e, 200) === "Login dibatalkan.";
+
+    if (loginStatus && !cancelled) {
+      await loginStatus.update(
+        [
+          "❌ <b>Login gagal</b>",
+          "",
+          `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+          escapeHtml(safeErrorMessage(e, 300))
+        ].join("\n"),
+        cancelKeyboard(false)
+      );
+    }
+
     try { await client.disconnect(); } catch (_) {}
 
     if (options.deleteOnFailure) {
       try {
-        await sb.from("telegram_accounts").delete().eq("id", accountId);
-      } catch (_) {}
+        await deleteAccountAfterLoginFailure(accountId);
+      } catch (cleanupError) {
+        console.error(
+          "LOGIN CLEANUP:",
+          safeErrorMessage(cleanupError, 300)
+        );
+      }
     }
+
+    if (cancelled) return;
 
     throw e;
   }
@@ -2117,14 +2164,13 @@ async function connectStoredAccount(ctx, accountId, adminId) {
     .update({
       telegram_user_id: identity.telegramUserId,
       status: "connected",
-      connected_at: new Date().toISOString()
     })
     .eq("id", accountId);
 
   if (error) throw error;
 
   await recordHistory(accountId, adminId, {
-    actionType: "account_connect",
+    action: "account_connect",
     status: "success",
     details: { reconnect: true, telegram_user_id: identity.telegramUserId }
   });
@@ -2207,7 +2253,7 @@ async function migrateLegacyData() {
     .maybeSingle();
 
   if (owner.error) throw owner.error;
-  const ownerId = owner.data?.id || null;
+  const ownerTelegramUserId = owner.data?.telegram_user_id || null;
 
   const { data: legacyUsers, error: usersError } = await sb
     .from("app_users")
@@ -2248,7 +2294,7 @@ async function migrateLegacyData() {
           telegram_user_id: tgId,
           label,
           status: "disconnected",
-          created_by_admin_id: ownerId
+          created_by: ownerTelegramUserId
         })
         .select("*")
         .single();
@@ -2287,9 +2333,8 @@ async function migrateLegacyData() {
       }
 
       const existingAccount = await getAccount(account.id);
-      if (!existingAccount?.session_encrypted && session.session_string) {
-        update.session_encrypted = encryptSession(session.session_string);
-        update.session_version = 1;
+      if (!existingAccount?.session_string && session.session_string) {
+        update.session_string = encryptSession(session.session_string);
       }
 
       if (Object.keys(update).length) {
@@ -2321,8 +2366,7 @@ async function migrateLegacyData() {
           telegram_group_id: String(group.telegram_group_id),
           title: group.title || "Tanpa Nama",
           can_send: group.can_send !== false,
-          enabled: group.enabled === true,
-          last_seen_at: group.updated_at || group.created_at || new Date().toISOString()
+          enabled: group.enabled === true
         }, {
           onConflict: "account_id,telegram_group_id"
         });
@@ -2353,15 +2397,15 @@ async function migrateLegacyData() {
       if (!account) continue;
 
       const update = {
-        delay_minutes: Number(campaign.interval_minutes || 10),
+        interval_minutes: Number(campaign.interval_minutes || 10),
         duration_hours: Number(campaign.duration_hours || 1),
-        format_type: campaign.media_file_id ? "photo" : "text",
+        media_type: campaign.media_file_id ? "photo" : "text",
         message: campaign.message || "",
         media_file_id: campaign.media_file_id || null,
         caption: campaign.caption || null,
-        promotion_enabled: campaign.active === true,
-        promotion_started_at: campaign.started_at || null,
-        promotion_expires_at: campaign.expires_at || null
+        active: campaign.active === true,
+        started_at: campaign.started_at || null,
+        expires_at: campaign.expires_at || null
       };
 
       // The migration runs before normal new-version use, so legacy settings
@@ -2453,7 +2497,7 @@ async function migrateLegacyData() {
           : "error";
 
         await recordHistory(account.id, null, {
-          actionType: "legacy_send",
+          action: "legacy_send",
           status,
           groupId,
           groupTitle,
@@ -2617,11 +2661,14 @@ bot.callbackQuery("account:add", async ctx => {
   if (!adminRow) return;
 
   await ctx.answerCallbackQuery().catch(() => {});
-  flows.set(String(ctx.from.id), { t: "account_label" });
+  flows.set(String(ctx.from.id), {
+    t: "account_phone_new",
+    adminId: adminRow.id
+  });
 
   return replaceUi(
     ctx,
-    "➕ <b>Tambah Akun Telegram</b>\n\nKirim <b>label/nama akun</b> yang akan tampil di dashboard.\n\nContoh: <code>Account A</code>",
+    "➕ <b>Tambah Akun Telegram</b>\n\nKirim <b>nomor telepon</b> akun yang akan dihubungkan.\nNama akun akan diambil otomatis dari akun Telegram setelah login.\n\nContoh: <code>+628123456789</code>",
     cancelKeyboard(false),
     { parse_mode: "HTML" }
   );
@@ -2702,7 +2749,7 @@ bot.callbackQuery(/^account:disconnect:(\d+)$/, async ctx => {
     if (error) throw error;
 
     await recordHistory(accountId, adminRow.id, {
-      actionType: "account_disconnect",
+      action: "account_disconnect",
       status: "success"
     });
 
@@ -2752,37 +2799,71 @@ bot.callbackQuery(/^account:remove:confirm:(\d+)$/, async ctx => {
   const account = await getAccount(accountId);
 
   if (!account) {
-    return replaceUi(ctx, "❌ Account sudah tidak ada.", backDashboardKeyboard(), { parse_mode: "HTML" });
+    return replaceUi(
+      ctx,
+      "❌ Account sudah tidak ada.",
+      backDashboardKeyboard(),
+      { parse_mode: "HTML" }
+    );
   }
 
   try {
-    await stopScheduler(accountId);
-    await closeClient(accountId);
+    await withAccountLock(accountId, async () => {
+      await stopScheduler(accountId);
+      await closeClient(accountId);
 
-    await recordHistory(accountId, adminRow.id, {
-      actionType: "account_remove",
-      status: "success",
-      details: { deleted_label: account.label }
+      // Detach history from the account/group rows first so the audit log can
+      // survive the account deletion even when the FK uses RESTRICT.
+      const detach = await sb
+        .from("promotion_history")
+        .update({ account_id: null, group_id: null })
+        .eq("account_id", accountId);
+
+      if (detach.error) throw detach.error;
+
+      const { error: settingsError } = await sb
+        .from("account_settings")
+        .delete()
+        .eq("account_id", accountId);
+
+      if (settingsError) throw settingsError;
+
+      const { error: groupsError } = await sb
+        .from("account_groups")
+        .delete()
+        .eq("account_id", accountId);
+
+      if (groupsError) throw groupsError;
+
+      const { error: accountError } = await sb
+        .from("telegram_accounts")
+        .delete()
+        .eq("id", accountId);
+
+      if (accountError) throw accountError;
     });
 
-    const { error } = await sb
-      .from("telegram_accounts")
-      .delete()
-      .eq("id", accountId);
-
-    if (error) throw error;
+    await recordHistory(null, adminRow.id, {
+      accountLabel: account.label,
+      action: "account_remove",
+      status: "success",
+      details: { deleted_account_id: accountId }
+    });
 
     return replaceUi(
       ctx,
-      `✅ <b>Account dihapus.</b>\n\n${escapeHtml(account.label)} sudah tidak lagi berada di sistem.`,
+      `✅ <b>Account dihapus.</b>\\n\\n${escapeHtml(account.label)} sudah tidak lagi berada di sistem. Riwayat audit tetap disimpan.`,
       new InlineKeyboard().text("📱 Daftar Akun", "accounts:list:0"),
       { parse_mode: "HTML" }
     );
   } catch (e) {
     return replaceUi(
       ctx,
-      `❌ Gagal menghapus account.\n\n${escapeHtml(safeErrorMessage(e))}`,
-      backDashboardKeyboard(),
+      `❌ Gagal menghapus account.\\n\\n${escapeHtml(safeErrorMessage(e))}`,
+      new InlineKeyboard()
+        .text("◀️ Account", `account:open:${accountId}`)
+        .row()
+        .text("🏠 Dashboard", "menu:dashboard"),
       { parse_mode: "HTML" }
     );
   }
@@ -2947,7 +3028,7 @@ bot.callbackQuery(/^promo:start:(\d+)$/, async ctx => {
     return showAccount(
       ctx,
       accountId,
-      `▶️ <b>Promosi dimulai.</b>\nJeda: <b>${escapeHtml(formatInterval(result.settings.delay_minutes))}</b>\nDurasi: <b>${escapeHtml(formatDuration(result.settings.duration_hours))}</b>`
+      `▶️ <b>Promosi dimulai.</b>\nJeda: <b>${escapeHtml(formatInterval(result.settings.interval_minutes))}</b>\nDurasi: <b>${escapeHtml(formatDuration(result.settings.duration_hours))}</b>`
     );
   } catch (e) {
     return showAccount(ctx, accountId, `❌ ${escapeHtml(safeErrorMessage(e))}`);
@@ -3053,12 +3134,14 @@ bot.callbackQuery(/^group:refresh:(\d+)$/, async ctx => {
   const accountId = String(ctx.match[1]);
   const account = await getAccount(accountId);
 
-  if (!account) return;
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
 
   try {
     const rows = await refreshGroups(accountId);
     await recordHistory(accountId, adminRow.id, {
-      actionType: "group_refresh",
+      action: "group_refresh",
       status: "success",
       details: { scanned: rows.length }
     });
@@ -3144,7 +3227,7 @@ bot.callbackQuery(/^group:toggle:(\d+)$/, async ctx => {
   }
 
   await recordHistory(group.data.account_id, adminRow.id, {
-    actionType: nextEnabled ? "group_enable" : "group_disable",
+    action: nextEnabled ? "group_enable" : "group_disable",
     status: "success",
     groupId: groupId
   });
@@ -3180,7 +3263,7 @@ bot.callbackQuery(/^group:remove:(\d+)$/, async ctx => {
   }
 
   await recordHistory(group.account_id, adminRow.id, {
-    actionType: "group_remove",
+    action: "group_remove",
     status: "success",
     groupId: groupId,
     groupTitle: group.title
@@ -3330,10 +3413,10 @@ bot.callbackQuery("flow:cancel", async ctx => {
   if (!adminRow) return;
 
   await ctx.answerCallbackQuery("Dibatalkan").catch(() => {});
-  flows.delete(String(ctx.from.id));
-
-  const waiter = waiters.get(String(ctx.from.id));
+  const userKey = String(ctx.from.id);
+  const waiter = waiters.get(userKey);
   if (waiter) waiter.reject(new Error("Login dibatalkan."));
+  flows.delete(userKey);
 
   return replaceUi(
     ctx,
@@ -3387,7 +3470,9 @@ bot.on("message", async (ctx, next) => {
       );
     }
 
-    const text = ctx.message.text.trim();
+    const text = waiter.type === "code"
+      ? ctx.message.text.replace(/\s+/g, "").trim()
+      : ctx.message.text.trim();
     if (!text) {
       return renderUi(
         telegramUserId,
@@ -3401,6 +3486,14 @@ bot.on("message", async (ctx, next) => {
       await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
     } catch (_) {}
 
+    if (
+      (waiter.type === "code" && flow?.t !== "login_code") ||
+      (waiter.type === "password" && flow?.t !== "login_password")
+    ) {
+      waiter.reject(new Error("Sesi input login sudah tidak aktif."));
+      return next();
+    }
+
     waiter.resolve(text);
     return;
   }
@@ -3409,43 +3502,7 @@ bot.on("message", async (ctx, next) => {
 
   try {
     /* -------------------------
-       ADD ACCOUNT: LABEL
-    -------------------------- */
-    if (flow.t === "account_label") {
-      if (!ctx.message.text) {
-        return renderUi(
-          telegramUserId,
-          "❌ Label account harus berupa teks.",
-          cancelKeyboard(false)
-        );
-      }
-
-      const label = ctx.message.text.trim().replace(/\s+/g, " ").slice(0, 80);
-      if (label.length < 2) {
-        return renderUi(
-          telegramUserId,
-          "❌ Label terlalu pendek. Minimal 2 karakter.",
-          cancelKeyboard(false)
-        );
-      }
-
-      const account = await createAccountShell(label, adminRow.id);
-      flows.set(userKey, {
-        t: "account_phone_new",
-        accountId: String(account.id),
-        adminId: adminRow.id
-      });
-
-      return renderUi(
-        telegramUserId,
-        `📱 <b>Nomor Telegram</b>\n\nKirim <b>nomor telepon</b> akun yang akan dihubungkan.\nLabel/nama akun tidak digunakan untuk login.\n\nContoh: <code>+628123456789</code>`,
-        cancelKeyboard(false),
-        { parse_mode: "HTML" }
-      );
-    }
-
-    /* -------------------------
-       NEW ACCOUNT: PHONE
+       ADD ACCOUNT: PHONE
     -------------------------- */
     if (flow.t === "account_phone_new") {
       if (!ctx.message.text) {
@@ -3466,8 +3523,10 @@ bot.on("message", async (ctx, next) => {
         );
       }
 
+      const account = await createAccountShell(`Telegram ${phone}`, adminRow.telegram_user_id, phone);
       flows.delete(userKey);
-      return startLogin(ctx, flow.accountId, phone, {
+
+      return startLogin(ctx, account.id, phone, {
         adminId: adminRow.id,
         deleteOnFailure: true
       });
@@ -3530,7 +3589,7 @@ bot.on("message", async (ctx, next) => {
       if (error) throw error;
 
       await recordHistory(flow.accountId, adminRow.id, {
-        actionType: "label_update",
+        action: "label_update",
         status: "success",
         details: { label }
       });
@@ -3550,7 +3609,7 @@ bot.on("message", async (ctx, next) => {
         const { error } = await sb
           .from("account_settings")
           .update({
-            format_type: "photo",
+            media_type: "photo",
             message: "",
             media_file_id: photo.file_id,
             caption
@@ -3560,7 +3619,7 @@ bot.on("message", async (ctx, next) => {
         if (error) throw error;
 
         await recordHistory(flow.accountId, adminRow.id, {
-          actionType: "format_update",
+          action: "format_update",
           status: "success",
           details: { type: "photo", has_caption: Boolean(caption) }
         });
@@ -3582,7 +3641,7 @@ bot.on("message", async (ctx, next) => {
         const { error } = await sb
           .from("account_settings")
           .update({
-            format_type: "text",
+            media_type: "text",
             message,
             media_file_id: null,
             caption: null
@@ -3592,7 +3651,7 @@ bot.on("message", async (ctx, next) => {
         if (error) throw error;
 
         await recordHistory(flow.accountId, adminRow.id, {
-          actionType: "format_update",
+          action: "format_update",
           status: "success",
           details: { type: "text" }
         });
@@ -3624,7 +3683,7 @@ bot.on("message", async (ctx, next) => {
 
       const { error } = await sb
         .from("account_settings")
-        .update({ delay_minutes: minutes })
+        .update({ interval_minutes: minutes })
         .eq("account_id", flow.accountId);
 
       if (error) throw error;
@@ -3632,7 +3691,7 @@ bot.on("message", async (ctx, next) => {
       const settings = await getAccountSettings(flow.accountId);
 
       // Apply new delay to a running scheduler without creating a second task.
-      if (settings?.promotion_enabled && schedulerTasks.has(String(flow.accountId))) {
+      if (settings?.active && schedulerTasks.has(String(flow.accountId))) {
         scheduleAccount(
           flow.accountId,
           Math.max(1000, minutes * 60 * 1000)
@@ -3640,9 +3699,9 @@ bot.on("message", async (ctx, next) => {
       }
 
       await recordHistory(flow.accountId, adminRow.id, {
-        actionType: "delay_update",
+        action: "delay_update",
         status: "success",
-        details: { delay_minutes: minutes }
+        details: { interval_minutes: minutes }
       });
 
       flows.delete(userKey);
@@ -3670,8 +3729,8 @@ bot.on("message", async (ctx, next) => {
       const current = await getAccountSettings(flow.accountId);
       const update = { duration_hours: hours };
 
-      if (current?.promotion_enabled) {
-        update.promotion_expires_at = new Date(
+      if (current?.active) {
+        update.expires_at = new Date(
           Date.now() + hours * 60 * 60 * 1000
         ).toISOString();
       }
@@ -3684,7 +3743,7 @@ bot.on("message", async (ctx, next) => {
       if (error) throw error;
 
       await recordHistory(flow.accountId, adminRow.id, {
-        actionType: "duration_update",
+        action: "duration_update",
         status: "success",
         details: { duration_hours: hours }
       });
@@ -3815,6 +3874,40 @@ bot.on("message", async (ctx, next) => {
         );
       }
 
+      const ownerResult = await sb
+        .from("admins")
+        .select("id,telegram_user_id")
+        .eq("role", "OWNER")
+        .eq("active", true)
+        .order("id", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (ownerResult.error) throw ownerResult.error;
+      const ownerTelegramUserId = ownerResult.data?.telegram_user_id;
+
+      if (!ownerTelegramUserId) {
+        throw new Error("ADMIN UTAMA aktif tidak ditemukan.");
+      }
+
+      // Preserve FK integrity: telegram_accounts.created_by points to
+      // admins.telegram_user_id, so reassign accounts before deleting admin.
+      const reassignAccounts = await sb
+        .from("telegram_accounts")
+        .update({ created_by: ownerTelegramUserId })
+        .eq("created_by", targetId);
+
+      if (reassignAccounts.error) throw reassignAccounts.error;
+
+      // Preserve audit history while removing the admin row referenced by
+      // promotion_history.admin_id.
+      const detachHistory = await sb
+        .from("promotion_history")
+        .update({ admin_id: ownerResult.data.id })
+        .eq("admin_id", existing.data.id);
+
+      if (detachHistory.error) throw detachHistory.error;
+
       const { error } = await sb
         .from("admins")
         .delete()
@@ -3863,13 +3956,13 @@ bot.on("callback_query:data", async ctx => {
 async function restoreSessions() {
   const { data, error } = await sb
     .from("telegram_accounts")
-    .select("id,status,session_encrypted")
+    .select("id,status,session_string")
     .eq("status", "connected");
 
   if (error) throw error;
 
   for (const row of data || []) {
-    if (!row.session_encrypted) continue;
+    if (!row.session_string) continue;
 
     try {
       const client = await clientFor(row.id);
@@ -3888,23 +3981,22 @@ async function restoreSessions() {
 async function restoreRunningPromotions() {
   const { data, error } = await sb
     .from("account_settings")
-    .select("account_id,promotion_enabled,promotion_expires_at,delay_minutes")
-    .eq("promotion_enabled", true);
+    .select("account_id,active,expires_at,interval_minutes")
+    .eq("active", true);
 
   if (error) throw error;
 
   for (const row of data || []) {
     if (
-      !row.promotion_expires_at ||
-      new Date(row.promotion_expires_at) <= new Date()
+      !row.expires_at ||
+      new Date(row.expires_at) <= new Date()
     ) {
       await sb
         .from("account_settings")
         .update({
-          promotion_enabled: false,
-          promotion_expires_at: null,
-          promotion_started_at: null,
-          started_by_admin_id: null
+          active: false,
+          expires_at: null,
+          started_at: null,
         })
         .eq("account_id", row.account_id);
       continue;
@@ -3919,8 +4011,36 @@ async function restoreRunningPromotions() {
    ERROR HANDLING / BOT START
 ========================================================= */
 
-bot.catch(err => {
-  console.error("BOT:", err?.error || err);
+bot.catch(async err => {
+  const error = err?.error || err;
+  console.error("BOT:", error);
+
+  const ctx = err?.ctx;
+  if (!ctx?.from?.id) return;
+
+  const message = `❌ <b>Terjadi kesalahan menu.</b>\n\n${escapeHtml(safeErrorMessage(error, 500))}`;
+
+  try {
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery("Terjadi kesalahan.", { show_alert: true }).catch(() => {});
+      await replaceUi(
+        ctx,
+        message,
+        new InlineKeyboard().text("🏠 Menu Utama", "menu:dashboard"),
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    await renderUi(
+      ctx.from.id,
+      message,
+      new InlineKeyboard().text("🏠 Menu Utama", "menu:dashboard"),
+      { parse_mode: "HTML" }
+    );
+  } catch (uiError) {
+    console.error("BOT ERROR UI:", safeErrorMessage(uiError, 300));
+  }
 });
 
 const app = express();
