@@ -533,23 +533,33 @@ function dashboardText(ctx, stats, extra = "") {
   const first = String(ctx.from?.first_name || "").trim();
   const last = String(ctx.from?.last_name || "").trim();
   const name = [first, last].filter(Boolean).join(" ") || "Admin";
+  const username = ctx.from?.username ? `@${ctx.from.username}` : "-";
 
   return [
-    "🛡️ <b>ADMIN CONTROL CENTER</b>",
-    `<i>${escapeHtml(extra || `Halo ${name}, semua akun Telegram dan promosi dikontrol dari bot ini.`)}</i>`,
+    "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮",
+    "┃ 🛡️ <b>ADMIN CONTROL CENTER</b>",
+    "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
+    `<i>${escapeHtml(extra || `Selamat datang, ${name}. Semua pengaturan akun dan promosi tersedia di sini.`)}</i>`,
     "",
-    `<pre>👤 Admin        : ${escapeHtml(name)}
-🆔 Telegram ID  : ${escapeHtml(ctx.from.id)}
-🤖 Bot Version  : v${escapeHtml(BOT_VERSION)}</pre>`,
+    "┌─ 👤 <b>PROFIL ADMIN</b>",
+    `│ Nama      <code>${escapeHtml(name)}</code>`,
+    `│ Username  <code>${escapeHtml(username)}</code>`,
+    `│ User ID   <code>${escapeHtml(ctx.from.id)}</code>`,
+    `│ Bot       <code>v${escapeHtml(BOT_VERSION)}</code>`,
+    "└────────────────────────────",
     "",
-    "📊 <b>STATUS SISTEM</b>",
-    `👥 Admin aktif  : <b>${stats.admins}</b>`,
-    `📱 Akun Telegram: <b>${stats.accounts}</b>`,
-    `🟢 Terhubung    : <b>${stats.connected}</b>`,
-    `▶️ Promosi jalan: <b>${stats.running}</b>`,
-    `👥 Target grup  : <b>${stats.groups}</b>`,
+    "┌─ 📊 <b>STATUS SISTEM</b>",
+    `│ 👥 Admin aktif    <b>${stats.admins}</b>`,
+    `│ 📱 Akun Telegram  <b>${stats.accounts}</b>`,
+    `│ 🟢 Terhubung      <b>${stats.connected}</b>`,
+    `│ ▶️ Promosi jalan   <b>${stats.running}</b>`,
+    `│ 👥 Target grup    <b>${stats.groups}</b>`,
+    "└────────────────────────────",
     "",
-    "👇 <b>Pilih menu:</b>"
+    `👤 <b>Admin ${escapeHtml(name)}</b>`,
+    "⚙️ <i>Silakan pilih pengaturan yang ingin dikelola.</i>",
+    "",
+    "⌄ <b>MENU UTAMA</b>"
   ].join("\n");
 }
 
@@ -1876,12 +1886,94 @@ function waitForInput(adminTelegramId, nextType, timeoutMs = 5 * 60 * 1000) {
   });
 }
 
+async function createAnimatedLoginStatus(ctx, phone) {
+  const chatId = ctx.chat?.id || ctx.from.id;
+  const safePhone = escapeHtml(phone);
+  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  let index = 0;
+  let stopped = false;
+  let timer = null;
+  let busy = false;
+
+  const markup = cancelKeyboard(false);
+  const build = frame => [
+    `${frame} <b>Menghubungkan akun Telegram...</b>`,
+    "",
+    `📱 Nomor <code>${safePhone}</code>`,
+    "🔐 Menyiapkan sesi login..."
+  ].join("\n");
+
+  const message = await bot.api.sendMessage(chatId, build(frames[0]), {
+    parse_mode: "HTML",
+    reply_markup: markup
+  });
+
+  const schedule = () => {
+    if (stopped) return;
+    timer = setTimeout(async () => {
+      if (stopped) return;
+      if (!busy) {
+        busy = true;
+        index = (index + 1) % frames.length;
+        try {
+          await bot.api.editMessageText(chatId, message.message_id, build(frames[index]), {
+            parse_mode: "HTML",
+            reply_markup: markup
+          });
+        } catch (e) {
+          if (!/message is not modified/i.test(String(e?.message || e))) {
+            console.warn("LOGIN SPINNER:", safeErrorMessage(e, 180));
+          }
+        } finally {
+          busy = false;
+        }
+      }
+      schedule();
+    }, 800);
+  };
+
+  schedule();
+
+  return {
+    async update(text, keyboard = cancelKeyboard(false)) {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      try {
+        await bot.api.editMessageText(chatId, message.message_id, text, {
+          parse_mode: "HTML",
+          reply_markup: keyboard
+        });
+      } catch (e) {
+        if (!/message is not modified/i.test(String(e?.message || e))) {
+          console.warn("LOGIN STATUS UPDATE:", safeErrorMessage(e, 180));
+        }
+      }
+    },
+    stop() {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    }
+  };
+}
+
 async function startLogin(ctx, accountId, phone, options = {}) {
   const adminTelegramId = ctx.from.id;
   const client = await createTelegramClient("");
-  await client.connect();
+  let loginStatus = null;
 
   try {
+    loginStatus = await createAnimatedLoginStatus(ctx, phone);
+    await client.connect();
+
+    await loginStatus.update(
+      [
+        "⠋ <b>Verifikasi akun...</b>",
+        "",
+        `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+        "📡 Meminta kode verifikasi dari Telegram..."
+      ].join("\n")
+    );
+
     await client.start({
       phoneNumber: async () => phone,
 
@@ -1891,11 +1983,16 @@ async function startLogin(ctx, accountId, phone, options = {}) {
           accountId: String(accountId)
         });
 
-        await renderUi(
-          adminTelegramId,
-          "📩 <b>Kode Telegram sudah dikirim.</b>\n\nBalas dengan kode OTP.",
-          cancelKeyboard(false),
-          { parse_mode: "HTML" }
+        await loginStatus.update(
+          [
+            "✅ <b>Kode verifikasi sudah dikirim</b>",
+            "",
+            `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+            "📨 Cek aplikasi Telegram pada nomor tersebut.",
+            "",
+            "🔑 <b>Kirim kode OTP di chat ini.</b>"
+          ].join("\n"),
+          cancelKeyboard(false)
         );
 
         return waitForInput(adminTelegramId, "code");
@@ -1907,11 +2004,16 @@ async function startLogin(ctx, accountId, phone, options = {}) {
           accountId: String(accountId)
         });
 
-        await renderUi(
-          adminTelegramId,
-          "🔐 <b>Verifikasi 2 langkah</b>\n\nBalas dengan password Telegram kamu.",
-          cancelKeyboard(false),
-          { parse_mode: "HTML" }
+        await loginStatus.update(
+          [
+            "🔐 <b>Verifikasi 2 langkah</b>",
+            "",
+            `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+            "Akun ini meminta password 2FA Telegram.",
+            "",
+            "🔑 <b>Kirim password 2FA di chat ini.</b>"
+          ].join("\n"),
+          cancelKeyboard(false)
         );
 
         return waitForInput(adminTelegramId, "password");
@@ -1969,9 +2071,29 @@ async function startLogin(ctx, accountId, phone, options = {}) {
       }
     });
 
+    await loginStatus.update(
+      [
+        "✅ <b>Login berhasil</b>",
+        "",
+        `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+        `👤 Akun <code>${escapeHtml(identity.firstName || identity.username || "Telegram")}</code>`,
+        "🔒 Session berhasil disimpan."
+      ].join("\n")
+    );
+
     await showAccount(ctx, updated.id, "✅ Account Telegram berhasil terhubung.");
   } catch (e) {
     flows.delete(String(adminTelegramId));
+    loginStatus?.stop();
+    if (loginStatus) await loginStatus.update(
+      [
+        "❌ <b>Login gagal</b>",
+        "",
+        `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+        escapeHtml(safeErrorMessage(e, 300))
+      ].join("\n"),
+      cancelKeyboard(false)
+    );
     try { await client.disconnect(); } catch (_) {}
 
     if (options.deleteOnFailure) {
@@ -2554,7 +2676,7 @@ bot.callbackQuery(/^account:connect:(\d+)$/, async ctx => {
 
   return replaceUi(
     ctx,
-    "🔗 <b>Connect Ulang</b>\n\nSession lama tidak dapat dipakai saat ini.\n\nKirim nomor Telegram dalam format internasional.\nContoh: <code>+628123456789</code>",
+    "📱 <b>Nomor Telegram</b>\n\nSession lama tidak dapat dipakai saat ini.\nKirim <b>nomor telepon</b> akun yang akan dihubungkan.\nLabel/nama akun tidak digunakan untuk login.\n\nContoh: <code>+628123456789</code>",
     cancelKeyboard(false),
     { parse_mode: "HTML" }
   );
@@ -3239,12 +3361,17 @@ bot.callbackQuery("admin:cancel", async ctx => {
    MESSAGE FLOW HANDLER
 ========================================================= */
 
-bot.on("message", async ctx => {
+bot.on("message", async (ctx, next) => {
   const telegramUserId = ctx.from?.id;
-  if (!telegramUserId) return;
+  if (!telegramUserId) return next();
+
+  // Biarkan command handler seperti /start memproses command lebih dulu.
+  if (ctx.message?.text?.trim().startsWith("/start")) {
+    return next();
+  }
 
   const adminRow = await getAdminByTelegramId(telegramUserId).catch(() => null);
-  if (!adminRow) return;
+  if (!adminRow) return next();
 
   const userKey = String(telegramUserId);
   const waiter = waiters.get(userKey);
@@ -3278,7 +3405,7 @@ bot.on("message", async ctx => {
     return;
   }
 
-  if (!flow) return;
+  if (!flow) return next();
 
   try {
     /* -------------------------
@@ -3311,7 +3438,7 @@ bot.on("message", async ctx => {
 
       return renderUi(
         telegramUserId,
-        `🔐 <b>${escapeHtml(label)}</b>\n\nKirim nomor Telegram dalam format internasional.\nContoh: <code>+628123456789</code>`,
+        `📱 <b>Nomor Telegram</b>\n\nKirim <b>nomor telepon</b> akun yang akan dihubungkan.\nLabel/nama akun tidak digunakan untuk login.\n\nContoh: <code>+628123456789</code>`,
         cancelKeyboard(false),
         { parse_mode: "HTML" }
       );
