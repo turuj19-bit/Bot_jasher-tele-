@@ -97,6 +97,15 @@ const accountLocks = new Map();
 // Telegram admin ID -> last UI message
 const uiMessages = new Map();
 
+// Telegram admin ID -> serialized UI render operation. Prevents concurrent
+// /start calls from both observing an empty uiMessages entry and sending
+// duplicate dashboards.
+const uiLocks = new Map();
+
+// Telegram admin ID -> current interactive GramJS login run. This keeps one
+// login state per admin chat and gives the cancel flow a safe cancellation flag.
+const loginRuns = new Map();
+
 const ACCOUNT_PAGE_SIZE = 8;
 const HISTORY_PAGE_SIZE = 8;
 const GROUP_PAGE_SIZE = 8;
@@ -420,6 +429,21 @@ async function deleteSavedUi(userId) {
   uiMessages.delete(String(userId));
 }
 
+async function withUiLock(userId, fn) {
+  const key = String(userId);
+  const previous = uiLocks.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(fn);
+  uiLocks.set(key, current);
+
+  try {
+    return await current;
+  } finally {
+    if (uiLocks.get(key) === current) {
+      uiLocks.delete(key);
+    }
+  }
+}
+
 async function renderUi(userId, text, keyboard, options = {}) {
   const key = String(userId);
   const saved = uiMessages.get(key);
@@ -470,69 +494,72 @@ async function replaceUi(ctx, text, keyboard, options = {}) {
 
 async function renderStart(ctx, text, keyboard) {
   const userId = ctx.from.id;
-  const saved = uiMessages.get(String(userId));
 
-  // Reuse the existing dashboard UI instead of stacking new messages.
-  if (saved) {
-    return renderUi(userId, text, keyboard, { parse_mode: "HTML" });
-  }
+  return withUiLock(userId, async () => {
+    const saved = uiMessages.get(String(userId));
 
-  if (START_BANNER_FILE_ID) {
-    try {
-      const msg = await ctx.replyWithPhoto(START_BANNER_FILE_ID, {
-        caption: text,
-        parse_mode: "HTML",
-        reply_markup: keyboard
-      });
-      await saveUiMessage(userId, msg, true);
-      return msg;
-    } catch (e) {
-      console.error("START BANNER FILE_ID:", safeErrorMessage(e));
+    // Reuse the existing dashboard UI instead of stacking new messages.
+    if (saved) {
+      return renderUi(userId, text, keyboard, { parse_mode: "HTML" });
     }
-  }
 
-  if (START_BANNER_URL && /^https?:\/\//i.test(START_BANNER_URL)) {
-    try {
-      const response = await fetch(START_BANNER_URL, {
-        redirect: "follow",
-        signal: AbortSignal.timeout(15000)
-      });
-
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-      const contentType = String(
-        response.headers.get("content-type") || ""
-      ).toLowerCase();
-
-      if (!contentType.startsWith("image/")) {
-        throw new Error(
-          `URL bukan file gambar (content-type: ${contentType || "unknown"})`
-        );
-      }
-
-      const buffer = Buffer.from(await response.arrayBuffer());
-      if (!buffer.length) throw new Error("File banner kosong.");
-      if (buffer.length > 10 * 1024 * 1024) {
-        throw new Error("File banner terlalu besar.");
-      }
-
-      const msg = await ctx.replyWithPhoto(
-        new InputFile(buffer, "start-banner.jpg"),
-        {
+    if (START_BANNER_FILE_ID) {
+      try {
+        const msg = await ctx.replyWithPhoto(START_BANNER_FILE_ID, {
           caption: text,
           parse_mode: "HTML",
           reply_markup: keyboard
-        }
-      );
-
-      await saveUiMessage(userId, msg, true);
-      return msg;
-    } catch (e) {
-      console.error("START BANNER URL:", safeErrorMessage(e));
+        });
+        await saveUiMessage(userId, msg, true);
+        return msg;
+      } catch (e) {
+        console.error("START BANNER FILE_ID:", safeErrorMessage(e));
+      }
     }
-  }
 
-  return renderUi(userId, text, keyboard, { parse_mode: "HTML" });
+    if (START_BANNER_URL && /^https?:\/\//i.test(START_BANNER_URL)) {
+      try {
+        const response = await fetch(START_BANNER_URL, {
+          redirect: "follow",
+          signal: AbortSignal.timeout(15000)
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const contentType = String(
+          response.headers.get("content-type") || ""
+        ).toLowerCase();
+
+        if (!contentType.startsWith("image/")) {
+          throw new Error(
+            `URL bukan file gambar (content-type: ${contentType || "unknown"})`
+          );
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (!buffer.length) throw new Error("File banner kosong.");
+        if (buffer.length > 10 * 1024 * 1024) {
+          throw new Error("File banner terlalu besar.");
+        }
+
+        const msg = await ctx.replyWithPhoto(
+          new InputFile(buffer, "start-banner.jpg"),
+          {
+            caption: text,
+            parse_mode: "HTML",
+            reply_markup: keyboard
+          }
+        );
+
+        await saveUiMessage(userId, msg, true);
+        return msg;
+      } catch (e) {
+        console.error("START BANNER URL:", safeErrorMessage(e));
+      }
+    }
+
+    return renderUi(userId, text, keyboard, { parse_mode: "HTML" });
+  });
 }
 
 function dashboardText(ctx, stats, extra = "") {
@@ -542,28 +569,22 @@ function dashboardText(ctx, stats, extra = "") {
   const username = ctx.from?.username ? `@${ctx.from.username}` : "-";
 
   return [
-    "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮",
-    "┃ 🛡️ <b>ADMIN CONTROL CENTER</b>",
-    "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
-    `<i>${escapeHtml(extra || `Selamat datang, ${name}. Semua pengaturan akun dan promosi tersedia di sini.`)}</i>`,
+    "╭─ 🛡️ <b>ADMIN CONTROL CENTER</b>",
+    "│",
+    `│ 👤 <b>${escapeHtml(name)}</b>`,
+    `│ 🆔 Telegram ID  <code>${escapeHtml(ctx.from.id)}</code>`,
+    `│ 🔗 Username     <code>${escapeHtml(username)}</code>`,
+    `│ 🤖 Bot          <code>v${escapeHtml(BOT_VERSION)}</code>`,
+    "╰────────────────────────────",
     "",
-    "┌─ 👤 <b>PROFIL ADMIN</b>",
-    `│ Nama      <code>${escapeHtml(name)}</code>`,
-    `│ Username  <code>${escapeHtml(username)}</code>`,
-    `│ User ID   <code>${escapeHtml(ctx.from.id)}</code>`,
-    `│ Bot       <code>v${escapeHtml(BOT_VERSION)}</code>`,
-    "└────────────────────────────",
+    `<i>${escapeHtml(extra || "Profil admin ditampilkan sesuai nama akun Telegram. Silakan pilih menu di bawah untuk mengatur akun Telegram, format promosi, target grup, dan pengaturan lainnya.")}</i>`,
     "",
-    "┌─ 📊 <b>STATUS SISTEM</b>",
-    `│ 👥 Admin aktif    <b>${stats.admins}</b>`,
-    `│ 📱 Akun Telegram  <b>${stats.accounts}</b>`,
-    `│ 🟢 Terhubung      <b>${stats.connected}</b>`,
-    `│ ▶️ Promosi jalan   <b>${stats.running}</b>`,
-    `│ 👥 Target grup    <b>${stats.groups}</b>`,
-    "└────────────────────────────",
-    "",
-    `👤 <b>Admin ${escapeHtml(name)}</b>`,
-    "⚙️ <i>Silakan pilih pengaturan yang ingin dikelola.</i>",
+    "📊 <b>STATUS SISTEM</b>",
+    `👥 Admin aktif   · <b>${stats.admins}</b>`,
+    `📱 Akun Telegram · <b>${stats.accounts}</b>`,
+    `🟢 Terhubung     · <b>${stats.connected}</b>`,
+    `▶️ Promosi jalan  · <b>${stats.running}</b>`,
+    `👥 Target grup   · <b>${stats.groups}</b>`,
     "",
     "⌄ <b>MENU UTAMA</b>"
   ].join("\n");
@@ -1852,25 +1873,28 @@ async function stopPromotion(accountId, adminId) {
    ACCOUNT LOGIN / CONNECT
 ========================================================= */
 
-function waitForInput(adminTelegramId, nextType, timeoutMs = 5 * 60 * 1000) {
+function waitForInput(
+  adminTelegramId,
+  nextType,
+  timeoutMs = 5 * 60 * 1000,
+  accountId = null
+) {
   const userId = String(adminTelegramId);
 
   return new Promise((resolve, reject) => {
     const old = waiters.get(userId);
     if (old) old.reject(new Error("Input sebelumnya dibatalkan."));
 
-    const timer = setTimeout(() => {
-      waiters.delete(userId);
-      flows.delete(userId);
-      reject(new Error("Waktu input habis. Silakan mulai lagi."));
-    }, timeoutMs);
+    let settled = false;
+    let timer = null;
 
-    waiters.set(userId, {
+    const waiter = {
       type: nextType,
-      timer,
+      accountId: accountId == null ? null : String(accountId),
+      timer: null,
       resolve(value) {
-        clearTimeout(timer);
-        waiters.delete(userId);
+        if (settled) return;
+        if (waiters.get(userId) !== waiter) return;
 
         const normalized =
           nextType === "code"
@@ -1878,6 +1902,9 @@ function waitForInput(adminTelegramId, nextType, timeoutMs = 5 * 60 * 1000) {
             : String(value ?? "").trim();
 
         if (!normalized) {
+          settled = true;
+          clearTimeout(timer);
+          waiters.delete(userId);
           reject(new Error(
             nextType === "code"
               ? "Kode OTP tidak boleh kosong."
@@ -1886,108 +1913,170 @@ function waitForInput(adminTelegramId, nextType, timeoutMs = 5 * 60 * 1000) {
           return;
         }
 
+        settled = true;
+        clearTimeout(timer);
+        waiters.delete(userId);
         resolve(normalized);
       },
       reject(error) {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
-        waiters.delete(userId);
+        if (waiters.get(userId) === waiter) {
+          waiters.delete(userId);
+        }
         reject(error);
       }
-    });
+    };
+
+    timer = setTimeout(() => {
+      if (waiters.get(userId) !== waiter || settled) return;
+      settled = true;
+      waiters.delete(userId);
+      flows.delete(userId);
+      reject(new Error("Waktu input habis. Silakan mulai lagi."));
+    }, timeoutMs);
+
+    waiter.timer = timer;
+    waiters.set(userId, waiter);
   });
 }
 
-async function createAnimatedLoginStatus(ctx, phone) {
+async function startLoading(ctx, phone) {
   const userId = String(ctx.from.id);
   const chatId = ctx.chat?.id || ctx.from.id;
   const safePhone = escapeHtml(phone);
-
-  // Keep the bot UI to a single editable message while login is running.
-  await deleteSavedUi(userId);
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-  let index = 0;
+
+  // Keep the login process inside one editable UI message.
+  await deleteSavedUi(userId);
+
+  let frameIndex = 0;
   let stopped = false;
   let timer = null;
   let busy = false;
-
-  const markup = cancelKeyboard(false);
-  const build = frame => [
-    `${frame} <b>Menghubungkan akun Telegram...</b>`,
+  let currentBody = [
+    "<b>Nomor diterima</b>",
     "",
     `📱 Nomor <code>${safePhone}</code>`,
+    "⏳ Menghubungkan ke Telegram...",
     "🔐 Menyiapkan sesi login..."
   ].join("\n");
+  let currentKeyboard = cancelKeyboard(false);
 
-  const message = await bot.api.sendMessage(chatId, build(frames[0]), {
-    parse_mode: "HTML",
-    reply_markup: markup
-  });
-  await saveUiMessage(userId, message, false);
+  const buildText = frame => `${frame} ${currentBody}`;
+
+  const edit = async text => {
+    try {
+      await bot.api.editMessageText(chatId, message.message_id, text, {
+        parse_mode: "HTML",
+        reply_markup: currentKeyboard
+      });
+    } catch (e) {
+      if (!/message is not modified/i.test(String(e?.message || e))) {
+        console.warn("LOGIN STATUS UPDATE:", safeErrorMessage(e, 180));
+      }
+    }
+  };
 
   const schedule = () => {
     if (stopped) return;
+
     timer = setTimeout(async () => {
       if (stopped) return;
+
       if (!busy) {
         busy = true;
-        index = (index + 1) % frames.length;
+        frameIndex = (frameIndex + 1) % frames.length;
         try {
-          await bot.api.editMessageText(chatId, message.message_id, build(frames[index]), {
-            parse_mode: "HTML",
-            reply_markup: markup
-          });
-        } catch (e) {
-          if (!/message is not modified/i.test(String(e?.message || e))) {
-            console.warn("LOGIN SPINNER:", safeErrorMessage(e, 180));
-          }
+          await edit(buildText(frames[frameIndex]));
         } finally {
           busy = false;
         }
       }
+
       schedule();
     }, 800);
   };
+
+  const message = await bot.api.sendMessage(
+    chatId,
+    buildText(frames[0]),
+    {
+      parse_mode: "HTML",
+      reply_markup: currentKeyboard
+    }
+  );
+  await saveUiMessage(userId, message, false);
 
   schedule();
 
   return {
     async update(text, keyboard = cancelKeyboard(false)) {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-      try {
-        await bot.api.editMessageText(chatId, message.message_id, text, {
-          parse_mode: "HTML",
-          reply_markup: keyboard
-        });
-      } catch (e) {
-        if (!/message is not modified/i.test(String(e?.message || e))) {
-          console.warn("LOGIN STATUS UPDATE:", safeErrorMessage(e, 180));
-        }
+      currentBody = String(text);
+      currentKeyboard = keyboard;
+      if (!stopped) {
+        await edit(buildText(frames[frameIndex]));
       }
+    },
+    async finish(text, keyboard = cancelKeyboard(false)) {
+      stopped = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      currentBody = String(text);
+      currentKeyboard = keyboard;
+      await edit(currentBody);
     },
     stop() {
       stopped = true;
-      if (timer) clearTimeout(timer);
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
     }
   };
+}
+
+function stopLoading(loader) {
+  loader?.stop?.();
 }
 
 async function startLogin(ctx, accountId, phone, options = {}) {
   const adminTelegramId = ctx.from.id;
   const userKey = String(adminTelegramId);
+  const existingRun = loginRuns.get(userKey);
+
+  if (existingRun) {
+    throw new Error("Proses login akun Telegram lain masih berjalan.");
+  }
+
   const client = await createTelegramClient("");
+  const run = {
+    accountId: String(accountId),
+    client,
+    cancelled: false
+  };
+  loginRuns.set(userKey, run);
+
   let loginStatus = null;
+  let sessionPersisted = false;
 
   try {
-    loginStatus = await createAnimatedLoginStatus(ctx, phone);
+    if (run.cancelled) throw new Error("Login dibatalkan.");
+
+    loginStatus = await startLoading(ctx, phone);
     await client.connect();
+
+    if (run.cancelled) throw new Error("Login dibatalkan.");
 
     await loginStatus.update(
       [
-        "⠋ <b>Verifikasi akun...</b>",
+        "<b>Terhubung ke Telegram</b>",
         "",
         `📱 Nomor <code>${escapeHtml(phone)}</code>`,
-        "📡 Meminta kode verifikasi dari Telegram..."
+        "📩 Meminta kode verifikasi dari Telegram..."
       ].join("\n")
     );
 
@@ -1995,37 +2084,60 @@ async function startLogin(ctx, accountId, phone, options = {}) {
       phoneNumber: async () => phone,
 
       phoneCode: async () => {
-        // Register the waiter BEFORE editing Telegram UI so a fast OTP message
-        // cannot arrive between the prompt and wait registration.
+        if (run.cancelled) throw new Error("Login dibatalkan.");
+
+        // Register the waiter before changing the UI. This prevents a fast
+        // OTP message from arriving before the input promise is available.
         flows.set(userKey, {
           t: "login_code",
           accountId: String(accountId)
         });
-        const codePromise = waitForInput(adminTelegramId, "code");
+        const codePromise = waitForInput(
+          adminTelegramId,
+          "code",
+          5 * 60 * 1000,
+          accountId
+        );
 
-        await loginStatus.update(
+        await loginStatus.finish(
           [
-            "✅ <b>Kode verifikasi sudah dikirim</b>",
+            "✅ <b>Kode OTP Telegram sudah dikirim</b>",
             "",
             `📱 Nomor <code>${escapeHtml(phone)}</code>`,
-            "📨 Cek aplikasi Telegram pada nomor tersebut.",
+            "📨 Periksa aplikasi Telegram pada nomor tersebut.",
             "",
             "🔑 <b>Kirim kode OTP di chat ini.</b>"
           ].join("\n"),
           cancelKeyboard(false)
         );
 
-        return codePromise;
+        const code = await codePromise;
+        const normalized = String(code || "").replace(/\s+/g, "").trim();
+        if (!normalized) {
+          throw new Error("Kode OTP tidak boleh kosong.");
+        }
+        if (!/^\d+$/.test(normalized)) {
+          throw new Error("Kode OTP harus berupa angka.");
+        }
+
+        return normalized;
       },
 
       password: async () => {
+        if (run.cancelled) throw new Error("Login dibatalkan.");
+
         flows.set(userKey, {
           t: "login_password",
           accountId: String(accountId)
         });
-        const passwordPromise = waitForInput(adminTelegramId, "password");
+        const passwordPromise = waitForInput(
+          adminTelegramId,
+          "password",
+          5 * 60 * 1000,
+          accountId
+        );
 
-        await loginStatus.update(
+        await loginStatus.finish(
           [
             "🔐 <b>Verifikasi 2 langkah</b>",
             "",
@@ -2037,13 +2149,37 @@ async function startLogin(ctx, accountId, phone, options = {}) {
           cancelKeyboard(false)
         );
 
-        return passwordPromise;
+        const password = await passwordPromise;
+        if (!password) {
+          throw new Error("Password 2FA tidak boleh kosong.");
+        }
+        return password;
       },
 
       onError: async error => {
-        console.error("LOGIN ERROR:", safeErrorMessage(error, 300));
+        const message = safeErrorMessage(error, 300);
+        console.error("LOGIN ERROR:", message);
+
+        // GramJS returns to its auth loop after onError unless the callback
+        // returns truthy. A manual cancel must therefore explicitly stop the
+        // auth loop instead of being mistaken for an OTP failure.
+        if (
+          run.cancelled ||
+          message === "Login dibatalkan." ||
+          message === "AUTH_USER_CANCEL" ||
+          message === "Waktu input habis. Silakan mulai lagi." ||
+          message === "Sesi input login sudah tidak aktif." ||
+          message === "Input sebelumnya dibatalkan."
+        ) {
+          run.cancelled = true;
+          return true;
+        }
+
+        return false;
       }
     });
+
+    if (run.cancelled) throw new Error("Login dibatalkan.");
 
     const identity = await getMeFromClient(client);
 
@@ -2069,6 +2205,9 @@ async function startLogin(ctx, accountId, phone, options = {}) {
       phone;
 
     const sessionString = client.session.save();
+    if (!sessionString) {
+      throw new Error("Session Telegram kosong setelah login.");
+    }
     const sessionEncrypted = encryptSession(sessionString);
 
     const { data: updated, error } = await sb
@@ -2088,6 +2227,7 @@ async function startLogin(ctx, accountId, phone, options = {}) {
     if (error) throw error;
 
     clients.set(String(accountId), client);
+    sessionPersisted = true;
     flows.delete(userKey);
 
     await recordHistory(accountId, options.adminId || null, {
@@ -2099,31 +2239,41 @@ async function startLogin(ctx, accountId, phone, options = {}) {
       }
     });
 
-    await loginStatus.update(
+    await loginStatus?.finish(
       [
         "✅ <b>Login berhasil</b>",
         "",
         `📱 Nomor <code>${escapeHtml(phone)}</code>`,
         `👤 Akun <code>${escapeHtml(derivedLabel)}</code>`,
-        "🔒 Session berhasil disimpan."
-      ].join("\n")
+        "🔒 Session berhasil disimpan.",
+        "🟢 Status: connected"
+      ].join("\n"),
+      cancelKeyboard(false)
     );
 
-    await showAccount(ctx, updated.id, "✅ Account Telegram berhasil terhubung.");
+    // UI rendering should never undo a successfully persisted login.
+    try {
+      await showAccount(ctx, updated.id, "✅ Account Telegram berhasil terhubung.");
+    } catch (uiError) {
+      console.error("LOGIN SUCCESS UI:", safeErrorMessage(uiError, 300));
+    }
   } catch (e) {
     flows.delete(userKey);
 
     const waiter = waiters.get(userKey);
-    if (waiter) waiter.reject(e);
+    if (waiter?.accountId === String(accountId)) {
+      waiter.reject(e);
+    }
 
-    loginStatus?.stop();
+    const cancelled =
+      run.cancelled ||
+      safeErrorMessage(e, 200) === "Login dibatalkan." ||
+      safeErrorMessage(e, 200) === "AUTH_USER_CANCEL";
 
-    // flow:cancel already rendered the dashboard; don't overwrite it with
-    // a second "login failed" message for the expected cancellation path.
-    const cancelled = safeErrorMessage(e, 200) === "Login dibatalkan.";
+    stopLoading(loginStatus);
 
-    if (loginStatus && !cancelled) {
-      await loginStatus.update(
+    if (loginStatus && !cancelled && !sessionPersisted) {
+      await loginStatus.finish(
         [
           "❌ <b>Login gagal</b>",
           "",
@@ -2134,22 +2284,30 @@ async function startLogin(ctx, accountId, phone, options = {}) {
       );
     }
 
-    try { await client.disconnect(); } catch (_) {}
+    // Once the session is persisted and the client is stored, never disconnect
+    // it because a later UI-only operation failed.
+    if (!sessionPersisted) {
+      try { await client.disconnect(); } catch (_) {}
 
-    if (options.deleteOnFailure) {
-      try {
-        await deleteAccountAfterLoginFailure(accountId);
-      } catch (cleanupError) {
-        console.error(
-          "LOGIN CLEANUP:",
-          safeErrorMessage(cleanupError, 300)
-        );
+      if (options.deleteOnFailure) {
+        try {
+          await deleteAccountAfterLoginFailure(accountId);
+        } catch (cleanupError) {
+          console.error(
+            "LOGIN CLEANUP:",
+            safeErrorMessage(cleanupError, 300)
+          );
+        }
       }
     }
 
     if (cancelled) return;
 
     throw e;
+  } finally {
+    if (loginRuns.get(userKey) === run) {
+      loginRuns.delete(userKey);
+    }
   }
 }
 
@@ -2563,6 +2721,24 @@ async function showAccount(ctx, accountId, prefixMessage = "") {
 
 bot.command("start", async ctx => {
   try {
+    const userKey = String(ctx.from.id);
+    const activeFlow = flows.get(userKey);
+    const activeLogin = loginRuns.get(userKey);
+
+    // Do not let /start replace the OTP/2FA UI while GramJS is waiting for
+    // user input. The login waiter remains the only consumer of the next OTP
+    // or password message.
+    if (
+      activeLogin ||
+      activeFlow?.t === "login_code" ||
+      activeFlow?.t === "login_password"
+    ) {
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      } catch (_) {}
+      return;
+    }
+
     const adminRow = await getAdminByTelegramId(ctx.from.id);
 
     if (!adminRow) {
@@ -3414,9 +3590,20 @@ bot.callbackQuery("flow:cancel", async ctx => {
 
   await ctx.answerCallbackQuery("Dibatalkan").catch(() => {});
   const userKey = String(ctx.from.id);
+  const run = loginRuns.get(userKey);
+  if (run) {
+    run.cancelled = true;
+  }
+
   const waiter = waiters.get(userKey);
   if (waiter) waiter.reject(new Error("Login dibatalkan."));
   flows.delete(userKey);
+
+  // Abort the local connection for an active login only. A stored/connected
+  // account client is not touched because it is not placed in loginRuns.
+  if (run && !waiter) {
+    try { await run.client.disconnect(); } catch (_) {}
+  }
 
   return replaceUi(
     ctx,
@@ -3462,22 +3649,46 @@ bot.on("message", async (ctx, next) => {
 
   // OTP / 2FA password
   if (waiter && ["code", "password"].includes(waiter.type)) {
+    const expectedFlowType = waiter.type === "code" ? "login_code" : "login_password";
+
+    if (
+      flow?.t !== expectedFlowType ||
+      (waiter.accountId != null && String(flow.accountId) !== String(waiter.accountId))
+    ) {
+      waiter.reject(new Error("Sesi input login sudah tidak aktif."));
+      return next();
+    }
+
     if (!ctx.message.text) {
       return renderUi(
         telegramUserId,
         "❌ Input ini harus berupa teks.",
-        cancelKeyboard(false)
+        cancelKeyboard(false),
+        { parse_mode: "HTML" }
       );
     }
 
     const text = waiter.type === "code"
       ? ctx.message.text.replace(/\s+/g, "").trim()
       : ctx.message.text.trim();
+
     if (!text) {
       return renderUi(
         telegramUserId,
-        "❌ Input tidak boleh kosong.",
-        cancelKeyboard(false)
+        waiter.type === "code"
+          ? "❌ Kode OTP tidak boleh kosong."
+          : "❌ Password 2FA tidak boleh kosong.",
+        cancelKeyboard(false),
+        { parse_mode: "HTML" }
+      );
+    }
+
+    if (waiter.type === "code" && !/^\d+$/.test(text)) {
+      return renderUi(
+        telegramUserId,
+        "❌ Kode OTP harus berupa angka.",
+        cancelKeyboard(false),
+        { parse_mode: "HTML" }
       );
     }
 
@@ -3485,14 +3696,6 @@ bot.on("message", async (ctx, next) => {
     try {
       await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
     } catch (_) {}
-
-    if (
-      (waiter.type === "code" && flow?.t !== "login_code") ||
-      (waiter.type === "password" && flow?.t !== "login_password")
-    ) {
-      waiter.reject(new Error("Sesi input login sudah tidak aktif."));
-      return next();
-    }
 
     waiter.resolve(text);
     return;
