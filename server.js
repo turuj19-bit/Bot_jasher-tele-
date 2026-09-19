@@ -736,13 +736,14 @@ function groupListKeyboard(rows, accountId, page, hasNext) {
   // Tapping the group name itself toggles the target state.
   for (const group of rows.filter(g => g.can_send)) {
     const icon = group.enabled ? "✅" : "❌";
-    kb.text(`${icon} ${safeButtonText(group.title, 34)}`, `group:toggle:${group.id}`).row();
+    kb.text(`${icon} ${safeButtonText(group.title, 34)}`, `group:toggle:${group.id}:${page}`).row();
   }
 
   if (page > 0) kb.text("◀️", `group:list:${accountId}:${page - 1}`);
   kb.text("🏠", "menu:dashboard");
   if (hasNext) kb.text("▶️", `group:list:${accountId}:${page + 1}`);
   kb.row();
+  kb.text("➕ Tambah Semua Grup", `group:all:${accountId}`).row();
   kb.text("🔄 Deteksi Grup", `group:refresh:${accountId}`).row();
   kb.text("⬅️ Akun", `account:open:${accountId}`);
 
@@ -4041,11 +4042,12 @@ async function renderGroupPageDirect(ctx, accountId, page, prefix = "") {
   );
 }
 
-bot.callbackQuery(/^group:toggle:(\d+)$/, async ctx => {
+bot.callbackQuery(/^group:toggle:(\d+):(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
 
   const groupId = String(ctx.match[1]);
+  const page = Math.max(0, Number(ctx.match[2] || 0));
   const group = await sb
     .from("account_groups")
     .select("*")
@@ -4082,7 +4084,55 @@ bot.callbackQuery(/^group:toggle:(\d+)$/, async ctx => {
     groupId: groupId
   });
 
-  return renderGroupPageDirect(ctx, group.data.account_id, 0);
+  return renderGroupPageDirect(ctx, group.data.account_id, page);
+});
+
+/* Add/select all writable groups for this account in one action. */
+bot.callbackQuery(/^group:all:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  try {
+    // Scan first so newly detected writable groups are included too.
+    const rows = await refreshGroups(accountId);
+    const allowed = rows.filter(x => x.can_send);
+
+    if (allowed.length) {
+      const { error } = await sb
+        .from("account_groups")
+        .update({ enabled: true })
+        .eq("account_id", accountId)
+        .eq("can_send", true);
+      if (error) throw error;
+    }
+
+    await recordHistory(accountId, adminRow.id, {
+      action: "group_enable_all",
+      status: "success",
+      details: { detected: rows.length, enabled: allowed.length }
+    });
+
+    return renderGroupPageDirect(
+      ctx,
+      accountId,
+      0,
+      `✅ <b>Semua grup ditambahkan.</b>\n\n${allowed.length} grup yang bisa menerima pesan sekarang aktif sebagai target.`
+    );
+  } catch (e) {
+    return replaceUi(
+      ctx,
+      `❌ Gagal menambahkan semua grup.\n\n${escapeHtml(safeErrorMessage(e))}`,
+      new InlineKeyboard().text("⬅️ Akun", `account:open:${accountId}`),
+      { parse_mode: "HTML" }
+    );
+  }
 });
 
 bot.callbackQuery(/^group:remove:(\d+)$/, async ctx => {
