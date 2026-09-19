@@ -929,14 +929,77 @@ function timeParts(value) {
   return { h, m };
 }
 
-function nextTimeWindowMs(startTime, stopTime) {
-  if (!startTime) return 0;
-  const now = new Date();
-  const { h, m } = timeParts(startTime);
-  const start = new Date(now);
-  start.setHours(h, m, 0, 0);
-  if (start <= now) start.setDate(start.getDate() + 1);
-  return Math.max(1000, start.getTime() - now.getTime());
+function nextFormatStartAt(format, now = new Date()) {
+  const startTime = format?.start_time || null;
+  const stopTime = format?.stop_time || null;
+
+  // No time restriction: start immediately.
+  if (!startTime && !stopTime) return new Date(now);
+
+  const minutesNow = now.getHours() * 60 + now.getMinutes();
+
+  // Start only: active from start time onward.
+  if (startTime && !stopTime) {
+    const start = new Date(now);
+    const { h, m } = timeParts(startTime);
+    const startMinutes = h * 60 + m;
+    start.setHours(h, m, 0, 0);
+    return minutesNow >= startMinutes ? new Date(now) : start;
+  }
+
+  // Stop only: active from midnight until stop time.
+  // Once today's window has ended, wait for next midnight instead of
+  // retrying every second.
+  if (!startTime && stopTime) {
+    const { h, m } = timeParts(stopTime);
+    const stopMinutes = h * 60 + m;
+
+    if (minutesNow <= stopMinutes) return new Date(now);
+
+    const nextMidnight = new Date(now);
+    nextMidnight.setDate(nextMidnight.getDate() + 1);
+    nextMidnight.setHours(0, 0, 0, 0);
+    return nextMidnight;
+  }
+
+  const startParts = timeParts(startTime);
+  const stopParts = timeParts(stopTime);
+  const startMinutes = startParts.h * 60 + startParts.m;
+  const stopMinutes = stopParts.h * 60 + stopParts.m;
+
+  // Same-day window, e.g. 08:00 - 22:00.
+  if (startMinutes <= stopMinutes) {
+    if (minutesNow < startMinutes) {
+      const start = new Date(now);
+      start.setHours(startParts.h, startParts.m, 0, 0);
+      return start;
+    }
+
+    if (minutesNow <= stopMinutes) return new Date(now);
+
+    const nextStart = new Date(now);
+    nextStart.setDate(nextStart.getDate() + 1);
+    nextStart.setHours(startParts.h, startParts.m, 0, 0);
+    return nextStart;
+  }
+
+  // Overnight window, e.g. 22:00 - 08:00.
+  if (minutesNow >= startMinutes || minutesNow <= stopMinutes) {
+    return new Date(now);
+  }
+
+  const nextStart = new Date(now);
+  nextStart.setHours(startParts.h, startParts.m, 0, 0);
+  return nextStart;
+}
+
+function nextTimeWindowMs(startTime, stopTime, now = new Date()) {
+  const startAt = nextFormatStartAt(
+    { start_time: startTime || null, stop_time: stopTime || null },
+    now
+  );
+
+  return Math.max(1000, startAt.getTime() - now.getTime());
 }
 
 function isWithinFormatWindow(format, now = new Date()) {
@@ -1485,34 +1548,6 @@ function formatDetailText(account, settings) {
   ].join("\n");
 }
 
-function formatDetailKeyboard(accountId, settings, hasFormat = true) {
-  const kb = new InlineKeyboard();
-
-  if (hasFormat) {
-    kb.text("✏️ Edit Format", `promo:format:edit:${accountId}`).row();
-  } else {
-    kb.text("➕ Buat Format", `promo:format:edit:${accountId}`).row();
-  }
-
-  kb
-    .text("⏱️ Atur Jeda", `promo:delay:${accountId}`)
-    .row()
-    .text("📅 Atur Durasi", `promo:duration:${accountId}`)
-    .row();
-
-  if (settings?.active) {
-    kb.text("⏹️ Stop", `promo:stop:${accountId}`);
-  } else {
-    kb.text("▶️ Mulai", `promo:start:${accountId}`);
-  }
-
-  kb
-    .row()
-    .text("⬅️ Kembali", `account:open:${accountId}`);
-
-  return kb;
-}
-
 /* =========================================================
    HISTORY / AUDIT
 ========================================================= */
@@ -1765,7 +1800,35 @@ async function startFormat(accountId,formatId,adminId){
   if(!formatReady(f))throw new Error("Isi format belum dibuat.");
   const client=await clientFor(accountId); if(!client)throw new Error("Account belum connected atau session tidak valid.");
   const {count,error}=await sb.from("account_groups").select("*",{count:"exact",head:true}).eq("account_id",accountId).eq("enabled",true).eq("can_send",true); if(error)throw error;if(!Number(count||0))throw new Error("Belum ada target grup aktif yang bisa dikirimi.");
-  const now=new Date(); f.active=true;f.started_at=now.toISOString();f.expires_at=new Date(now.getTime()+Number(f.duration_hours||1)*3600000).toISOString();await savePromotionFormats(accountId,formats);scheduleFormat(accountId,f.id,0);await recordHistory(accountId,adminId,{action:"promotion_start",status:"success",details:{format_id:f.id,format_name:f.name}});return {format:f};
+  const now = new Date();
+  const scheduledStartAt = nextFormatStartAt(f, now);
+  const durationMs = Number(f.duration_hours || 1) * 3600000;
+
+  f.active = true;
+  f.started_at = scheduledStartAt.toISOString();
+  f.expires_at = new Date(
+    scheduledStartAt.getTime() + durationMs
+  ).toISOString();
+
+  await savePromotionFormats(accountId, formats);
+  scheduleFormat(
+    accountId,
+    f.id,
+    Math.max(0, scheduledStartAt.getTime() - now.getTime())
+  );
+
+  await recordHistory(accountId, adminId, {
+    action: "promotion_start",
+    status: "success",
+    details: {
+      format_id: f.id,
+      format_name: f.name,
+      scheduled_start_at: f.started_at,
+      expires_at: f.expires_at
+    }
+  });
+
+  return { format: f };
 }
 
 async function stopFormat(accountId,formatId,adminId){
@@ -4633,14 +4696,14 @@ bot.on("message", async (ctx, next) => {
       if(raw === "00:00 - 00:00") {
         const formats=await getPromotionFormats(flow.accountId); const f=formats.find(x=>x.id===String(flow.formatId));
         if(!f)return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan.");
-        f.start_time=null;f.stop_time=null;await savePromotionFormats(flow.accountId,formats);flows.delete(userKey);return renderFormatDetail(ctx,flow.accountId,f.id,"✅ Waktu dijadikan tanpa batas.");
+        f.start_time=null;f.stop_time=null;f.updated_at=new Date().toISOString();await savePromotionFormats(flow.accountId,formats);flows.delete(userKey);return renderFormatDetail(ctx,flow.accountId,f.id,"✅ Waktu dijadikan tanpa batas.");
       }
       const m=raw.match(/^\s*(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s*$/);
       const a=parseTimeHHMM(m?.[1]), b=parseTimeHHMM(m?.[2]);
       if(!a||!b)return renderUi(telegramUserId,"❌ Format waktu salah. Contoh: <code>08:00 - 22:00</code>.",cancelKeyboard(false),{parse_mode:"HTML"});
       const formats=await getPromotionFormats(flow.accountId); const f=formats.find(x=>x.id===String(flow.formatId));
       if(!f)return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan.");
-      f.start_time=a;f.stop_time=b;await savePromotionFormats(flow.accountId,formats);flows.delete(userKey);return renderFormatDetail(ctx,flow.accountId,f.id,`✅ Waktu disimpan: <b>${a} - ${b}</b>`);
+      f.start_time=a;f.stop_time=b;f.updated_at=new Date().toISOString();await savePromotionFormats(flow.accountId,formats);flows.delete(userKey);return renderFormatDetail(ctx,flow.accountId,f.id,`✅ Waktu disimpan: <b>${a} - ${b}</b>`);
     }
 
     /* -------------------------
