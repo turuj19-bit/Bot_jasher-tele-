@@ -5455,7 +5455,12 @@ process.once("SIGTERM", () => {
       );
     }
 
-    await restoreSessions();
+    // Restore user sessions in the background so a stuck GramJS account
+    // cannot prevent the admin Telegram bot from starting.
+    void restoreSessions().catch(e => {
+      console.error("RESTORE SESSIONS:", safeErrorMessage(e, 800));
+    });
+
     await restoreRunningPromotions();
     await bot.start({
       onStart: info => {
