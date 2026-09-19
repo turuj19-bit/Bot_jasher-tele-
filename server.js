@@ -481,6 +481,9 @@ async function renderUi(userId, text, keyboard, options = {}) {
       }
 
       await deleteSavedUi(userId);
+
+      // Let the caller decide how to re-create the message (e.g. with banner).
+      if (options.sendFallback === false) return false;
     }
   }
 
@@ -499,8 +502,14 @@ async function renderStart(ctx, text, keyboard) {
     const saved = uiMessages.get(String(userId));
 
     // Reuse the existing dashboard UI instead of stacking new messages.
+    // If that message no longer exists it is dropped (never left behind) and a
+    // fresh dashboard is created below.
     if (saved) {
-      return renderUi(userId, text, keyboard, { parse_mode: "HTML" });
+      const reused = await renderUi(userId, text, keyboard, {
+        parse_mode: "HTML",
+        sendFallback: false
+      });
+      if (reused !== false) return reused;
     }
 
     if (START_BANNER_FILE_ID) {
@@ -562,32 +571,40 @@ async function renderStart(ctx, text, keyboard) {
   });
 }
 
-function dashboardText(ctx, stats, extra = "") {
+function dashboardText(ctx, stats, extra = "", role = "") {
   const first = String(ctx.from?.first_name || "").trim();
   const last = String(ctx.from?.last_name || "").trim();
   const name = [first, last].filter(Boolean).join(" ") || "Admin";
   const username = ctx.from?.username ? `@${ctx.from.username}` : "-";
+  const roleLabel = role ? (role === "OWNER" ? "OWNER" : "ADMIN") : "";
+  const rule = "━━━━━━━━━━━━━━━━━━";
 
+  const intro =
+    extra ||
+    "Silakan pilih menu di bawah untuk mengatur akun Telegram, format promosi, target grup, dan pengaturan lainnya.";
+
+  // Every value that may be copied sits in its own <code> element, so a single
+  // tap copies just that value (never one big block).
   return [
-    "╭─ 🛡️ <b>ADMIN CONTROL CENTER</b>",
-    "│",
-    `│ 👤 <b>${escapeHtml(name)}</b>`,
-    `│ 🆔 Telegram ID  <code>${escapeHtml(ctx.from.id)}</code>`,
-    `│ 🔗 Username     <code>${escapeHtml(username)}</code>`,
-    `│ 🤖 Bot          <code>v${escapeHtml(BOT_VERSION)}</code>`,
-    "╰────────────────────────────",
-    "",
-    `<i>${escapeHtml(extra || "Profil admin ditampilkan sesuai nama akun Telegram. Silakan pilih menu di bawah untuk mengatur akun Telegram, format promosi, target grup, dan pengaturan lainnya.")}</i>`,
+    "🛡️ <b>ADMIN CONTROL CENTER</b>",
+    rule,
+    `👤 <b>${escapeHtml(name)}</b>`,
+    `🆔 ID Telegram · <code>${escapeHtml(ctx.from.id)}</code>`,
+    `🔗 Username · <code>${escapeHtml(username)}</code>`,
+    roleLabel ? `🎖️ Role · <code>${roleLabel}</code>` : null,
+    `🤖 Versi bot · <code>v${escapeHtml(BOT_VERSION)}</code>`,
+    rule,
+    `<blockquote>✨ <b>Admin sesuai nama akun Telegram.</b>\n${escapeHtml(intro)}</blockquote>`,
     "",
     "📊 <b>STATUS SISTEM</b>",
-    `👥 Admin aktif   · <b>${stats.admins}</b>`,
+    `👥 Admin aktif · <b>${stats.admins}</b>`,
     `📱 Akun Telegram · <b>${stats.accounts}</b>`,
-    `🟢 Terhubung     · <b>${stats.connected}</b>`,
-    `▶️ Promosi jalan  · <b>${stats.running}</b>`,
-    `👥 Target grup   · <b>${stats.groups}</b>`,
-    "",
-    "⌄ <b>MENU UTAMA</b>"
-  ].join("\n");
+    `🟢 Terhubung · <b>${stats.connected}</b>`,
+    `▶️ Promosi berjalan · <b>${stats.running}</b>`,
+    `🎯 Target grup aktif · <b>${stats.groups}</b>`,
+    rule,
+    "⬇️ <b>MENU UTAMA</b>"
+  ].filter(line => line !== null).join("\n");
 }
 
 async function getDashboardStats() {
@@ -1873,6 +1890,86 @@ async function stopPromotion(accountId, adminId) {
    ACCOUNT LOGIN / CONNECT
 ========================================================= */
 
+// Accepts "+628123456789", "628123456789", "+62 812-3456-789", etc. and returns
+// the canonical "+<digits>" form, or null when it is not a usable number.
+function normalizePhone(value) {
+  let raw = String(value ?? "").trim().replace(/[\s\-().]/g, "");
+  if (/^\d{7,15}$/.test(raw) && !raw.startsWith("0")) raw = `+${raw}`;
+  return /^\+[1-9]\d{6,14}$/.test(raw) ? raw : null;
+}
+
+// Telegram frequently invalidates a login code when the exact digits are sent
+// back through Telegram itself. Admins can therefore write the OTP with
+// separators ("1-2-3-4-5" / "1 2 3 4 5"); only the digits reach GramJS.
+function parseLoginCode(value) {
+  const raw = String(value ?? "").trim();
+
+  if (!raw) {
+    return { ok: false, code: "", error: "Kode OTP tidak boleh kosong." };
+  }
+
+  if (!/^[\d\s.,\-_]+$/.test(raw)) {
+    return {
+      ok: false,
+      code: "",
+      error: "Kode OTP hanya boleh berisi angka (boleh dipisah spasi atau tanda hubung)."
+    };
+  }
+
+  const code = raw.replace(/\D/g, "");
+  if (code.length < 4 || code.length > 8) {
+    return { ok: false, code: "", error: "Kode OTP harus 4-8 digit angka." };
+  }
+
+  return { ok: true, code, error: "" };
+}
+
+function rpcErrorCode(error) {
+  return String(error?.errorMessage || error?.message || "").toUpperCase();
+}
+
+function loginErrorText(error) {
+  const code = rpcErrorCode(error);
+
+  if (/PHONE_NUMBER_INVALID/.test(code)) {
+    return "Nomor telepon tidak valid. Periksa kembali nomor Telegram tersebut.";
+  }
+  if (/PHONE_NUMBER_BANNED/.test(code)) {
+    return "Nomor ini diblokir oleh Telegram.";
+  }
+  if (/FLOOD/.test(code)) {
+    const seconds = Number(error?.seconds);
+    return seconds > 0
+      ? `Terlalu banyak percobaan. Coba lagi dalam ${seconds} detik.`
+      : "Terlalu banyak percobaan. Tunggu beberapa saat lalu coba lagi.";
+  }
+  if (/PHONE_CODE_INVALID/.test(code)) {
+    return "Kode OTP salah.";
+  }
+  if (/PHONE_CODE_EXPIRED/.test(code)) {
+    return "Kode OTP kedaluwarsa atau diblokir Telegram. Saat mengirim kode, tulis dengan pemisah (contoh 1-2-3-4-5), lalu ulangi dari awal.";
+  }
+  if (/PASSWORD_HASH_INVALID/.test(code)) {
+    return "Password 2FA salah.";
+  }
+  if (/API_ID_INVALID/.test(code)) {
+    return "API_ID / API_HASH tidak valid. Periksa konfigurasi server.";
+  }
+
+  return safeErrorMessage(error, 300);
+}
+
+function clearLoginFlow(userKey, accountId) {
+  const flow = flows.get(userKey);
+  if (
+    flow &&
+    (flow.t === "login_code" || flow.t === "login_password") &&
+    String(flow.accountId) === String(accountId)
+  ) {
+    flows.delete(userKey);
+  }
+}
+
 function waitForInput(
   adminTelegramId,
   nextType,
@@ -1898,7 +1995,7 @@ function waitForInput(
 
         const normalized =
           nextType === "code"
-            ? String(value ?? "").replace(/\s+/g, "").trim()
+            ? parseLoginCode(value).code
             : String(value ?? "").trim();
 
         if (!normalized) {
@@ -1947,6 +2044,8 @@ async function startLoading(ctx, phone) {
   const chatId = ctx.chat?.id || ctx.from.id;
   const safePhone = escapeHtml(phone);
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  const FRAME_MS = 1000;
+  const MAX_ANIMATION_MS = 15 * 60 * 1000;
 
   // Keep the login process inside one editable UI message.
   await deleteSavedUi(userId);
@@ -1954,7 +2053,11 @@ async function startLoading(ctx, phone) {
   let frameIndex = 0;
   let stopped = false;
   let timer = null;
-  let busy = false;
+  let frameQueued = false;
+  let pauseUntil = 0;
+  let startedAt = Date.now();
+  let message = null;
+  let queue = Promise.resolve();
   let currentBody = [
     "<b>Nomor diterima</b>",
     "",
@@ -1966,40 +2069,68 @@ async function startLoading(ctx, phone) {
 
   const buildText = frame => `${frame} ${currentBody}`;
 
-  const edit = async text => {
-    try {
-      await bot.api.editMessageText(chatId, message.message_id, text, {
-        parse_mode: "HTML",
-        reply_markup: currentKeyboard
-      });
-    } catch (e) {
-      if (!/message is not modified/i.test(String(e?.message || e))) {
+  // Every edit goes through one queue. A late spinner frame can therefore
+  // never land after (and overwrite) a final status, and edits never overlap.
+  const enqueue = getText => {
+    queue = queue.then(async () => {
+      const text = getText();
+      if (text == null || !message) return;
+
+      try {
+        await bot.api.editMessageText(chatId, message.message_id, text, {
+          parse_mode: "HTML",
+          reply_markup: currentKeyboard
+        });
+      } catch (e) {
+        const raw = String(e?.message || e);
+        if (/message is not modified/i.test(raw)) return;
+
+        const retryAfter = Number(e?.parameters?.retry_after);
+        if (retryAfter > 0) pauseUntil = Date.now() + retryAfter * 1000;
+
         console.warn("LOGIN STATUS UPDATE:", safeErrorMessage(e, 180));
       }
+    });
+
+    return queue;
+  };
+
+  const halt = () => {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
     }
   };
 
-  const schedule = () => {
-    if (stopped) return;
+  const tick = () => {
+    if (stopped || timer) return;
 
-    timer = setTimeout(async () => {
+    timer = setTimeout(() => {
+      timer = null;
       if (stopped) return;
 
-      if (!busy) {
-        busy = true;
-        frameIndex = (frameIndex + 1) % frames.length;
-        try {
-          await edit(buildText(frames[frameIndex]));
-        } finally {
-          busy = false;
-        }
+      // Failsafe: an animation can never outlive a stuck login.
+      if (Date.now() - startedAt > MAX_ANIMATION_MS) {
+        halt();
+        return;
       }
 
-      schedule();
-    }, 800);
+      if (!frameQueued && Date.now() >= pauseUntil) {
+        frameQueued = true;
+        frameIndex = (frameIndex + 1) % frames.length;
+
+        void enqueue(() => {
+          frameQueued = false;
+          return stopped ? null : buildText(frames[frameIndex]);
+        });
+      }
+
+      tick();
+    }, FRAME_MS);
   };
 
-  const message = await bot.api.sendMessage(
+  message = await bot.api.sendMessage(
     chatId,
     buildText(frames[0]),
     {
@@ -2009,64 +2140,87 @@ async function startLoading(ctx, phone) {
   );
   await saveUiMessage(userId, message, false);
 
-  schedule();
+  tick();
 
   return {
+    // Change the status text while the animation keeps running.
     async update(text, keyboard = cancelKeyboard(false)) {
+      if (stopped) return;
       currentBody = String(text);
       currentKeyboard = keyboard;
-      if (!stopped) {
-        await edit(buildText(frames[frameIndex]));
-      }
+      await enqueue(() => (stopped ? null : buildText(frames[frameIndex])));
     },
+
+    // Stop the animation and show a final (static) status.
     async finish(text, keyboard = cancelKeyboard(false)) {
-      stopped = true;
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
+      halt();
       currentBody = String(text);
       currentKeyboard = keyboard;
-      await edit(currentBody);
+      await enqueue(() => currentBody);
     },
-    stop() {
-      stopped = true;
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
+
+    // Start animating again (e.g. while an OTP is being verified).
+    async restart(text, keyboard = cancelKeyboard(false)) {
+      currentBody = String(text);
+      currentKeyboard = keyboard;
+
+      if (stopped) {
+        stopped = false;
+        frameQueued = false;
+        startedAt = Date.now();
+        tick();
       }
+
+      await enqueue(() => (stopped ? null : buildText(frames[frameIndex])));
+    },
+
+    // Clears the interval. The returned promise settles once any edit that is
+    // already in flight is done, so the caller can safely render over it.
+    stop() {
+      halt();
+      return queue;
     }
   };
 }
 
 function stopLoading(loader) {
-  loader?.stop?.();
+  return loader?.stop?.();
 }
 
 async function startLogin(ctx, accountId, phone, options = {}) {
   const adminTelegramId = ctx.from.id;
   const userKey = String(adminTelegramId);
-  const existingRun = loginRuns.get(userKey);
 
-  if (existingRun) {
+  if (loginRuns.has(userKey)) {
     throw new Error("Proses login akun Telegram lain masih berjalan.");
   }
 
-  const client = await createTelegramClient("");
   const run = {
     accountId: String(accountId),
-    client,
-    cancelled: false
+    client: null,
+    cancelled: false,
+    loader: null,
+    stage: "phone",
+    notice: "",
+    fatalError: null
   };
   loginRuns.set(userKey, run);
 
+  let client = null;
   let loginStatus = null;
   let sessionPersisted = false;
 
   try {
+    client = await createTelegramClient("");
+    run.client = client;
+
     if (run.cancelled) throw new Error("Login dibatalkan.");
 
     loginStatus = await startLoading(ctx, phone);
+    run.loader = loginStatus;
+
+    if (run.cancelled) throw new Error("Login dibatalkan.");
+
     await client.connect();
 
     if (run.cancelled) throw new Error("Login dibatalkan.");
@@ -2076,15 +2230,17 @@ async function startLogin(ctx, accountId, phone, options = {}) {
         "<b>Terhubung ke Telegram</b>",
         "",
         `📱 Nomor <code>${escapeHtml(phone)}</code>`,
-        "📩 Meminta kode verifikasi dari Telegram..."
+        "📩 Kode OTP sedang dikirim..."
       ].join("\n")
     );
 
     await client.start({
       phoneNumber: async () => phone,
 
-      phoneCode: async () => {
+      phoneCode: async isCodeViaApp => {
         if (run.cancelled) throw new Error("Login dibatalkan.");
+
+        run.stage = "code";
 
         // Register the waiter before changing the UI. This prevents a fast
         // OTP message from arriving before the input promise is available.
@@ -2098,33 +2254,52 @@ async function startLogin(ctx, accountId, phone, options = {}) {
           5 * 60 * 1000,
           accountId
         );
+        codePromise.catch(() => {});
+
+        const notice = run.notice;
+        run.notice = "";
+
+        const sentTo =
+          isCodeViaApp === true
+            ? "📨 Kode dikirim ke aplikasi Telegram pada nomor tersebut."
+            : isCodeViaApp === false
+              ? "📨 Kode dikirim lewat SMS/panggilan ke nomor tersebut."
+              : "📨 Periksa aplikasi Telegram (atau SMS) pada nomor tersebut.";
 
         await loginStatus.finish(
           [
+            notice ? `⚠️ <b>${escapeHtml(notice)}</b>\n` : null,
             "✅ <b>Kode OTP Telegram sudah dikirim</b>",
             "",
             `📱 Nomor <code>${escapeHtml(phone)}</code>`,
-            "📨 Periksa aplikasi Telegram pada nomor tersebut.",
+            sentTo,
             "",
-            "🔑 <b>Kirim kode OTP di chat ini.</b>"
-          ].join("\n"),
+            "🔑 <b>Kirim kode OTP di chat ini.</b>",
+            "💡 <i>Tulis dengan pemisah, contoh 1-2-3-4-5, agar kode tidak diblokir Telegram.</i>"
+          ].filter(line => line !== null).join("\n"),
           cancelKeyboard(false)
         );
 
         const code = await codePromise;
-        const normalized = String(code || "").replace(/\s+/g, "").trim();
-        if (!normalized) {
-          throw new Error("Kode OTP tidak boleh kosong.");
-        }
-        if (!/^\d+$/.test(normalized)) {
-          throw new Error("Kode OTP harus berupa angka.");
-        }
+        const parsed = parseLoginCode(code);
+        if (!parsed.ok) throw new Error(parsed.error);
 
-        return normalized;
+        await loginStatus.restart(
+          [
+            "<b>Memverifikasi kode OTP...</b>",
+            "",
+            `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+            "🔐 Mohon tunggu sebentar."
+          ].join("\n")
+        );
+
+        return parsed.code;
       },
 
       password: async () => {
         if (run.cancelled) throw new Error("Login dibatalkan.");
+
+        run.stage = "password";
 
         flows.set(userKey, {
           t: "login_password",
@@ -2136,16 +2311,21 @@ async function startLogin(ctx, accountId, phone, options = {}) {
           5 * 60 * 1000,
           accountId
         );
+        passwordPromise.catch(() => {});
+
+        const notice = run.notice;
+        run.notice = "";
 
         await loginStatus.finish(
           [
+            notice ? `⚠️ <b>${escapeHtml(notice)}</b>\n` : null,
             "🔐 <b>Verifikasi 2 langkah</b>",
             "",
             `📱 Nomor <code>${escapeHtml(phone)}</code>`,
             "Akun ini meminta password 2FA Telegram.",
             "",
             "🔑 <b>Kirim password 2FA di chat ini.</b>"
-          ].join("\n"),
+          ].filter(line => line !== null).join("\n"),
           cancelKeyboard(false)
         );
 
@@ -2153,16 +2333,27 @@ async function startLogin(ctx, accountId, phone, options = {}) {
         if (!password) {
           throw new Error("Password 2FA tidak boleh kosong.");
         }
+
+        await loginStatus.restart(
+          [
+            "<b>Memverifikasi password 2FA...</b>",
+            "",
+            `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+            "🔐 Mohon tunggu sebentar."
+          ].join("\n")
+        );
+
         return password;
       },
 
+      // GramJS calls onError for every failure inside client.start() and then
+      // goes back to its auth loop unless the callback returns true. Returning
+      // false for a non-recoverable error (bad phone, expired code, flood)
+      // would make GramJS re-send the code / re-ask for input forever.
       onError: async error => {
         const message = safeErrorMessage(error, 300);
         console.error("LOGIN ERROR:", message);
 
-        // GramJS returns to its auth loop after onError unless the callback
-        // returns truthy. A manual cancel must therefore explicitly stop the
-        // auth loop instead of being mistaken for an OTP failure.
         if (
           run.cancelled ||
           message === "Login dibatalkan." ||
@@ -2175,7 +2366,20 @@ async function startLogin(ctx, accountId, phone, options = {}) {
           return true;
         }
 
-        return false;
+        // A wrong OTP / wrong 2FA password can simply be entered again.
+        if (
+          (run.stage === "code" || run.stage === "password") &&
+          /PHONE_CODE_INVALID|PASSWORD_HASH_INVALID|PHONE_CODE_EMPTY/.test(
+            rpcErrorCode(error)
+          )
+        ) {
+          run.notice = loginErrorText(error);
+          return false;
+        }
+
+        // Everything else ends the login with the real reason.
+        run.fatalError = error;
+        return true;
       }
     });
 
@@ -2226,9 +2430,15 @@ async function startLogin(ctx, accountId, phone, options = {}) {
 
     if (error) throw error;
 
+    // Replace (and close) any stale client that was stored for this account.
+    const previous = clients.get(String(accountId));
+    if (previous && previous !== client) {
+      try { await previous.disconnect(); } catch (_) {}
+    }
+
     clients.set(String(accountId), client);
     sessionPersisted = true;
-    flows.delete(userKey);
+    clearLoginFlow(userKey, accountId);
 
     await recordHistory(accountId, options.adminId || null, {
       action: "account_connect",
@@ -2239,55 +2449,83 @@ async function startLogin(ctx, accountId, phone, options = {}) {
       }
     });
 
-    await loginStatus?.finish(
-      [
-        "✅ <b>Login berhasil</b>",
-        "",
-        `📱 Nomor <code>${escapeHtml(phone)}</code>`,
-        `👤 Akun <code>${escapeHtml(derivedLabel)}</code>`,
-        "🔒 Session berhasil disimpan.",
-        "🟢 Status: connected"
-      ].join("\n"),
-      cancelKeyboard(false)
-    );
+    await stopLoading(loginStatus);
+
+    const successText = [
+      "✅ <b>Login berhasil</b>",
+      "",
+      `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+      `👤 Akun <code>${escapeHtml(derivedLabel)}</code>`,
+      "🔒 Session tersimpan (terenkripsi).",
+      "🟢 Status: connected",
+      ""
+    ].join("\n");
 
     // UI rendering should never undo a successfully persisted login.
     try {
-      await showAccount(ctx, updated.id, "✅ Account Telegram berhasil terhubung.");
+      await showAccount(ctx, updated.id, successText);
     } catch (uiError) {
       console.error("LOGIN SUCCESS UI:", safeErrorMessage(uiError, 300));
+      await loginStatus.finish(
+        successText,
+        new InlineKeyboard()
+          .text("📱 Buka Akun", `account:open:${updated.id}`)
+          .row()
+          .text("🏠 Menu Utama", "menu:dashboard")
+      );
     }
   } catch (e) {
-    flows.delete(userKey);
+    clearLoginFlow(userKey, accountId);
 
     const waiter = waiters.get(userKey);
     if (waiter?.accountId === String(accountId)) {
       waiter.reject(e);
     }
 
+    const failure = run.fatalError || e;
+    const failureMessage = safeErrorMessage(failure, 200);
     const cancelled =
       run.cancelled ||
-      safeErrorMessage(e, 200) === "Login dibatalkan." ||
-      safeErrorMessage(e, 200) === "AUTH_USER_CANCEL";
+      failureMessage === "Login dibatalkan." ||
+      (failureMessage === "AUTH_USER_CANCEL" && !run.fatalError);
 
-    stopLoading(loginStatus);
+    await stopLoading(loginStatus);
 
-    if (loginStatus && !cancelled && !sessionPersisted) {
-      await loginStatus.finish(
-        [
-          "❌ <b>Login gagal</b>",
-          "",
-          `📱 Nomor <code>${escapeHtml(phone)}</code>`,
-          escapeHtml(safeErrorMessage(e, 300))
-        ].join("\n"),
-        cancelKeyboard(false)
-      );
+    if (!cancelled && !sessionPersisted) {
+      const failText = [
+        "❌ <b>Login gagal</b>",
+        "",
+        `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+        escapeHtml(loginErrorText(failure))
+      ].join("\n");
+
+      const failKeyboard = new InlineKeyboard()
+        .text(
+          "🔁 Coba Lagi",
+          options.deleteOnFailure
+            ? "account:add"
+            : `account:connect:${accountId}`
+        )
+        .row()
+        .text("🏠 Menu Utama", "menu:dashboard");
+
+      try {
+        if (loginStatus) {
+          await loginStatus.finish(failText, failKeyboard);
+        } else {
+          await renderUi(adminTelegramId, failText, failKeyboard, {
+            parse_mode: "HTML"
+          });
+        }
+      } catch (uiError) {
+        console.error("LOGIN FAILURE UI:", safeErrorMessage(uiError, 300));
+      }
     }
 
     // Once the session is persisted and the client is stored, never disconnect
     // it because a later UI-only operation failed.
     if (!sessionPersisted) {
-      try { await client.disconnect(); } catch (_) {}
+      try { await client?.disconnect(); } catch (_) {}
 
       if (options.deleteOnFailure) {
         try {
@@ -2303,12 +2541,23 @@ async function startLogin(ctx, accountId, phone, options = {}) {
 
     if (cancelled) return;
 
-    throw e;
+    throw failure;
   } finally {
     if (loginRuns.get(userKey) === run) {
       loginRuns.delete(userKey);
     }
   }
+}
+
+// grammY handles updates one at a time. A login waits for the admin's next
+// message (OTP / 2FA), so it must NOT be awaited inside the message handler:
+// the handler would never return and the OTP update would stay queued behind
+// it. Run it in the background instead; all errors are reported to the admin
+// from startLogin() itself.
+function startLoginInBackground(ctx, accountId, phone, options = {}) {
+  startLogin(ctx, accountId, phone, options).catch(error => {
+    console.error("LOGIN RUN:", safeErrorMessage(error, 300));
+  });
 }
 
 async function connectStoredAccount(ctx, accountId, adminId) {
@@ -2758,9 +3007,20 @@ bot.command("start", async ctx => {
       groups: 0
     }));
 
-    const text = dashboardText(ctx, stats);
+    // /start always returns to a clean state: drop any half-finished input
+    // flow (label, format, ...). Login flows were already handled above.
+    flows.delete(userKey);
+
+    const text = dashboardText(ctx, stats, "", adminRow.role);
     const menu = adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu();
-    return renderStart(ctx, text, menu);
+    const rendered = await renderStart(ctx, text, menu);
+
+    // Remove the "/start" command itself so the chat only keeps the dashboard.
+    try {
+      await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
+    } catch (_) {}
+
+    return rendered;
   } catch (e) {
     console.error("START:", safeErrorMessage(e));
     return ctx.reply("❌ Terjadi kesalahan saat membuka dashboard.");
@@ -2781,7 +3041,7 @@ bot.callbackQuery("menu:dashboard", async ctx => {
   }));
 
   const menu = adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu();
-  return replaceUi(ctx, dashboardText(ctx, stats), menu, { parse_mode: "HTML" });
+  return replaceUi(ctx, dashboardText(ctx, stats, "", adminRow.role), menu, { parse_mode: "HTML" });
 });
 
 /* =========================================================
@@ -3593,6 +3853,8 @@ bot.callbackQuery("flow:cancel", async ctx => {
   const run = loginRuns.get(userKey);
   if (run) {
     run.cancelled = true;
+    // Stop the spinner first so no late frame overwrites the menu below.
+    await stopLoading(run.loader);
   }
 
   const waiter = waiters.get(userKey);
@@ -3668,25 +3930,31 @@ bot.on("message", async (ctx, next) => {
       );
     }
 
+    // OTP may be written with separators (1-2-3-4-5); only digits are used.
+    const parsedCode = waiter.type === "code"
+      ? parseLoginCode(ctx.message.text)
+      : null;
     const text = waiter.type === "code"
-      ? ctx.message.text.replace(/\s+/g, "").trim()
+      ? parsedCode.code
       : ctx.message.text.trim();
 
-    if (!text) {
+    if (waiter.type === "code" && !parsedCode.ok) {
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      } catch (_) {}
+
       return renderUi(
         telegramUserId,
-        waiter.type === "code"
-          ? "❌ Kode OTP tidak boleh kosong."
-          : "❌ Password 2FA tidak boleh kosong.",
+        `❌ ${escapeHtml(parsedCode.error)}\n\n🔑 <b>Kirim ulang kode OTP di chat ini.</b>\n💡 <i>Contoh penulisan: 1-2-3-4-5</i>`,
         cancelKeyboard(false),
         { parse_mode: "HTML" }
       );
     }
 
-    if (waiter.type === "code" && !/^\d+$/.test(text)) {
+    if (!text) {
       return renderUi(
         telegramUserId,
-        "❌ Kode OTP harus berupa angka.",
+        "❌ Password 2FA tidak boleh kosong.",
         cancelKeyboard(false),
         { parse_mode: "HTML" }
       );
@@ -3716,8 +3984,8 @@ bot.on("message", async (ctx, next) => {
         );
       }
 
-      const phone = ctx.message.text.trim();
-      if (!/^\+\d{7,15}$/.test(phone)) {
+      const phone = normalizePhone(ctx.message.text);
+      if (!phone) {
         return renderUi(
           telegramUserId,
           "❌ Nomor tidak valid. Gunakan format internasional, contoh <code>+628123456789</code>.",
@@ -3726,13 +3994,29 @@ bot.on("message", async (ctx, next) => {
         );
       }
 
+      if (loginRuns.has(userKey)) {
+        return renderUi(
+          telegramUserId,
+          "⏳ Proses login akun Telegram lain masih berjalan. Selesaikan atau batalkan dulu.",
+          cancelKeyboard(false),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      // Keep the chat clean: the number is now shown in the status message.
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      } catch (_) {}
+
       const account = await createAccountShell(`Telegram ${phone}`, adminRow.telegram_user_id, phone);
       flows.delete(userKey);
 
-      return startLogin(ctx, account.id, phone, {
+      // Do not await: the login must stay free to receive the OTP message.
+      startLoginInBackground(ctx, account.id, phone, {
         adminId: adminRow.id,
         deleteOnFailure: true
       });
+      return;
     }
 
     /* -------------------------
@@ -3747,8 +4031,8 @@ bot.on("message", async (ctx, next) => {
         );
       }
 
-      const phone = ctx.message.text.trim();
-      if (!/^\+\d{7,15}$/.test(phone)) {
+      const phone = normalizePhone(ctx.message.text);
+      if (!phone) {
         return renderUi(
           telegramUserId,
           "❌ Nomor tidak valid. Gunakan format internasional.",
@@ -3756,11 +4040,27 @@ bot.on("message", async (ctx, next) => {
         );
       }
 
+      if (loginRuns.has(userKey)) {
+        return renderUi(
+          telegramUserId,
+          "⏳ Proses login akun Telegram lain masih berjalan. Selesaikan atau batalkan dulu.",
+          cancelKeyboard(false),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      } catch (_) {}
+
       flows.delete(userKey);
-      return startLogin(ctx, flow.accountId, phone, {
+
+      // Do not await: the login must stay free to receive the OTP message.
+      startLoginInBackground(ctx, flow.accountId, phone, {
         adminId: adminRow.id,
         deleteOnFailure: false
       });
+      return;
     }
 
     /* -------------------------
@@ -4282,6 +4582,14 @@ async function gracefulShutdown(signal) {
   }
   schedulerTasks.clear();
 
+  // Stop unfinished interactive logins (spinner timers + temporary clients).
+  for (const run of loginRuns.values()) {
+    run.cancelled = true;
+    try { await run.loader?.stop?.(); } catch (_) {}
+    try { await run.client?.disconnect(); } catch (_) {}
+  }
+  loginRuns.clear();
+
   // Intentionally disconnect local sockets only. The Telegram session is NOT logged out
   // and encrypted session remains in the database for reconnect after restart.
   for (const [accountId, client] of clients.entries()) {
@@ -4320,8 +4628,11 @@ process.once("SIGTERM", () => {
 
     await restoreSessions();
     await restoreRunningPromotions();
-    await bot.start();
-    console.log("Telegram admin bot started.");
+    await bot.start({
+      onStart: info => {
+        console.log(`Telegram admin bot started as @${info?.username || "bot"}.`);
+      }
+    });
   } catch (e) {
     console.error("FATAL:", e);
     process.exit(1);
