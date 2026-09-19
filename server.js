@@ -492,26 +492,21 @@ async function renderUi(userId, text, keyboard, options = {}) {
 }
 
 async function replaceUi(ctx, text, keyboard, options = {}) {
-  return renderUi(ctx.from.id, text, keyboard, options);
+  // Menu navigation intentionally creates a fresh UI message below the
+  // previous one. This keeps the chat history readable and lets every menu
+  // open as its own professional panel instead of overwriting the old panel.
+  const extra = { reply_markup: keyboard };
+  if (options.parse_mode) extra.parse_mode = options.parse_mode;
+  const msg = await bot.api.sendMessage(ctx.chat?.id || ctx.from.id, text, extra);
+  await saveUiMessage(ctx.from.id, msg, false);
+  return msg;
 }
 
 async function renderStart(ctx, text, keyboard) {
   const userId = ctx.from.id;
 
   return withUiLock(userId, async () => {
-    const saved = uiMessages.get(String(userId));
-
-    // Reuse the existing dashboard UI instead of stacking new messages.
-    // If that message no longer exists it is dropped (never left behind) and a
-    // fresh dashboard is created below.
-    if (saved) {
-      const reused = await renderUi(userId, text, keyboard, {
-        parse_mode: "HTML",
-        sendFallback: false
-      });
-      if (reused !== false) return reused;
-    }
-
+    // /start also creates a fresh main panel instead of editing an older one.
     if (START_BANNER_FILE_ID) {
       try {
         const msg = await ctx.replyWithPhoto(START_BANNER_FILE_ID, {
@@ -534,32 +529,20 @@ async function renderStart(ctx, text, keyboard) {
         });
 
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const contentType = String(
-          response.headers.get("content-type") || ""
-        ).toLowerCase();
-
+        const contentType = String(response.headers.get("content-type") || "").toLowerCase();
         if (!contentType.startsWith("image/")) {
-          throw new Error(
-            `URL bukan file gambar (content-type: ${contentType || "unknown"})`
-          );
+          throw new Error(`URL bukan file gambar (content-type: ${contentType || "unknown"})`);
         }
 
         const buffer = Buffer.from(await response.arrayBuffer());
         if (!buffer.length) throw new Error("File banner kosong.");
-        if (buffer.length > 10 * 1024 * 1024) {
-          throw new Error("File banner terlalu besar.");
-        }
+        if (buffer.length > 10 * 1024 * 1024) throw new Error("File banner terlalu besar.");
 
-        const msg = await ctx.replyWithPhoto(
-          new InputFile(buffer, "start-banner.jpg"),
-          {
-            caption: text,
-            parse_mode: "HTML",
-            reply_markup: keyboard
-          }
-        );
-
+        const msg = await ctx.replyWithPhoto(new InputFile(buffer, "start-banner.jpg"), {
+          caption: text,
+          parse_mode: "HTML",
+          reply_markup: keyboard
+        });
         await saveUiMessage(userId, msg, true);
         return msg;
       } catch (e) {
@@ -567,7 +550,12 @@ async function renderStart(ctx, text, keyboard) {
       }
     }
 
-    return renderUi(userId, text, keyboard, { parse_mode: "HTML" });
+    const msg = await bot.api.sendMessage(userId, text, {
+      parse_mode: "HTML",
+      reply_markup: keyboard
+    });
+    await saveUiMessage(userId, msg, false);
+    return msg;
   });
 }
 
@@ -594,7 +582,7 @@ function dashboardText(ctx, stats, extra = "", role = "") {
     roleLabel ? `🎖️ Role · <code>${roleLabel}</code>` : null,
     `🤖 Versi bot · <code>v${escapeHtml(BOT_VERSION)}</code>`,
     rule,
-    `<blockquote>✨ <b>Admin sesuai nama akun Telegram.</b>\n${escapeHtml(intro)}</blockquote>`,
+    `<blockquote>✨ <b>Panel admin sesuai akun Telegram yang sedang digunakan.</b>\n${escapeHtml(intro)}</blockquote>`,
     "",
     "📊 <b>STATUS SISTEM</b>",
     `👥 Admin aktif · <b>${stats.admins}</b>`,
@@ -687,18 +675,16 @@ function accountMenu(account, settings) {
   }
 
   kb
-    .text("👥 Grup", `group:list:${account.id}:0`)
+    .text("👥 Grup / Target", `group:list:${account.id}:0`)
+    .text("➕ Tambah Grup", `group:add:${account.id}`)
     .row()
-    .text("📝 Format", `promo:format:${account.id}`)
+    .text("📝 Format Promosi", `promo:format:${account.id}`)
     .text("⏱ Jeda", `promo:delay:${account.id}`)
     .row()
     .text("📅 Durasi", `promo:duration:${account.id}`)
-    .text(
-      settings?.active ? "⏹ Stop" : "▶️ Start",
-      settings?.active
-        ? `promo:stop:${account.id}`
-        : `promo:start:${account.id}`
-    )
+    .row()
+    .text("▶️ Mulai Promosi", `promo:start:${account.id}`)
+    .text("⏹ Stop Promosi", `promo:stop:${account.id}`)
     .row()
     .text("📋 Riwayat", `history:list:${account.id}:0`)
     .text("✏️ Label", `account:label:${account.id}`)
@@ -727,9 +713,9 @@ function groupListKeyboard(rows, accountId, page, hasNext) {
   const kb = new InlineKeyboard();
 
   for (const group of rows) {
-    const label = `${group.enabled ? "✅" : "⬜"} ${safeButtonText(group.title, 24)}`;
-    kb
-      .text(label, `group:toggle:${group.id}`)
+    const icon = group.enabled ? "✅" : (group.can_send ? "⬜" : "🚫");
+    const label = `${icon} ${safeButtonText(group.title, 24)}`;
+    kb.text(label, `group:toggle:${group.id}`)
       .text("🗑", `group:remove:${group.id}`)
       .row();
   }
@@ -738,7 +724,9 @@ function groupListKeyboard(rows, accountId, page, hasNext) {
   kb.text("🏠", "menu:dashboard");
   if (hasNext) kb.text("▶️", `group:list:${accountId}:${page + 1}`);
   kb.row();
-  kb.text("🔄 Scan / Refresh", `group:refresh:${accountId}`);
+  kb.text("➕ Tambah Target", `group:add:${accountId}`)
+    .text("🔎 Deteksi Ulang", `group:refresh:${accountId}`);
+  kb.row();
   kb.text("◀️ Account", `account:open:${accountId}`);
 
   return kb;
@@ -1263,10 +1251,13 @@ function settingsFormatText(settings) {
 }
 
 function settingsSummary(account, settings) {
+  const telegramName = account.label || account.username || account.phone || "Akun Telegram";
+  const username = account.username ? `@${account.username}` : "belum ada username";
   return [
-    `📱 <b>${escapeHtml(account.label)}</b>`,
-    `🆔 ID internal: <code>${escapeHtml(account.id)}</code>`,
-    `🔗 Telegram ID: <code>${escapeHtml(account.telegram_user_id || "belum")}</code>`,
+    `📱 <b>AKUN TELEGRAM TERHUBUNG</b>`,
+    `👤 Nama: <b>${escapeHtml(telegramName)}</b>`,
+    `🔗 Username: <code>${escapeHtml(username)}</code>`,
+    `🆔 Telegram ID: <code>${escapeHtml(account.telegram_user_id || "belum login")}</code>`,
     `📌 Koneksi: <b>${escapeHtml(account.status || "-")}</b>`,
     `▶️ Promosi: <b>${settings?.active ? "RUNNING" : "STOPPED"}</b>`,
     `📝 Format: <b>${escapeHtml(settingsFormatText(settings))}</b>`,
@@ -2965,6 +2956,75 @@ async function showAccount(ctx, accountId, prefixMessage = "") {
 }
 
 /* =========================================================
+   CHAT LOADING ANIMATION
+   Menu loading is shown as an animated message in the chat itself.
+   No loading text is sent through Telegram's callback notification/toast.
+========================================================= */
+
+async function startChatLoading(ctx, title = "Memproses menu...") {
+  const chatId = ctx.chat?.id || ctx.from?.id;
+  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  const frameMs = 450;
+  let index = 0;
+  let stopped = false;
+  let timer = null;
+  let message = null;
+  let queue = Promise.resolve();
+
+  const body = () => `${frames[index]} <b>${escapeHtml(title)}</b>\n\n<i>Mohon tunggu, bot sedang memproses...</i>`;
+  const edit = () => {
+    queue = queue.then(async () => {
+      if (stopped || !message) return;
+      try {
+        await bot.api.editMessageText(chatId, message.message_id, body(), { parse_mode: "HTML" });
+      } catch (_) {}
+    });
+    return queue;
+  };
+
+  message = await bot.api.sendMessage(chatId, body(), { parse_mode: "HTML" });
+
+  const tick = () => {
+    if (stopped) return;
+    timer = setTimeout(async () => {
+      timer = null;
+      if (stopped) return;
+      index = (index + 1) % frames.length;
+      await edit();
+      tick();
+    }, frameMs);
+  };
+  tick();
+
+  return {
+    async stop() {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      await queue.catch(() => {});
+      if (message) {
+        try { await bot.api.deleteMessage(chatId, message.message_id); } catch (_) {}
+      }
+    }
+  };
+}
+
+// Put a real animated loader in the chat for callback/menu actions. The
+// callback answer itself stays empty, so Telegram's small top notification
+// never shows messages such as "Memuat..." or "Scanning...".
+bot.on("callback_query", async (ctx, next) => {
+  const data = String(ctx.callbackQuery?.data || "");
+  if (data === "flow:cancel" || data === "admin:cancel") return next();
+
+  let loader = null;
+  try {
+    loader = await startChatLoading(ctx, "Memproses menu");
+    return await next();
+  } finally {
+    await loader?.stop?.();
+  }
+});
+
+/* =========================================================
    START / DASHBOARD
 ========================================================= */
 
@@ -3104,7 +3164,7 @@ bot.callbackQuery("account:add", async ctx => {
 
   return replaceUi(
     ctx,
-    "➕ <b>Tambah Akun Telegram</b>\n\nKirim <b>nomor telepon</b> akun yang akan dihubungkan.\nNama akun akan diambil otomatis dari akun Telegram setelah login.\n\nContoh: <code>+628123456789</code>",
+    "➕ <b>KAITKAN AKUN TELEGRAM</b>\n\nMasukkan <b>nomor HP Telegram</b> dari akun yang ingin kamu kaitkan ke bot.\n\nSetelah login berhasil, <b>nama, username, dan Telegram ID</b> akan diambil otomatis dari akun tersebut. Nama akun di panel tidak akan memakai nama nomor lagi.\n\n📱 Contoh: <code>+628123456789</code>\n\n🔐 <i>Kode OTP/2FA akan diproses melalui chat ini.</i>",
     cancelKeyboard(false),
     { parse_mode: "HTML" }
   );
@@ -3134,7 +3194,7 @@ bot.callbackQuery(/^account:connect:(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
 
-  await ctx.answerCallbackQuery("Mengecek session...").catch(() => {});
+  await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
   const account = await getAccount(accountId);
 
@@ -3159,7 +3219,7 @@ bot.callbackQuery(/^account:connect:(\d+)$/, async ctx => {
 
   return replaceUi(
     ctx,
-    "📱 <b>Nomor Telegram</b>\n\nSession lama tidak dapat dipakai saat ini.\nKirim <b>nomor telepon</b> akun yang akan dihubungkan.\nLabel/nama akun tidak digunakan untuk login.\n\nContoh: <code>+628123456789</code>",
+    "📱 <b>KAITKAN ULANG AKUN TELEGRAM</b>\n\nMasukkan <b>nomor HP Telegram</b> akun yang ingin dikaitkan kembali.\n\nNama akun akan disesuaikan otomatis dengan identitas Telegram setelah login berhasil.\n\n📱 Contoh: <code>+628123456789</code>",
     cancelKeyboard(false),
     { parse_mode: "HTML" }
   );
@@ -3451,7 +3511,7 @@ bot.callbackQuery(/^promo:start:(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
 
-  await ctx.answerCallbackQuery("Menjalankan promosi...").catch(() => {});
+  await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
 
   try {
@@ -3475,7 +3535,7 @@ bot.callbackQuery(/^promo:stop:(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
 
-  await ctx.answerCallbackQuery("Menghentikan promosi...").catch(() => {});
+  await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
 
   try {
@@ -3541,9 +3601,9 @@ bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
         ? result.rows.map((g, i) =>
             `${String(page * GROUP_PAGE_SIZE + i + 1).padStart(2, "0")}. ${g.enabled ? "✅" : "⬜"} <b>${escapeHtml(g.title)}</b>\n   ${g.can_send ? "🟢 Bisa kirim" : "🔴 Tidak bisa kirim"}`
           ).join("\n\n")
-        : "<i>Belum ada grup yang tersimpan. Gunakan Scan / Refresh.</i>",
+        : "<i>Belum ada grup yang terdeteksi. Tekan Tambah Target / Deteksi Ulang.</i>",
       "",
-      "Tap nama grup untuk ON/OFF target. Tombol 🗑 menghapus target dari database bot."
+      "Pilih nama grup untuk ON/OFF target. Hanya grup/channel yang terdeteksi dan diizinkan menerima pesan yang dapat dijadikan target."
     ].join("\n");
 
     return replaceUi(
@@ -3562,11 +3622,47 @@ bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
   }
 });
 
+bot.callbackQuery(/^group:add:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  try {
+    const rows = await refreshGroups(accountId);
+    const allowed = rows.filter(x => x.can_send);
+    await recordHistory(accountId, adminRow.id, {
+      action: "group_scan_add",
+      status: "success",
+      details: { detected: rows.length, allowed: allowed.length }
+    });
+
+    return renderGroupPageDirect(
+      ctx,
+      accountId,
+      0,
+      `🔎 <b>GRUP TERDETEKSI</b>\n\n${allowed.length} grup/channel yang diizinkan menerima pesan sudah dimasukkan ke daftar target. Tekan nama grup untuk ON/OFF.`
+    );
+  } catch (e) {
+    return replaceUi(
+      ctx,
+      `❌ Deteksi grup gagal.\n\n${escapeHtml(safeErrorMessage(e))}`,
+      new InlineKeyboard().text("◀️ Account", `account:open:${accountId}`),
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
 bot.callbackQuery(/^group:refresh:(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
 
-  await ctx.answerCallbackQuery("Scanning dialog Telegram...").catch(() => {});
+  await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
   const account = await getAccount(accountId);
 
@@ -3582,7 +3678,7 @@ bot.callbackQuery(/^group:refresh:(\d+)$/, async ctx => {
       details: { scanned: rows.length }
     });
 
-    return renderGroupPageDirect(ctx, accountId, 0, `✅ Scan selesai. ${rows.length} dialog group/channel terbaca.`);
+    return renderGroupPageDirect(ctx, accountId, 0, `🔎 Deteksi selesai. ${rows.length} grup/channel terbaca dan diperbarui.`);
   } catch (e) {
     return replaceUi(
       ctx,
@@ -4008,7 +4104,7 @@ bot.on("message", async (ctx, next) => {
         await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
       } catch (_) {}
 
-      const account = await createAccountShell(`Telegram ${phone}`, adminRow.telegram_user_id, phone);
+      const account = await createAccountShell("Menunggu login", adminRow.telegram_user_id, phone);
       flows.delete(userKey);
 
       // Do not await: the login must stay free to receive the OTP message.
