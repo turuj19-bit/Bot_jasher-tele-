@@ -106,6 +106,10 @@ const uiLocks = new Map();
 // login state per admin chat and gives the cancel flow a safe cancellation flag.
 const loginRuns = new Map();
 
+// In-memory promotion reports for the failure-detail button.
+const promotionReports = new Map();
+const MAX_PROMOTION_REPORTS = 200;
+
 const ACCOUNT_PAGE_SIZE = 8;
 const HISTORY_PAGE_SIZE = 8;
 const GROUP_PAGE_SIZE = 8;
@@ -596,13 +600,45 @@ function dashboardText(ctx, stats, extra = "", role = "") {
   ].filter(line => line !== null).join("\n");
 }
 
-async function getDashboardStats() {
+async function getDashboardStats(adminRow = null) {
+  const isOwner = adminRow?.role === "OWNER";
+  let accountIds = null;
+
+  if (adminRow && !isOwner) {
+    const { data, error } = await sb
+      .from("telegram_accounts")
+      .select("id")
+      .eq("created_by", adminRow.telegram_user_id);
+    if (error) throw error;
+    accountIds = (data || []).map(x => x.id);
+  }
+
+  const accountsQuery = sb.from("telegram_accounts").select("*", { count: "exact", head: true });
+  const connectedQuery = sb.from("telegram_accounts").select("*", { count: "exact", head: true }).eq("status", "connected");
+
+  if (accountIds !== null) {
+    accountsQuery.eq("created_by", adminRow.telegram_user_id);
+    connectedQuery.eq("created_by", adminRow.telegram_user_id);
+  }
+
+  const groupsQuery = accountIds === null
+    ? sb.from("account_groups").select("*", { count: "exact", head: true }).eq("enabled", true).eq("can_send", true)
+    : accountIds.length
+      ? sb.from("account_groups").select("*", { count: "exact", head: true }).eq("enabled", true).eq("can_send", true).in("account_id", accountIds)
+      : null;
+
+  const settingsQuery = accountIds === null
+    ? sb.from("account_settings").select("formats")
+    : accountIds.length
+      ? sb.from("account_settings").select("formats").in("account_id", accountIds)
+      : null;
+
   const [admins, accounts, connected, groups, settingsRows] = await Promise.all([
     sb.from("admins").select("*", { count: "exact", head: true }).eq("active", true),
-    sb.from("telegram_accounts").select("*", { count: "exact", head: true }),
-    sb.from("telegram_accounts").select("*", { count: "exact", head: true }).eq("status", "connected"),
-    sb.from("account_groups").select("*", { count: "exact", head: true }).eq("enabled", true).eq("can_send", true),
-    sb.from("account_settings").select("formats")
+    accountsQuery,
+    connectedQuery,
+    groupsQuery || Promise.resolve({ data: [], count: 0, error: null }),
+    settingsQuery || Promise.resolve({ data: [], error: null })
   ]);
 
   for (const r of [admins, accounts, connected, groups, settingsRows]) {
@@ -807,6 +843,21 @@ async function getAccount(accountId) {
 
   if (error) throw error;
   return data || null;
+}
+
+async function getAccountForAdmin(accountId, adminRow) {
+  const account = await getAccount(accountId);
+  if (!account) return null;
+  if (adminRow?.role === "OWNER") return account;
+  if (String(account.created_by || "") !== String(adminRow?.telegram_user_id || "")) return null;
+  return account;
+}
+
+async function requireAccountAccess(ctx, adminRow, accountId) {
+  const account = await getAccountForAdmin(accountId, adminRow);
+  if (account) return account;
+  await ctx.answerCallbackQuery("Akun ini bukan milik admin ini.", { show_alert: true }).catch(() => {});
+  return null;
 }
 
 async function getAccountSettings(accountId) {
@@ -1068,16 +1119,25 @@ async function createAccountShell(label, adminId, phone = null) {
   return data;
 }
 
-async function listAccounts(page = 0) {
+async function listAccounts(page = 0, adminRow = null) {
   const offset = page * ACCOUNT_PAGE_SIZE;
+  const owner = adminRow?.role === "OWNER";
+
+  let rowsQuery = sb
+    .from("telegram_accounts")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .range(offset, offset + ACCOUNT_PAGE_SIZE);
+  let countQuery = sb.from("telegram_accounts").select("*", { count: "exact", head: true });
+
+  if (adminRow && !owner) {
+    rowsQuery = rowsQuery.eq("created_by", adminRow.telegram_user_id);
+    countQuery = countQuery.eq("created_by", adminRow.telegram_user_id);
+  }
 
   const [{ data, error }, { count, error: countError }] = await Promise.all([
-    sb
-      .from("telegram_accounts")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .range(offset, offset + ACCOUNT_PAGE_SIZE),
-    sb.from("telegram_accounts").select("*", { count: "exact", head: true })
+    rowsQuery,
+    countQuery
   ]);
 
   if (error) throw error;
@@ -1293,6 +1353,57 @@ async function getMeFromClient(client) {
     lastName: me.lastName || null
   };
 }
+
+/* =========================================================
+   PROMOTION FAILURE REPORT
+========================================================= */
+
+bot.callbackQuery(/^promo:failures:([a-f0-9]+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+
+  const report = promotionReports.get(String(ctx.match[1]));
+  if (!report) {
+    return replaceUi(
+      ctx,
+      "⚠️ <b>Data grup gagal sudah tidak tersedia.</b>\n\nJalankan promosi berikutnya untuk membuat laporan baru.",
+      new InlineKeyboard().text("🏠 Menu Utama", "menu:dashboard"),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  const account = await getAccountForAdmin(report.accountId, adminRow);
+  if (!account) return;
+
+  const lines = [
+    "❌ <b>DAFTAR GROUP GAGAL</b>",
+    "━━━━━━━━━━━━━━━━━━",
+    `📝 <b>Format:</b> ${escapeHtml(report.formatName || "-")}`,
+    `👤 <b>Username:</b> ${escapeHtml(report.accountUsername ? `@${report.accountUsername}` : "-")}`,
+    `🆔 <b>ID Akun:</b> <code>${escapeHtml(report.accountTelegramId || "-")}</code>`,
+    `📱 <b>Nomor:</b> <code>${escapeHtml(report.accountPhone || "-")}</code>`,
+    "━━━━━━━━━━━━━━━━━━"
+  ];
+
+  if (!report.failedRows.length) {
+    lines.push("<i>Tidak ada group yang gagal.</i>");
+  } else {
+    report.failedRows.forEach((row, index) => {
+      lines.push(`${String(index + 1).padStart(2, "0")}. <b>${escapeHtml(row.groupTitle)}</b>\n   ❌ ${escapeHtml(row.reason)}`);
+    });
+  }
+
+  return replaceUi(
+    ctx,
+    lines.join("\n\n"),
+    new InlineKeyboard()
+      .text("⬅️ Kembali ke Hasil", `promo:view:${report.accountId}:${report.formatId}`)
+      .row()
+      .text("🏠 Menu Utama", "menu:dashboard"),
+    { parse_mode: "HTML" }
+  );
+});
 
 /* =========================================================
    GROUP MANAGEMENT
@@ -1754,30 +1865,197 @@ function classifySendError(error) {
   return raw ? raw.replace(/\s+/g, " ").slice(0, 160) : "Kesalahan tidak diketahui";
 }
 
+function rememberPromotionReport(report) {
+  const token = crypto.randomBytes(6).toString("hex");
+  promotionReports.set(token, { ...report, createdAt: Date.now() });
+  while (promotionReports.size > MAX_PROMOTION_REPORTS) {
+    const first = promotionReports.keys().next().value;
+    if (!first) break;
+    promotionReports.delete(first);
+  }
+  return token;
+}
+
+function promotionReportKeyboard(token, failedCount, accountId, formatId) {
+  const kb = new InlineKeyboard();
+  if (failedCount > 0) {
+    kb.text(`🔎 Cek Grup Gagal (${failedCount})`, `promo:failures:${token}`).row();
+  }
+  kb.text("📝 Detail Format", `promo:view:${accountId}:${formatId}`);
+  return kb;
+}
+
+async function sendPromotionReport(account, format, total, success, failed, failures) {
+  const recipientId = account?.created_by;
+  if (!recipientId) return;
+
+  const admin = await getAdminByTelegramId(recipientId).catch(() => null);
+  if (!admin) return;
+
+  const failedRows = failures.map(x => ({
+    groupId: x.groupId || null,
+    groupTitle: x.groupTitle || "Group tanpa nama",
+    reason: x.reason || "Kesalahan tidak diketahui"
+  }));
+
+  const token = rememberPromotionReport({
+    accountId: String(account.id),
+    formatId: String(format.id),
+    accountLabel: account.label,
+    accountUsername: account.username,
+    accountTelegramId: account.telegram_user_id,
+    accountPhone: account.phone,
+    formatName: format.name,
+    failedRows
+  });
+
+  const lines = [
+    "📊 <b>HASIL PROMOSI</b>",
+    "━━━━━━━━━━━━━━━━━━",
+    `📝 <b>Format:</b> ${escapeHtml(format.name || "-")}`,
+    `👤 <b>Username:</b> ${escapeHtml(account.username ? `@${account.username}` : "-")}`,
+    `🆔 <b>ID Akun:</b> <code>${escapeHtml(account.telegram_user_id || "-")}</code>`,
+    `📱 <b>Nomor:</b> <code>${escapeHtml(account.phone || "-")}</code>`,
+    "━━━━━━━━━━━━━━━━━━",
+    "📤 <b>HASIL PENGIRIMAN</b>",
+    `Total group dipilih: <b>${total}</b>`,
+    `Berhasil terkirim: <b>${success}</b>`,
+    `Gagal: <b>${failed}</b>`
+  ];
+
+  if (failedRows.length) {
+    lines.push("", "❌ <b>Ringkasan gagal:</b>");
+    const counts = new Map();
+    for (const row of failedRows) counts.set(row.reason, (counts.get(row.reason) || 0) + 1);
+    for (const [reason, count] of counts) {
+      lines.push(`• ${count} group — ${escapeHtml(reason)}`);
+    }
+  }
+
+  await bot.api.sendMessage(
+    Number(recipientId),
+    lines.join("\n"),
+    {
+      parse_mode: "HTML",
+      reply_markup: promotionReportKeyboard(token, failed, account.id, format.id)
+    }
+  ).catch(e => console.warn("PROMOTION REPORT:", safeErrorMessage(e, 220)));
+}
+
 async function fireFormat(accountId, formatId) {
-  const account=await getAccount(accountId);
-  const format=await getPromotionFormat(accountId,formatId);
-  if(!account||!format||!format.active)return {shouldContinue:false,delayMs:0};
-  const now=new Date();
-  if(!format.expires_at||new Date(format.expires_at)<=now){
-    await stopFormat(accountId,formatId,null);
-    return {shouldContinue:false,delayMs:0};
+  const account = await getAccount(accountId);
+  const format = await getPromotionFormat(accountId, formatId);
+  if (!account || !format || !format.active) return { shouldContinue: false, delayMs: 0 };
+
+  const now = new Date();
+  if (!format.expires_at || new Date(format.expires_at) <= now) {
+    await stopFormat(accountId, formatId, null);
+    return { shouldContinue: false, delayMs: 0 };
   }
-  if(!isWithinFormatWindow(format,now)){
-    return {shouldContinue:true,delayMs:nextTimeWindowMs(format.start_time,format.stop_time)};
+
+  if (!isWithinFormatWindow(format, now)) {
+    return { shouldContinue: true, delayMs: nextTimeWindowMs(format.start_time, format.stop_time) };
   }
-  const client=await clientFor(accountId);
-  if(!client)return {shouldContinue:true,delayMs:120000};
-  const {data:groups,error}=await sb.from("account_groups").select("id,telegram_group_id,title,can_send,enabled").eq("account_id",accountId).eq("enabled",true).eq("can_send",true).order("title",{ascending:true});
-  if(error)throw error;
-  if(!groups?.length)return {shouldContinue:true,delayMs:Number(format.interval_minutes||10)*60000};
-  const dialogs=await client.getDialogs({limit:500}); const entityMap=new Map();
-  for(const d of dialogs){const e=d?.entity;if(!e||(!d.isGroup&&!d.isChannel))continue;const id=String(e.id?.value??e.id??"");if(id)entityMap.set(id,e);}
-  let photoBuffer=null;
-  if(format.media_type==="photo"&&format.media_file_id)photoBuffer=await downloadBotPhoto(format.media_file_id);
-  let success=0,fail=0,floodWaitMs=0;
-  for(const group of groups){const target=entityMap.get(String(group.telegram_group_id));if(!target){fail++;continue;}try{if(format.media_type==="photo"&&photoBuffer){await client.sendFile(target,{file:photoBuffer,caption:format.caption||"",forceDocument:false});}else{await client.sendMessage(target,{message:String(format.message||"").trim()});}success++;await recordHistory(accountId,null,{accountLabel:account.label,action:"promotion_send",status:"success",groupId:group.id,groupTitle:group.title,details:{format_id:format.id,format_name:format.name}});}catch(e){fail++;floodWaitMs=Math.max(floodWaitMs,extractFloodWaitMs(e));await recordHistory(accountId,null,{accountLabel:account.label,action:"promotion_send",status:"error",groupId:group.id,groupTitle:group.title,error:safeErrorMessage(e,1000),details:{format_id:format.id,format_name:format.name}});}}
-  return {shouldContinue:true,delayMs:Math.max(Number(format.interval_minutes||10)*60000,floodWaitMs),success,fail};
+
+  const client = await clientFor(accountId);
+  if (!client) return { shouldContinue: true, delayMs: 120000 };
+
+  const { data: groups, error } = await sb
+    .from("account_groups")
+    .select("id,telegram_group_id,title,can_send,enabled")
+    .eq("account_id", accountId)
+    .eq("enabled", true)
+    .eq("can_send", true)
+    .order("title", { ascending: true });
+  if (error) throw error;
+
+  if (!groups?.length) {
+    return { shouldContinue: true, delayMs: Number(format.interval_minutes || 10) * 60000 };
+  }
+
+  const dialogs = await client.getDialogs({ limit: 500 });
+  const entityMap = new Map();
+  for (const dialog of dialogs) {
+    const entity = dialog?.entity;
+    if (!entity || (!dialog.isGroup && !dialog.isChannel)) continue;
+    const id = String(entity.id?.value ?? entity.id ?? "");
+    if (id) entityMap.set(id, entity);
+  }
+
+  let photoBuffer = null;
+  if (format.media_type === "photo" && format.media_file_id) {
+    photoBuffer = await downloadBotPhoto(format.media_file_id);
+  }
+
+  let success = 0;
+  let fail = 0;
+  let floodWaitMs = 0;
+  const failures = [];
+
+  for (const group of groups) {
+    const target = entityMap.get(String(group.telegram_group_id));
+    if (!target) {
+      fail++;
+      failures.push({ groupId: group.id, groupTitle: group.title, reason: "Group tidak dapat diakses" });
+      await recordHistory(accountId, null, {
+        accountLabel: account.label,
+        action: "promotion_send",
+        status: "error",
+        groupId: group.id,
+        groupTitle: group.title,
+        error: "Entity grup tidak ditemukan di dialog Telegram",
+        details: { format_id: format.id, format_name: format.name }
+      });
+      continue;
+    }
+
+    try {
+      if (format.media_type === "photo" && photoBuffer) {
+        await client.sendFile(target, {
+          file: photoBuffer,
+          caption: format.caption || "",
+          forceDocument: false
+        });
+      } else {
+        const message = String(format.message || "").trim();
+        if (!message) throw new Error("Format teks kosong.");
+        await client.sendMessage(target, { message });
+      }
+
+      success++;
+      await recordHistory(accountId, null, {
+        accountLabel: account.label,
+        action: "promotion_send",
+        status: "success",
+        groupId: group.id,
+        groupTitle: group.title,
+        details: { format_id: format.id, format_name: format.name }
+      });
+    } catch (e) {
+      fail++;
+      const reason = classifySendError(e);
+      failures.push({ groupId: group.id, groupTitle: group.title, reason });
+      floodWaitMs = Math.max(floodWaitMs, extractFloodWaitMs(e));
+      await recordHistory(accountId, null, {
+        accountLabel: account.label,
+        action: "promotion_send",
+        status: "error",
+        groupId: group.id,
+        groupTitle: group.title,
+        error: safeErrorMessage(e, 1000),
+        details: { format_id: format.id, format_name: format.name, reason }
+      });
+    }
+  }
+
+  await sendPromotionReport(account, format, groups.length, success, fail, failures);
+
+  return {
+    shouldContinue: true,
+    delayMs: Math.max(Number(format.interval_minutes || 10) * 60000, floodWaitMs),
+    success,
+    fail
+  };
 }
 
 function scheduleFormat(accountId,formatId,delayMs=0){
@@ -3458,7 +3736,7 @@ bot.command("start", async ctx => {
       );
     }
 
-    const stats = await getDashboardStats().catch(() => ({
+    const stats = await getDashboardStats(adminRow).catch(() => ({
       admins: 0,
       accounts: 0,
       connected: 0,
@@ -3491,7 +3769,7 @@ bot.callbackQuery("menu:dashboard", async ctx => {
   if (!adminRow) return;
 
   await ctx.answerCallbackQuery().catch(() => {});
-  const stats = await getDashboardStats().catch(() => ({
+  const stats = await getDashboardStats(adminRow).catch(() => ({
     admins: 0,
     accounts: 0,
     connected: 0,
@@ -3515,11 +3793,11 @@ bot.callbackQuery(/^accounts:list:(\d+)$/, async ctx => {
   const rawPage = Number(ctx.match[1]);
 
   try {
-    const result = await listAccounts(rawPage);
+    const result = await listAccounts(rawPage, adminRow);
     const page = ensurePage(rawPage, Math.floor(Math.max(0, result.total - 1) / ACCOUNT_PAGE_SIZE));
 
     // Re-load if the requested page was beyond current max.
-    const current = page === rawPage ? result : await listAccounts(page);
+    const current = page === rawPage ? result : await listAccounts(page, adminRow);
 
     const lines = [
       "📱 <b>AKUN TELEGRAM</b>",
@@ -3574,7 +3852,9 @@ bot.callbackQuery(/^account:open:(\d+)$/, async ctx => {
   if (!adminRow) return;
 
   await ctx.answerCallbackQuery().catch(() => {});
-  return showAccount(ctx, String(ctx.match[1]));
+  const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
+  return showAccount(ctx, accountId);
 });
 
 bot.callbackQuery(/^account:status:(\d+)$/, async ctx => {
@@ -3582,7 +3862,9 @@ bot.callbackQuery(/^account:status:(\d+)$/, async ctx => {
   if (!adminRow) return;
 
   await ctx.answerCallbackQuery().catch(() => {});
-  return showAccount(ctx, String(ctx.match[1]));
+  const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
+  return showAccount(ctx, accountId);
 });
 
 /* =========================================================
@@ -3595,6 +3877,7 @@ bot.callbackQuery(/^account:connect:(\d+)$/, async ctx => {
 
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const account = await getAccount(accountId);
 
   if (!account) {
@@ -3630,6 +3913,7 @@ bot.callbackQuery(/^account:disconnect:(\d+)$/, async ctx => {
 
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
 
   try {
     await stopScheduler(accountId);
@@ -3665,6 +3949,7 @@ bot.callbackQuery(/^account:remove:(\d+)$/, async ctx => {
 
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const account = await getAccount(accountId);
 
   if (!account) {
@@ -3691,6 +3976,7 @@ bot.callbackQuery(/^account:remove:confirm:(\d+)$/, async ctx => {
 
   await ctx.answerCallbackQuery("Menghapus account...").catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const account = await getAccount(accountId);
 
   if (!account) {
@@ -3774,6 +4060,7 @@ bot.callbackQuery(/^account:settings:(\d+)$/, async ctx => {
 
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const { account, settings } = await getAccountBundle(accountId);
 
   if (!account) {
@@ -3794,6 +4081,7 @@ bot.callbackQuery(/^account:label:(\d+)$/, async ctx => {
 
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const account = await getAccount(accountId);
 
   if (!account) {
@@ -3820,13 +4108,16 @@ bot.callbackQuery(/^account:label:(\d+)$/, async ctx => {
 bot.callbackQuery(/^promo:list:(\d+):\d+$/, async ctx => {
   const adminRow = await requireAdmin(ctx); if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
-  return renderFormatList(ctx, String(ctx.match[1]));
+  const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
+  return renderFormatList(ctx, accountId);
 });
 
 bot.callbackQuery(/^promo:add:(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx); if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const account = await getAccount(accountId);
   if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), {parse_mode:"HTML"});
   flows.set(String(ctx.from.id), { t:"format_add_name", accountId, adminId:adminRow.id });
@@ -3836,13 +4127,16 @@ bot.callbackQuery(/^promo:add:(\d+)$/, async ctx => {
 bot.callbackQuery(/^promo:view:(\d+):([^:]+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx); if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
-  return renderFormatDetail(ctx, String(ctx.match[1]), String(ctx.match[2]));
+  const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
+  return renderFormatDetail(ctx, accountId, String(ctx.match[2]));
 });
 
 bot.callbackQuery(/^promo:edit:(\d+):([^:]+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx); if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const format=await getPromotionFormat(accountId, formatId);
   if(!format) return renderFormatList(ctx, accountId, "❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id), {t:"format", accountId, formatId, adminId:adminRow.id});
@@ -3853,6 +4147,7 @@ bot.callbackQuery(/^promo:delete:(\d+):([^:]+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx); if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const formats=await getPromotionFormats(accountId);
   const format=formats.find(x=>x.id===formatId);
   if(!format) return renderFormatList(ctx, accountId, "❌ Format tidak ditemukan.");
@@ -3866,6 +4161,7 @@ bot.callbackQuery(/^promo:active:(\d+):\d+$/, async ctx => {
   const adminRow = await requireAdmin(ctx); if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId=String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const formats=await getPromotionFormats(accountId);
   const active=formats.filter(x=>x.active);
   return replaceUi(ctx, `▶️ <b>FORMAT AKTIF</b>\n\n${active.length ? active.map(x=>`🟢 <b>${escapeHtml(x.name)}</b>\n⏱ ${escapeHtml(formatInterval(x.interval_minutes))}\n📅 ${escapeHtml(formatDuration(x.duration_hours))}\n🕐 ${escapeHtml(formatWindowLabel(x))}`).join("\n\n") : "Tidak ada format yang sedang aktif."}`, activeFormatKeyboard(active,accountId), {parse_mode:"HTML"});
@@ -3873,7 +4169,8 @@ bot.callbackQuery(/^promo:active:(\d+):\d+$/, async ctx => {
 
 bot.callbackQuery(/^promo:delay:(\d+):([^:]+)$/, async ctx => {
   const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
-  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]); const f=await getPromotionFormat(accountId,formatId);
+  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const f=await getPromotionFormat(accountId,formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id),{t:"delay",accountId,formatId,adminId:adminRow.id});
   return replaceUi(ctx,`⏱️ <b>ATUR JEDA</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nContoh: <code>10 menit</code> atau <code>1 jam</code>.`,cancelKeyboard(false),{parse_mode:"HTML"});
@@ -3881,7 +4178,8 @@ bot.callbackQuery(/^promo:delay:(\d+):([^:]+)$/, async ctx => {
 
 bot.callbackQuery(/^promo:duration:(\d+):([^:]+)$/, async ctx => {
   const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
-  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]); const f=await getPromotionFormat(accountId,formatId);
+  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const f=await getPromotionFormat(accountId,formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id),{t:"duration",accountId,formatId,adminId:adminRow.id});
   return replaceUi(ctx,`📅 <b>ATUR DURASI</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nContoh: <code>3 hari</code> atau <code>12 jam</code>.`,cancelKeyboard(false),{parse_mode:"HTML"});
@@ -3889,7 +4187,8 @@ bot.callbackQuery(/^promo:duration:(\d+):([^:]+)$/, async ctx => {
 
 bot.callbackQuery(/^promo:time:(\d+):([^:]+)$/, async ctx => {
   const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
-  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]); const f=await getPromotionFormat(accountId,formatId);
+  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const f=await getPromotionFormat(accountId,formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id),{t:"time",accountId,formatId,adminId:adminRow.id});
   return replaceUi(ctx,`🕐 <b>ATUR WAKTU</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nKirim: <code>08:00 - 22:00</code>\nAtau <code>00:00 - 00:00</code> untuk tanpa batas waktu.`,cancelKeyboard(false),{parse_mode:"HTML"});
@@ -3897,7 +4196,8 @@ bot.callbackQuery(/^promo:time:(\d+):([^:]+)$/, async ctx => {
 
 bot.callbackQuery(/^promo:toggle:(\d+):([^:]+)$/, async ctx => {
   const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
-  const accountId=String(ctx.match[1]),formatId=String(ctx.match[2]); const formats=await getPromotionFormats(accountId); const f=formats.find(x=>x.id===formatId);
+  const accountId=String(ctx.match[1]),formatId=String(ctx.match[2]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const formats=await getPromotionFormats(accountId); const f=formats.find(x=>x.id===formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   if(f.active) await stopFormat(accountId,formatId,adminRow.id); else await startFormat(accountId,formatId,adminRow.id);
   return renderFormatDetail(ctx,accountId,formatId,f.active?"🔴 Format dinonaktifkan.":"🟢 Format diaktifkan.");
@@ -3912,6 +4212,7 @@ bot.callbackQuery(/^promo:stopall:(\d+)$/, async ctx => {
   if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   try {
     await stopAllFormats(accountId, adminRow.id);
     return showAccount(ctx, accountId, "⏹️ <b>Semua promosi dihentikan.</b>");
@@ -3923,6 +4224,7 @@ bot.callbackQuery(/^promo:stopall:(\d+)$/, async ctx => {
 bot.callbackQuery(/^promo:start:(\d+):([^:]+)$/, async ctx => {
   const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
   const accountId=String(ctx.match[1]),formatId=String(ctx.match[2]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   try { const r=await startFormat(accountId,formatId,adminRow.id); return renderFormatDetail(ctx,accountId,formatId,`▶️ <b>Format ${escapeHtml(r.format.name)} dimulai.</b>`); }
   catch(e){ return renderFormatDetail(ctx,accountId,formatId,`❌ ${escapeHtml(safeErrorMessage(e))}`); }
 });
@@ -3930,6 +4232,7 @@ bot.callbackQuery(/^promo:start:(\d+):([^:]+)$/, async ctx => {
 bot.callbackQuery(/^promo:stop:(\d+):([^:]+)$/, async ctx => {
   const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
   const accountId=String(ctx.match[1]),formatId=String(ctx.match[2]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   try { const r=await stopFormat(accountId,formatId,adminRow.id); return renderFormatDetail(ctx,accountId,formatId,r.wasRunning?"⏹️ <b>Format dihentikan.</b>":"ℹ️ Format tidak sedang aktif."); }
   catch(e){ return renderFormatDetail(ctx,accountId,formatId,`❌ ${escapeHtml(safeErrorMessage(e))}`); }
 });
@@ -3944,6 +4247,7 @@ bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
 
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const requestedPage = Number(ctx.match[2]);
   const account = await getAccount(accountId);
 
@@ -4010,6 +4314,7 @@ bot.callbackQuery(/^group:add:(\d+)$/, async ctx => {
 
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const account = await getAccount(accountId);
   if (!account) {
     return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
@@ -4046,6 +4351,7 @@ bot.callbackQuery(/^group:refresh:(\d+)$/, async ctx => {
 
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const account = await getAccount(accountId);
 
   if (!account) {
@@ -4121,6 +4427,8 @@ bot.callbackQuery(/^group:toggle:(\d+):(\d+)$/, async ctx => {
     return ctx.answerCallbackQuery("Grup tidak ditemukan.", { show_alert: true });
   }
 
+  if (!await requireAccountAccess(ctx, adminRow, String(group.data.account_id))) return;
+
   if (!group.data.can_send && !group.data.enabled) {
     return ctx.answerCallbackQuery(
       "Telegram menandai group ini tidak bisa menerima pesan.",
@@ -4157,6 +4465,7 @@ bot.callbackQuery(/^group:all:(\d+)$/, async ctx => {
 
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const account = await getAccount(accountId);
   if (!account) {
     return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
@@ -4212,6 +4521,8 @@ bot.callbackQuery(/^group:remove:(\d+)$/, async ctx => {
   if (groupError || !group) {
     return ctx.answerCallbackQuery("Grup tidak ditemukan.", { show_alert: true });
   }
+
+  if (!await requireAccountAccess(ctx, adminRow, String(group.account_id))) return;
 
   await ctx.answerCallbackQuery().catch(() => {});
 
@@ -4499,6 +4810,14 @@ bot.on("message", async (ctx, next) => {
   if (!flow) return next();
 
   try {
+    if (flow.accountId && !["account_phone", "account_phone_new"].includes(flow.t)) {
+      const owned = await getAccountForAdmin(flow.accountId, adminRow);
+      if (!owned) {
+        flows.delete(userKey);
+        return renderUi(telegramUserId, "⛔ Akun tersebut bukan milik admin ini.", backDashboardKeyboard(), { parse_mode: "HTML" });
+      }
+    }
+
     /* -------------------------
        ADD ACCOUNT: PHONE
     -------------------------- */
