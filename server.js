@@ -1350,7 +1350,11 @@ async function getMeFromClient(client) {
     telegramUserId: Number(me.id),
     username: me.username || null,
     firstName: me.firstName || null,
-    lastName: me.lastName || null
+    lastName: me.lastName || null,
+    // For the connected account, Telegram's own User object is the
+    // authoritative source. Do not trust the number typed during login
+    // when displaying/saving the account identity.
+    phone: normalizePhone(me.phone) || null
   };
 }
 
@@ -1380,7 +1384,8 @@ bot.callbackQuery(/^promo:failures:([a-f0-9]+)$/, async ctx => {
     "❌ <b>DAFTAR GROUP GAGAL</b>",
     "━━━━━━━━━━━━━━━━━━",
     `📝 <b>Format:</b> ${escapeHtml(report.formatName || "-")}`,
-    `👤 <b>Username:</b> ${escapeHtml(report.accountUsername ? `@${report.accountUsername}` : "-")}`,
+    `👤 <b>Nama:</b> ${escapeHtml(report.accountName || report.accountLabel || "-")}`,
+    `🔗 <b>Username:</b> ${escapeHtml(report.accountUsername ? `@${report.accountUsername}` : "-")}`,
     `🆔 <b>ID Akun:</b> <code>${escapeHtml(report.accountTelegramId || "-")}</code>`,
     `📱 <b>Nomor:</b> <code>${escapeHtml(report.accountPhone || "-")}</code>`,
     "━━━━━━━━━━━━━━━━━━"
@@ -1473,6 +1478,11 @@ function channelCanSend(entity, client) {
   })();
 }
 
+function isBrokenAccountGroupsUpdatedAtError(error) {
+  const message = safeErrorMessage(error, 1000);
+  return /record\s+["']new["']\s+has\s+no\s+field\s+["']updated_at["']/i.test(message);
+}
+
 async function refreshGroups(accountId) {
   const client = await clientFor(accountId);
 
@@ -1510,7 +1520,39 @@ async function refreshGroups(accountId) {
       .from("account_groups")
       .upsert(rows, { onConflict: "account_id,telegram_group_id" });
 
-    if (error) throw error;
+    if (error) {
+      // Some older Supabase databases have the account_groups UPDATE trigger
+      // installed even though the table is missing updated_at. That makes an
+      // upsert fail with: record "new" has no field "updated_at".
+      // Do not make Telegram scanning fail in that case: insert only groups
+      // that are not already present, leaving existing rows untouched until
+      // the database schema is repaired.
+      if (!isBrokenAccountGroupsUpdatedAtError(error)) throw error;
+
+      const { data: existingRows, error: existingError } = await sb
+        .from("account_groups")
+        .select("telegram_group_id")
+        .eq("account_id", accountId);
+
+      if (existingError) throw error;
+
+      const existingIds = new Set(
+        (existingRows || []).map(row => String(row.telegram_group_id))
+      );
+      const newRows = rows.filter(row => !existingIds.has(String(row.telegram_group_id)));
+
+      if (newRows.length) {
+        const { error: insertError } = await sb
+          .from("account_groups")
+          .insert(newRows);
+        if (insertError) throw insertError;
+      }
+
+      console.warn(
+        `ACCOUNT_GROUPS legacy schema detected for account ${accountId}: ` +
+        "scan completed using insert-only fallback. Run the supplied SQL schema repair to restore updates."
+      );
+    }
   }
 
   return rows;
@@ -1892,6 +1934,28 @@ async function sendPromotionReport(account, format, total, success, failed, fail
   const admin = await getAdminByTelegramId(recipientId).catch(() => null);
   if (!admin) return;
 
+  // Refresh identity from the authenticated Telegram session immediately
+  // before building the report. This prevents stale/wrong phone data in the
+  // promotion result and keeps the displayed name tied to the connected
+  // Telegram account itself.
+  let liveIdentity = null;
+  try {
+    const client = await clientFor(account.id);
+    if (client) liveIdentity = await getMeFromClient(client);
+  } catch (e) {
+    console.warn("PROMOTION IDENTITY REFRESH:", safeErrorMessage(e, 220));
+  }
+
+  const accountName =
+    [liveIdentity?.firstName, liveIdentity?.lastName].filter(Boolean).join(" ").trim() ||
+    account.label ||
+    liveIdentity?.username ||
+    "Akun Telegram";
+
+  const accountUsername = liveIdentity?.username || account.username || null;
+  const accountTelegramId = liveIdentity?.telegramUserId || account.telegram_user_id || null;
+  const accountPhone = liveIdentity?.phone || account.phone || null;
+
   const failedRows = failures.map(x => ({
     groupId: x.groupId || null,
     groupTitle: x.groupTitle || "Group tanpa nama",
@@ -1901,10 +1965,11 @@ async function sendPromotionReport(account, format, total, success, failed, fail
   const token = rememberPromotionReport({
     accountId: String(account.id),
     formatId: String(format.id),
-    accountLabel: account.label,
-    accountUsername: account.username,
-    accountTelegramId: account.telegram_user_id,
-    accountPhone: account.phone,
+    accountLabel: accountName,
+    accountName,
+    accountUsername,
+    accountTelegramId,
+    accountPhone,
     formatName: format.name,
     failedRows
   });
@@ -1913,9 +1978,10 @@ async function sendPromotionReport(account, format, total, success, failed, fail
     "📊 <b>HASIL PROMOSI</b>",
     "━━━━━━━━━━━━━━━━━━",
     `📝 <b>Format:</b> ${escapeHtml(format.name || "-")}`,
-    `👤 <b>Username:</b> ${escapeHtml(account.username ? `@${account.username}` : "-")}`,
-    `🆔 <b>ID Akun:</b> <code>${escapeHtml(account.telegram_user_id || "-")}</code>`,
-    `📱 <b>Nomor:</b> <code>${escapeHtml(account.phone || "-")}</code>`,
+    `👤 <b>Nama:</b> ${escapeHtml(accountName)}`,
+    `🔗 <b>Username:</b> ${escapeHtml(accountUsername ? `@${accountUsername}` : "-")}`,
+    `🆔 <b>ID Akun:</b> <code>${escapeHtml(accountTelegramId || "-")}</code>`,
+    `📱 <b>Nomor:</b> <code>${escapeHtml(accountPhone || "-")}</code>`,
     "━━━━━━━━━━━━━━━━━━",
     "📤 <b>HASIL PENGIRIMAN</b>",
     `Total group dipilih: <b>${total}</b>`,
@@ -3054,7 +3120,7 @@ async function startLogin(ctx, accountId, phone, options = {}) {
         label: derivedLabel.slice(0, 80),
         telegram_user_id: identity.telegramUserId,
         username: identity.username || null,
-        phone,
+        phone: identity.phone || phone,
         session_string: sessionEncrypted,
         status: "connected"
       })
@@ -3088,7 +3154,7 @@ async function startLogin(ctx, accountId, phone, options = {}) {
     const successText = [
       "✅ <b>Login berhasil</b>",
       "",
-      `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+      `📱 Nomor <code>${escapeHtml(identity.phone || phone)}</code>`,
       `👤 Akun <code>${escapeHtml(derivedLabel)}</code>`,
       "🔒 Session tersimpan (terenkripsi).",
       "🟢 Status: connected",
@@ -3212,7 +3278,7 @@ async function connectStoredAccount(ctx, accountId, adminId) {
       label: derivedLabel.slice(0, 80),
       telegram_user_id: identity.telegramUserId,
       username: identity.username || null,
-      phone: account?.phone || null,
+      phone: identity.phone || account?.phone || null,
       status: "connected",
     })
     .eq("id", accountId);
@@ -3638,15 +3704,30 @@ async function renderFormatList(ctx, accountId, prefixMessage = "") {
 
 async function startChatLoading(ctx, title = "Memproses menu...") {
   const chatId = ctx.chat?.id || ctx.from?.id;
-  const frames = ["[░░░░░░░░░░]", "[██░░░░░░░░]", "[████░░░░░░]", "[██████░░░░]", "[████████░░]", "[██████████]"];
-  const frameMs = 350;
+  // Continuous ping-pong progress: it never gets stuck at the middle/end while
+  // the actual operation is still running. The percentage makes progress easy
+  // to see, while the bar keeps moving until the final UI is ready.
+  const percentages = Array.from({ length: 21 }, (_, i) => i * 5);
+  const frames = percentages.map(percent => {
+    const total = 14;
+    const filled = Math.round((percent / 100) * total);
+    return `${"█".repeat(filled)}${"░".repeat(total - filled)}`;
+  });
+  const sequence = [...frames, ...frames.slice(1, -1).reverse()];
+  const frameMs = 220;
   let index = 0;
   let stopped = false;
   let timer = null;
   let message = null;
   let queue = Promise.resolve();
 
-  const body = () => `⏳ <b>${escapeHtml(title)}</b>\n${frames[index]}`;
+  const percentForIndex = () => {
+    const frame = sequence[index] || frames[0];
+    const direct = frames.indexOf(frame);
+    return direct >= 0 ? percentages[direct] : 0;
+  };
+  const body = () => `⏳ <b>${escapeHtml(title)}</b>\n<code>[${sequence[index]}]</code> <b>${percentForIndex()}%</b>`;
+
   const edit = () => {
     queue = queue.then(async () => {
       if (stopped || !message) return;
@@ -3664,11 +3745,9 @@ async function startChatLoading(ctx, title = "Memproses menu...") {
     timer = setTimeout(async () => {
       timer = null;
       if (stopped) return;
-      if (index < frames.length - 1) {
-        index += 1;
-        await edit();
-        tick();
-      }
+      index = (index + 1) % sequence.length;
+      await edit();
+      tick();
     }, frameMs);
   };
   tick();
@@ -5378,6 +5457,11 @@ process.once("SIGTERM", () => {
 
     await restoreSessions();
     await restoreRunningPromotions();
+
+    // Past webhook mode can block long-polling after a VPS restart.
+    // Clear only the webhook configuration; do not discard pending updates.
+    await bot.api.deleteWebhook({ drop_pending_updates: false });
+
     await bot.start({
       onStart: info => {
         console.log(`Telegram admin bot started as @${info?.username || "bot"}.`);
