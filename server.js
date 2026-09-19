@@ -5457,6 +5457,11 @@ process.once("SIGTERM", () => {
 
     await restoreSessions();
     await restoreRunningPromotions();
+
+    // Past webhook mode can block long-polling after a VPS restart.
+    // Clear only the webhook configuration; do not discard pending updates.
+    await bot.api.deleteWebhook({ drop_pending_updates: false });
+
     await bot.start({
       onStart: info => {
         console.log(`Telegram admin bot started as @${info?.username || "bot"}.`);
