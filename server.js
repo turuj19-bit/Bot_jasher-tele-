@@ -85,7 +85,7 @@ const flows = new Map();
 // Admin Telegram ID -> { type, resolve, reject, timer }
 const waiters = new Map();
 
-// Account ID -> scheduler task object
+// Scheduler key -> task object. Key is accountId:formatId.
 const schedulerTasks = new Map();
 
 // Account ID -> currently loading GramJS client Promise
@@ -596,23 +596,28 @@ function dashboardText(ctx, stats, extra = "", role = "") {
 }
 
 async function getDashboardStats() {
-  const [admins, accounts, connected, running, groups] = await Promise.all([
+  const [admins, accounts, connected, groups, settingsRows] = await Promise.all([
     sb.from("admins").select("*", { count: "exact", head: true }).eq("active", true),
     sb.from("telegram_accounts").select("*", { count: "exact", head: true }),
     sb.from("telegram_accounts").select("*", { count: "exact", head: true }).eq("status", "connected"),
-    sb.from("account_settings").select("*", { count: "exact", head: true }).eq("active", true),
-    sb.from("account_groups").select("*", { count: "exact", head: true }).eq("enabled", true).eq("can_send", true)
+    sb.from("account_groups").select("*", { count: "exact", head: true }).eq("enabled", true).eq("can_send", true),
+    sb.from("account_settings").select("formats")
   ]);
 
-  for (const r of [admins, accounts, connected, running, groups]) {
+  for (const r of [admins, accounts, connected, groups, settingsRows]) {
     if (r.error) throw r.error;
   }
+
+  const running = (settingsRows.data || []).reduce(
+    (n, row) => n + (Array.isArray(row.formats) ? row.formats.filter(f => f?.active).length : 0),
+    0
+  );
 
   return {
     admins: Number(admins.count || 0),
     accounts: Number(accounts.count || 0),
     connected: Number(connected.count || 0),
-    running: Number(running.count || 0),
+    running,
     groups: Number(groups.count || 0)
   };
 }
@@ -662,51 +667,66 @@ function accountListKeyboard(accounts, page, hasNext) {
 
 function accountMenu(account, settings) {
   const kb = new InlineKeyboard();
-
-  kb
-    .text("📊 Status", `account:status:${account.id}`)
-    .text("⚙️ Setting", `account:settings:${account.id}`)
-    .row();
-
-  if (account.status === "connected") {
-    kb.text("🔌 Putuskan", `account:disconnect:${account.id}`);
-  } else {
-    kb.text("🔗 Connect", `account:connect:${account.id}`);
-  }
-
-  kb
-    .text("👥 Grup / Target", `group:list:${account.id}:0`)
-    .text("➕ Tambah Grup", `group:add:${account.id}`)
-    .row()
-    .text("📝 Format Promosi", `promo:format:${account.id}`)
-    .text("⏱ Jeda", `promo:delay:${account.id}`)
-    .row()
-    .text("📅 Durasi", `promo:duration:${account.id}`)
-    .row()
-    .text("▶️ Mulai Promosi", `promo:start:${account.id}`)
-    .text("⏹ Stop Promosi", `promo:stop:${account.id}`)
-    .row()
-    .text("📋 Riwayat", `history:list:${account.id}:0`)
-    .text("✏️ Label", `account:label:${account.id}`)
-    .row()
-    .text("🗑 Hapus", `account:remove:${account.id}`)
-    .row()
-    .text("◀️ Daftar Akun", "accounts:list:0");
-
+  kb.text("📊 Status", `account:status:${account.id}`).row();
+  kb.text("⚙️ Pengaturan", `account:settings:${account.id}`).row();
+  if (account.status === "connected") kb.text("🔌 Putuskan", `account:disconnect:${account.id}`);
+  else kb.text("🔗 Connect", `account:connect:${account.id}`);
+  kb.row();
+  kb.text("👥 Target", `group:list:${account.id}:0`).row();
+  kb.text("➕ Tambah Target", `group:add:${account.id}`).row();
+  kb.text("📝 Format", `promo:list:${account.id}:0`).row();
+  kb.text("➕ Tambah Format", `promo:add:${account.id}`).row();
+  kb.text("⏱️ Jeda", `promo:list:${account.id}:0`).row();
+  kb.text("📅 Durasi", `promo:list:${account.id}:0`).row();
+  kb.text("▶️ Format Aktif", `promo:active:${account.id}:0`).row();
+  kb.text("📋 Riwayat", `history:list:${account.id}:0`).row();
+  kb.text("🏷️ Label", `account:label:${account.id}`).row();
+  kb.text("🗑️ Hapus", `account:remove:${account.id}`).row();
+  kb.text("⬅️ Kembali", "accounts:list:0");
   return kb;
 }
 
 function settingsMenu(accountId) {
   return new InlineKeyboard()
-    .text("✏️ Ubah Label", `account:label:${accountId}`)
-    .row()
-    .text("📝 Format Promosi", `promo:format:${accountId}`)
-    .row()
-    .text("⏱ Ubah Jeda", `promo:delay:${accountId}`)
-    .text("📅 Ubah Durasi", `promo:duration:${accountId}`)
-    .row()
-    .text("◀️ Account", `account:open:${accountId}`)
-    .text("🏠", "menu:dashboard");
+    .text("🏷️ Label", `account:label:${accountId}`).row()
+    .text("📝 Format", `promo:list:${accountId}:0`).row()
+    .text("➕ Tambah Format", `promo:add:${accountId}`).row()
+    .text("⬅️ Kembali", `account:open:${accountId}`);
+}
+
+function formatListKeyboard(formats, accountId, page = 0) {
+  const kb = new InlineKeyboard();
+  for (const f of formats) {
+    const icon = f.active ? "🟢" : "⚪";
+    kb.text(`${icon} ${safeButtonText(f.name, 30)}`, `promo:view:${accountId}:${f.id}`).row();
+  }
+  kb.text("➕ Tambah Format", `promo:add:${accountId}`).row();
+  kb.text("⬅️ Kembali", `account:open:${accountId}`);
+  return kb;
+}
+
+function activeFormatKeyboard(formats, accountId) {
+  const kb = new InlineKeyboard();
+  for (const f of formats.filter(x => x.active)) {
+    kb.text(`🟢 ${safeButtonText(f.name, 28)}`, `promo:view:${accountId}:${f.id}`).row();
+  }
+  kb.text("⬅️ Kembali", `account:open:${accountId}`);
+  return kb;
+}
+
+function formatDetailKeyboard(accountId, format) {
+  const kb = new InlineKeyboard();
+  kb.text("✏️ Edit Format", `promo:edit:${accountId}:${format.id}`).row();
+  kb.text("⏱️ Atur Jeda", `promo:delay:${accountId}:${format.id}`).row();
+  kb.text("📅 Atur Durasi", `promo:duration:${accountId}:${format.id}`).row();
+  kb.text("🕐 Atur Waktu", `promo:time:${accountId}:${format.id}`).row();
+  if (format.active) kb.text("⏹️ Stop", `promo:stop:${accountId}:${format.id}`);
+  else kb.text("▶️ Mulai", `promo:start:${accountId}:${format.id}`);
+  kb.row();
+  kb.text(format.active ? "🔴 Nonaktif" : "🟢 Aktif", `promo:toggle:${accountId}:${format.id}`).row();
+  kb.text("🗑️ Hapus Format", `promo:delete:${accountId}:${format.id}`).row();
+  kb.text("⬅️ Kembali", `promo:list:${accountId}:0`);
+  return kb;
 }
 
 function groupListKeyboard(rows, accountId, page, hasNext) {
@@ -815,6 +835,144 @@ async function ensureAccountSettings(accountId) {
   if (error) throw error;
   return data;
 }
+
+/* =========================================================
+   MULTI FORMAT STORAGE
+   Formats are stored in account_settings.formats (JSONB) so the existing
+   database schema stays compatible. The legacy single-format columns remain
+   untouched and are imported once into "Format 1".
+========================================================= */
+
+function newFormatId() {
+  return crypto.randomBytes(6).toString("hex");
+}
+
+function normalizeFormat(row = {}) {
+  return {
+    id: String(row.id || newFormatId()),
+    name: String(row.name || "Format Baru").trim().slice(0, 60) || "Format Baru",
+    media_type: row.media_type === "photo" ? "photo" : "text",
+    message: String(row.message || ""),
+    media_file_id: row.media_file_id || null,
+    caption: row.caption || null,
+    interval_minutes: Math.max(1, Number(row.interval_minutes || 10)),
+    duration_hours: Math.max(1, Number(row.duration_hours || 1)),
+    start_time: row.start_time || null,
+    stop_time: row.stop_time || null,
+    active: row.active === true,
+    started_at: row.started_at || null,
+    expires_at: row.expires_at || null,
+    created_at: row.created_at || new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+}
+
+async function getPromotionFormats(accountId) {
+  const settings = await ensureAccountSettings(accountId);
+  let formats = Array.isArray(settings.formats) ? settings.formats.map(normalizeFormat) : [];
+
+  // One-time compatibility import from the old single-format columns.
+  if (!formats.length) {
+    const hasLegacy =
+      (settings.media_type === "text" && String(settings.message || "").trim()) ||
+      (settings.media_type === "photo" && settings.media_file_id);
+
+    if (hasLegacy) {
+      formats = [normalizeFormat({
+        name: "Format 1",
+        media_type: settings.media_type,
+        message: settings.message,
+        media_file_id: settings.media_file_id,
+        caption: settings.caption,
+        interval_minutes: settings.interval_minutes,
+        duration_hours: settings.duration_hours,
+        active: settings.active === true,
+        started_at: settings.started_at || null,
+        expires_at: settings.expires_at || null
+      })];
+      await sb.from("account_settings").update({ formats }).eq("account_id", accountId);
+    }
+  }
+
+  return formats;
+}
+
+async function savePromotionFormats(accountId, formats) {
+  const normalized = (formats || []).map(normalizeFormat);
+  const { data, error } = await sb
+    .from("account_settings")
+    .update({ formats: normalized })
+    .eq("account_id", accountId)
+    .select("*")
+    .single();
+  if (error) throw error;
+  return Array.isArray(data.formats) ? data.formats.map(normalizeFormat) : [];
+}
+
+async function getPromotionFormat(accountId, formatId) {
+  const formats = await getPromotionFormats(accountId);
+  return formats.find(x => String(x.id) === String(formatId)) || null;
+}
+
+function formatReady(format) {
+  return Boolean(
+    (format?.media_type === "text" && String(format?.message || "").trim()) ||
+    (format?.media_type === "photo" && format?.media_file_id)
+  );
+}
+
+function parseTimeHHMM(value) {
+  const m = String(value || "").trim().match(/^(?:[01]\d|2[0-3]):[0-5]\d$/);
+  return m ? m[0] : null;
+}
+
+function timeParts(value) {
+  const [h, m] = String(value).split(":").map(Number);
+  return { h, m };
+}
+
+function nextTimeWindowMs(startTime, stopTime) {
+  if (!startTime) return 0;
+  const now = new Date();
+  const { h, m } = timeParts(startTime);
+  const start = new Date(now);
+  start.setHours(h, m, 0, 0);
+  if (start <= now) start.setDate(start.getDate() + 1);
+  return Math.max(1000, start.getTime() - now.getTime());
+}
+
+function isWithinFormatWindow(format, now = new Date()) {
+  if (!format?.start_time && !format?.stop_time) return true;
+  if (format.start_time && !format.stop_time) {
+    const { h, m } = timeParts(format.start_time);
+    const start = new Date(now); start.setHours(h, m, 0, 0);
+    return now >= start;
+  }
+  if (!format.start_time && format.stop_time) {
+    const { h, m } = timeParts(format.stop_time);
+    const stop = new Date(now); stop.setHours(h, m, 0, 0);
+    return now <= stop;
+  }
+  const a = timeParts(format.start_time);
+  const b = timeParts(format.stop_time);
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  const start = a.h * 60 + a.m;
+  const stop = b.h * 60 + b.m;
+  if (start <= stop) return minutes >= start && minutes <= stop;
+  return minutes >= start || minutes <= stop;
+}
+
+function formatWindowLabel(format) {
+  if (format?.start_time || format?.stop_time) {
+    return `${format.start_time || "00:00"} - ${format.stop_time || "23:59"}`;
+  }
+  return "langsung";
+}
+
+function schedulerKey(accountId, formatId) {
+  return `${accountId}:${formatId}`;
+}
+
 
 async function getAccountBundle(accountId) {
   const [account, settings] = await Promise.all([
@@ -1150,7 +1308,8 @@ async function refreshGroups(accountId) {
     throw new Error("Akun Telegram belum terhubung. Connect akun terlebih dahulu.");
   }
 
-  const dialogs = await client.getDialogs({ limit: 500 });
+  const dialogs = [];
+  for await (const dialog of client.iterDialogs({})) dialogs.push(dialog);
   const rows = [];
 
   for (const dialog of dialogs) {
@@ -1559,6 +1718,67 @@ function classifySendError(error) {
   }
 
   return raw ? raw.replace(/\s+/g, " ").slice(0, 160) : "Kesalahan tidak diketahui";
+}
+
+async function fireFormat(accountId, formatId) {
+  const account=await getAccount(accountId);
+  const format=await getPromotionFormat(accountId,formatId);
+  if(!account||!format||!format.active)return {shouldContinue:false,delayMs:0};
+  const now=new Date();
+  if(!format.expires_at||new Date(format.expires_at)<=now){
+    await stopFormat(accountId,formatId,null);
+    return {shouldContinue:false,delayMs:0};
+  }
+  if(!isWithinFormatWindow(format,now)){
+    return {shouldContinue:true,delayMs:nextTimeWindowMs(format.start_time,format.stop_time)};
+  }
+  const client=await clientFor(accountId);
+  if(!client)return {shouldContinue:true,delayMs:120000};
+  const {data:groups,error}=await sb.from("account_groups").select("id,telegram_group_id,title,can_send,enabled").eq("account_id",accountId).eq("enabled",true).eq("can_send",true).order("title",{ascending:true});
+  if(error)throw error;
+  if(!groups?.length)return {shouldContinue:true,delayMs:Number(format.interval_minutes||10)*60000};
+  const dialogs=await client.getDialogs({limit:500}); const entityMap=new Map();
+  for(const d of dialogs){const e=d?.entity;if(!e||(!d.isGroup&&!d.isChannel))continue;const id=String(e.id?.value??e.id??"");if(id)entityMap.set(id,e);}
+  let photoBuffer=null;
+  if(format.media_type==="photo"&&format.media_file_id)photoBuffer=await downloadBotPhoto(format.media_file_id);
+  let success=0,fail=0,floodWaitMs=0;
+  for(const group of groups){const target=entityMap.get(String(group.telegram_group_id));if(!target){fail++;continue;}try{if(format.media_type==="photo"&&photoBuffer){await client.sendFile(target,{file:photoBuffer,caption:format.caption||"",forceDocument:false});}else{await client.sendMessage(target,{message:String(format.message||"").trim()});}success++;await recordHistory(accountId,null,{accountLabel:account.label,action:"promotion_send",status:"success",groupId:group.id,groupTitle:group.title,details:{format_id:format.id,format_name:format.name}});}catch(e){fail++;floodWaitMs=Math.max(floodWaitMs,extractFloodWaitMs(e));await recordHistory(accountId,null,{accountLabel:account.label,action:"promotion_send",status:"error",groupId:group.id,groupTitle:group.title,error:safeErrorMessage(e,1000),details:{format_id:format.id,format_name:format.name}});}}
+  return {shouldContinue:true,delayMs:Math.max(Number(format.interval_minutes||10)*60000,floodWaitMs),success,fail};
+}
+
+function scheduleFormat(accountId,formatId,delayMs=0){
+  const key=schedulerKey(accountId,formatId); const old=schedulerTasks.get(key); if(old?.timeout)clearTimeout(old.timeout);
+  const task={running:true,timeout:null}; schedulerTasks.set(key,task);
+  task.timeout=setTimeout(async()=>{
+    if(schedulerTasks.get(key)!==task||!task.running)return;
+    let nextDelay=60000,cont=true;
+    try{const r=await fireFormat(accountId,formatId);nextDelay=Number(r?.delayMs||60000);cont=r?.shouldContinue!==false;}catch(e){console.error(`PROMOTION ${key}:`,safeErrorMessage(e));nextDelay=60000;}
+    if(schedulerTasks.get(key)!==task||!task.running)return;
+    const f=await getPromotionFormat(accountId,formatId).catch(()=>null);
+    if(!f?.active||!cont){schedulerTasks.delete(key);return;}
+    task.timeout=setTimeout(()=>{if(schedulerTasks.get(key)!==task||!task.running)return;task.timeout=null;scheduleFormat(accountId,formatId,0);},Math.max(1000,nextDelay));
+  },Math.max(0,delayMs));
+}
+
+async function startFormat(accountId,formatId,adminId){
+  const account=await getAccount(accountId); if(!account)throw new Error("Account tidak ditemukan.");
+  const formats=await getPromotionFormats(accountId); const f=formats.find(x=>x.id===String(formatId)); if(!f)throw new Error("Format tidak ditemukan.");
+  if(!formatReady(f))throw new Error("Isi format belum dibuat.");
+  const client=await clientFor(accountId); if(!client)throw new Error("Account belum connected atau session tidak valid.");
+  const {count,error}=await sb.from("account_groups").select("*",{count:"exact",head:true}).eq("account_id",accountId).eq("enabled",true).eq("can_send",true); if(error)throw error;if(!Number(count||0))throw new Error("Belum ada target grup aktif yang bisa dikirimi.");
+  const now=new Date(); f.active=true;f.started_at=now.toISOString();f.expires_at=new Date(now.getTime()+Number(f.duration_hours||1)*3600000).toISOString();await savePromotionFormats(accountId,formats);scheduleFormat(accountId,f.id,0);await recordHistory(accountId,adminId,{action:"promotion_start",status:"success",details:{format_id:f.id,format_name:f.name}});return {format:f};
+}
+
+async function stopFormat(accountId,formatId,adminId){
+  const formats=await getPromotionFormats(accountId); const f=formats.find(x=>x.id===String(formatId)); if(!f)return {wasRunning:false};
+  const key=schedulerKey(accountId,formatId); const task=schedulerTasks.get(key);if(task?.timeout)clearTimeout(task.timeout);schedulerTasks.delete(key);
+  const wasRunning=Boolean(f.active);f.active=false;f.started_at=null;f.expires_at=null;await savePromotionFormats(accountId,formats);
+  if(adminId)await recordHistory(accountId,adminId,{action:"promotion_stop",status:"success",details:{format_id:f.id,format_name:f.name,was_running:wasRunning}});
+  return {wasRunning};
+}
+
+async function stopAllFormats(accountId,adminId=null){
+  const formats=await getPromotionFormats(accountId); for(const f of formats){if(f.active)await stopFormat(accountId,f.id,adminId);}
 }
 
 async function fireAccount(accountId) {
@@ -3010,65 +3230,55 @@ async function migrateLegacyData() {
 
 async function showAccount(ctx, accountId, prefixMessage = "") {
   const { account, settings } = await getAccountBundle(accountId);
-
-  if (!account) {
-    return replaceUi(
-      ctx,
-      "❌ Account tidak ditemukan.",
-      backDashboardKeyboard(),
-      { parse_mode: "HTML" }
-    );
-  }
-
-  const safeSettings = settings || await ensureAccountSettings(account.id);
+  if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  const formats = await getPromotionFormats(accountId);
+  const activeCount = formats.filter(x => x.active).length;
+  const name = account.label || account.username || account.phone || "Akun Telegram";
   const message = [
     prefixMessage,
-    settingsSummary(account, safeSettings),
-    "",
-    account.status === "error"
-      ? "⚠️ Status error berarti session perlu dicoba Connect kembali."
-      : ""
+    `📱 <b>AKUN TELEGRAM</b>`,
+    `👤 Nama: <b>${escapeHtml(name)}</b>`,
+    `🔗 Username: <code>${escapeHtml(account.username ? `@${account.username}` : "-")}</code>`,
+    `🆔 ID: <code>${escapeHtml(account.telegram_user_id || "-")}</code>`,
+    `🟢 Koneksi: <b>${escapeHtml(account.status || "-")}</b>`,
+    `📝 Format: <b>${formats.length}</b>`,
+    `▶️ Format aktif: <b>${activeCount}</b>`,
+    `🎯 Target aktif: <b>${formats.length >= 0 ? "dibagi bersama akun ini" : "-"}</b>`
   ].filter(Boolean).join("\n");
-
-  return replaceUi(
-    ctx,
-    message,
-    accountMenu(account, safeSettings),
-    { parse_mode: "HTML" }
-  );
+  return replaceUi(ctx, message, accountMenu(account, settings), { parse_mode: "HTML" });
 }
 
-async function renderFormatDetail(ctx, accountId, prefixMessage = "") {
-  const { account, settings } = await getAccountBundle(accountId);
-
-  if (!account) {
-    return replaceUi(
-      ctx,
-      "❌ Account tidak ditemukan.",
-      backDashboardKeyboard(),
-      { parse_mode: "HTML" }
-    );
-  }
-
-  const safeSettings = settings || await ensureAccountSettings(account.id);
-  const hasFormat = Boolean(
-    (safeSettings?.media_type === "text" && String(safeSettings?.message || "").trim()) ||
-    (safeSettings?.media_type === "photo" && safeSettings?.media_file_id)
-  );
-
+async function renderFormatDetail(ctx, accountId, formatId, prefixMessage = "") {
+  const account = await getAccount(accountId);
+  if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  const format = await getPromotionFormat(accountId, formatId);
+  if (!format) return replaceUi(ctx, "❌ Format tidak ditemukan.", new InlineKeyboard().text("⬅️ Kembali", `promo:list:${accountId}:0`), { parse_mode: "HTML" });
+  const body = format.media_type === "photo"
+    ? (format.caption || "Foto tanpa caption")
+    : (format.message || "Format teks kosong");
   const message = [
     prefixMessage,
-    formatDetailText(account, safeSettings),
-    "",
-    hasFormat ? null : "💡 <i>Gunakan tombol <b>➕ Buat Format</b> untuk menambahkan format pertama.</i>"
+    `📝 <b>FORMAT: ${escapeHtml(format.name)}</b>`,
+    "━━━━━━━━━━━━━━━━━━",
+    "📄 <b>ISI FORMAT</b>",
+    format.media_type === "photo" ? "🖼️ Media: Foto" : "📝 Media: Teks",
+    `<blockquote>${escapeHtml(String(body).slice(0, 2500))}</blockquote>`,
+    "━━━━━━━━━━━━━━━━━━",
+    "⚙️ <b>PENGATURAN</b>",
+    `⏱️ Jeda: <b>${escapeHtml(formatInterval(format.interval_minutes))}</b>`,
+    `📅 Durasi: <b>${escapeHtml(formatDuration(format.duration_hours))}</b>`,
+    `🕐 Waktu: <b>${escapeHtml(formatWindowLabel(format))}</b>`,
+    `🟢 Status: <b>${format.active ? "AKTIF" : "NONAKTIF"}</b>`
   ].filter(Boolean).join("\n");
+  return replaceUi(ctx, message, formatDetailKeyboard(accountId, format), { parse_mode: "HTML" });
+}
 
-  return replaceUi(
-    ctx,
-    message,
-    formatDetailKeyboard(account.id, safeSettings, hasFormat),
-    { parse_mode: "HTML" }
-  );
+async function renderFormatList(ctx, accountId, prefixMessage = "") {
+  const account = await getAccount(accountId);
+  if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  const formats = await getPromotionFormats(accountId);
+  const lines = [prefixMessage, `📝 <b>FORMAT PROMOSI</b>`, `👤 ${escapeHtml(account.label || "Akun Telegram")}`, "", formats.length ? `Total format: <b>${formats.length}</b>` : "Belum ada format."];
+  return replaceUi(ctx, lines.filter(Boolean).join("\n"), formatListKeyboard(formats, accountId), { parse_mode: "HTML" });
 }
 
 /* =========================================================
@@ -3079,15 +3289,15 @@ async function renderFormatDetail(ctx, accountId, prefixMessage = "") {
 
 async function startChatLoading(ctx, title = "Memproses menu...") {
   const chatId = ctx.chat?.id || ctx.from?.id;
-  const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-  const frameMs = 450;
+  const frames = ["[░░░░░░░░░░]", "[██░░░░░░░░]", "[████░░░░░░]", "[██████░░░░]", "[████████░░]", "[██████████]"];
+  const frameMs = 350;
   let index = 0;
   let stopped = false;
   let timer = null;
   let message = null;
   let queue = Promise.resolve();
 
-  const body = () => `${frames[index]} <b>${escapeHtml(title)}</b>\n\n<i>Mohon tunggu, bot sedang memproses...</i>`;
+  const body = () => `⏳ <b>${escapeHtml(title)}</b>\n${frames[index]}`;
   const edit = () => {
     queue = queue.then(async () => {
       if (stopped || !message) return;
@@ -3350,7 +3560,7 @@ bot.callbackQuery(/^account:disconnect:(\d+)$/, async ctx => {
 
   try {
     await stopScheduler(accountId);
-    await stopPromotion(accountId, adminRow.id);
+    await stopAllFormats(accountId, adminRow.id);
     await closeClient(accountId);
 
     const { error } = await sb
@@ -3534,165 +3744,108 @@ bot.callbackQuery(/^account:label:(\d+)$/, async ctx => {
    PROMOTION FORMAT / DELAY / DURATION
 ========================================================= */
 
-bot.callbackQuery(/^promo:format:(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-
+bot.callbackQuery(/^promo:list:(\d+):\d+$/, async ctx => {
+  const adminRow = await requireAdmin(ctx); if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
-  const accountId = String(ctx.match[1]);
-  const account = await getAccount(accountId);
-  const settings = account ? (await getAccountSettings(accountId)) || await ensureAccountSettings(accountId) : null;
-
-  if (!account) {
-    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
-  }
-
-  const hasFormat = Boolean(
-    (settings?.media_type === "text" && String(settings?.message || "").trim()) ||
-    (settings?.media_type === "photo" && settings?.media_file_id)
-  );
-
-  return replaceUi(
-    ctx,
-    formatDetailText(account, settings),
-    formatDetailKeyboard(accountId, settings, hasFormat),
-    { parse_mode: "HTML" }
-  );
+  return renderFormatList(ctx, String(ctx.match[1]));
 });
 
-bot.callbackQuery(/^promo:format:edit:(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-
+bot.callbackQuery(/^promo:add:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx); if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
   const account = await getAccount(accountId);
-
-  if (!account) {
-    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
-  }
-
-  flows.set(String(ctx.from.id), {
-    t: "format",
-    accountId,
-    adminId: adminRow.id
-  });
-
-  return replaceUi(
-    ctx,
-    `✏️ <b>EDIT FORMAT PROMOSI</b>\n\n` +
-      `Account: <b>${escapeHtml(account.label)}</b>\n\n` +
-      `Kirim salah satu:\n` +
-      `• Teks biasa\n` +
-      `• Foto saja\n` +
-      `• Foto + caption\n\n` +
-      `Format yang dikirim akan menggantikan isi format saat ini.`,
-    cancelKeyboard(false),
-    { parse_mode: "HTML" }
-  );
+  if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), {parse_mode:"HTML"});
+  flows.set(String(ctx.from.id), { t:"format_add_name", accountId, adminId:adminRow.id });
+  return replaceUi(ctx, `➕ <b>TAMBAH FORMAT</b>\n\nMasukkan <b>nama format</b>.\nContoh: <code>PROMO NOKOS</code>`, cancelKeyboard(false), {parse_mode:"HTML"});
 });
 
-bot.callbackQuery(/^promo:delay:(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-
+bot.callbackQuery(/^promo:view:(\d+):([^:]+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx); if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
-  const accountId = String(ctx.match[1]);
-  const account = await getAccount(accountId);
-
-  if (!account) {
-    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
-  }
-
-  flows.set(String(ctx.from.id), {
-    t: "delay",
-    accountId,
-    adminId: adminRow.id
-  });
-
-  return replaceUi(
-    ctx,
-    `⏱ <b>SET JEDA • ${escapeHtml(account.label)}</b>\n\n` +
-      `Contoh: <code>10 menit</code>, <code>30 menit</code>, <code>1 jam</code>.\n\nMinimal 1 menit.`,
-    cancelKeyboard(false),
-    { parse_mode: "HTML" }
-  );
+  return renderFormatDetail(ctx, String(ctx.match[1]), String(ctx.match[2]));
 });
 
-bot.callbackQuery(/^promo:duration:(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-
+bot.callbackQuery(/^promo:edit:(\d+):([^:]+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx); if (!adminRow) return;
   await ctx.answerCallbackQuery().catch(() => {});
-  const accountId = String(ctx.match[1]);
-  const account = await getAccount(accountId);
+  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]);
+  const format=await getPromotionFormat(accountId, formatId);
+  if(!format) return renderFormatList(ctx, accountId, "❌ Format tidak ditemukan.");
+  flows.set(String(ctx.from.id), {t:"format", accountId, formatId, adminId:adminRow.id});
+  return replaceUi(ctx, `✏️ <b>EDIT FORMAT: ${escapeHtml(format.name)}</b>\n\nKirim teks atau foto + caption baru.`, cancelKeyboard(false), {parse_mode:"HTML"});
+});
 
-  if (!account) {
-    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
-  }
+bot.callbackQuery(/^promo:delete:(\d+):([^:]+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx); if (!adminRow) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]);
+  const formats=await getPromotionFormats(accountId);
+  const format=formats.find(x=>x.id===formatId);
+  if(!format) return renderFormatList(ctx, accountId, "❌ Format tidak ditemukan.");
+  await stopFormat(accountId, formatId, adminRow.id).catch(()=>{});
+  await savePromotionFormats(accountId, formats.filter(x=>x.id!==formatId));
+  await recordHistory(accountId, adminRow.id, {action:"format_delete",status:"success",details:{format_id:formatId,format_name:format.name}});
+  return renderFormatList(ctx, accountId, `🗑️ Format <b>${escapeHtml(format.name)}</b> dihapus.`);
+});
 
-  flows.set(String(ctx.from.id), {
-    t: "duration",
-    accountId,
-    adminId: adminRow.id
-  });
+bot.callbackQuery(/^promo:active:(\d+):\d+$/, async ctx => {
+  const adminRow = await requireAdmin(ctx); if (!adminRow) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId=String(ctx.match[1]);
+  const formats=await getPromotionFormats(accountId);
+  const active=formats.filter(x=>x.active);
+  return replaceUi(ctx, `▶️ <b>FORMAT AKTIF</b>\n\n${active.length ? active.map(x=>`🟢 <b>${escapeHtml(x.name)}</b>\n⏱ ${escapeHtml(formatInterval(x.interval_minutes))}\n📅 ${escapeHtml(formatDuration(x.duration_hours))}\n🕐 ${escapeHtml(formatWindowLabel(x))}`).join("\n\n") : "Tidak ada format yang sedang aktif."}`, activeFormatKeyboard(active,accountId), {parse_mode:"HTML"});
+});
 
-  return replaceUi(
-    ctx,
-    `📅 <b>SET DURASI • ${escapeHtml(account.label)}</b>\n\n` +
-      `Contoh: <code>3 hari</code>, <code>12 jam</code>.`,
-    cancelKeyboard(false),
-    { parse_mode: "HTML" }
-  );
+bot.callbackQuery(/^promo:delay:(\d+):([^:]+)$/, async ctx => {
+  const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
+  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]); const f=await getPromotionFormat(accountId,formatId);
+  if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
+  flows.set(String(ctx.from.id),{t:"delay",accountId,formatId,adminId:adminRow.id});
+  return replaceUi(ctx,`⏱️ <b>ATUR JEDA</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nContoh: <code>10 menit</code> atau <code>1 jam</code>.`,cancelKeyboard(false),{parse_mode:"HTML"});
+});
+
+bot.callbackQuery(/^promo:duration:(\d+):([^:]+)$/, async ctx => {
+  const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
+  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]); const f=await getPromotionFormat(accountId,formatId);
+  if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
+  flows.set(String(ctx.from.id),{t:"duration",accountId,formatId,adminId:adminRow.id});
+  return replaceUi(ctx,`📅 <b>ATUR DURASI</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nContoh: <code>3 hari</code> atau <code>12 jam</code>.`,cancelKeyboard(false),{parse_mode:"HTML"});
+});
+
+bot.callbackQuery(/^promo:time:(\d+):([^:]+)$/, async ctx => {
+  const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
+  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]); const f=await getPromotionFormat(accountId,formatId);
+  if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
+  flows.set(String(ctx.from.id),{t:"time",accountId,formatId,adminId:adminRow.id});
+  return replaceUi(ctx,`🕐 <b>ATUR WAKTU</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nKirim: <code>08:00 - 22:00</code>\nAtau <code>00:00 - 00:00</code> untuk tanpa batas waktu.`,cancelKeyboard(false),{parse_mode:"HTML"});
+});
+
+bot.callbackQuery(/^promo:toggle:(\d+):([^:]+)$/, async ctx => {
+  const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
+  const accountId=String(ctx.match[1]),formatId=String(ctx.match[2]); const formats=await getPromotionFormats(accountId); const f=formats.find(x=>x.id===formatId);
+  if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
+  if(f.active) await stopFormat(accountId,formatId,adminRow.id); else await startFormat(accountId,formatId,adminRow.id);
+  return renderFormatDetail(ctx,accountId,formatId,f.active?"🔴 Format dinonaktifkan.":"🟢 Format diaktifkan.");
 });
 
 /* =========================================================
-   PROMOTION START / STOP
+   FORMAT START / STOP
 ========================================================= */
 
-bot.callbackQuery(/^promo:start:(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-
-  await ctx.answerCallbackQuery().catch(() => {});
-  const accountId = String(ctx.match[1]);
-
-  try {
-    const result = await startPromotion(accountId, adminRow.id);
-
-    if (result.alreadyRunning) {
-      return showAccount(ctx, accountId, "ℹ️ Promosi account ini sudah berjalan. Scheduler kedua tidak dibuat.");
-    }
-
-    return showAccount(
-      ctx,
-      accountId,
-      `▶️ <b>Promosi dimulai.</b>\nJeda: <b>${escapeHtml(formatInterval(result.settings.interval_minutes))}</b>\nDurasi: <b>${escapeHtml(formatDuration(result.settings.duration_hours))}</b>`
-    );
-  } catch (e) {
-    return showAccount(ctx, accountId, `❌ ${escapeHtml(safeErrorMessage(e))}`);
-  }
+bot.callbackQuery(/^promo:start:(\d+):([^:]+)$/, async ctx => {
+  const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
+  const accountId=String(ctx.match[1]),formatId=String(ctx.match[2]);
+  try { const r=await startFormat(accountId,formatId,adminRow.id); return renderFormatDetail(ctx,accountId,formatId,`▶️ <b>Format ${escapeHtml(r.format.name)} dimulai.</b>`); }
+  catch(e){ return renderFormatDetail(ctx,accountId,formatId,`❌ ${escapeHtml(safeErrorMessage(e))}`); }
 });
 
-bot.callbackQuery(/^promo:stop:(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-
-  await ctx.answerCallbackQuery().catch(() => {});
-  const accountId = String(ctx.match[1]);
-
-  try {
-    const result = await stopPromotion(accountId, adminRow.id);
-    return showAccount(
-      ctx,
-      accountId,
-      result.wasRunning
-        ? "⏹ <b>Promosi dihentikan.</b>"
-        : "ℹ️ Account tidak sedang menjalankan promosi."
-    );
-  } catch (e) {
-    return showAccount(ctx, accountId, `❌ ${escapeHtml(safeErrorMessage(e))}`);
-  }
+bot.callbackQuery(/^promo:stop:(\d+):([^:]+)$/, async ctx => {
+  const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
+  const accountId=String(ctx.match[1]),formatId=String(ctx.match[2]);
+  try { const r=await stopFormat(accountId,formatId,adminRow.id); return renderFormatDetail(ctx,accountId,formatId,r.wasRunning?"⏹️ <b>Format dihentikan.</b>":"ℹ️ Format tidak sedang aktif."); }
+  catch(e){ return renderFormatDetail(ctx,accountId,formatId,`❌ ${escapeHtml(safeErrorMessage(e))}`); }
 });
 
 /* =========================================================
@@ -4341,161 +4494,81 @@ bot.on("message", async (ctx, next) => {
     }
 
     /* -------------------------
-       FORMAT
+       FORMAT NAME ADD
+    -------------------------- */
+    if (flow.t === "format_add_name") {
+      const name = String(ctx.message.text || "").trim().replace(/\s+/g," ").slice(0,60);
+      if (name.length < 2) return renderUi(telegramUserId,"❌ Nama format terlalu pendek.",cancelKeyboard(false));
+      const formats = await getPromotionFormats(flow.accountId);
+      const format = normalizeFormat({id:newFormatId(),name});
+      formats.push(format);
+      await savePromotionFormats(flow.accountId,formats);
+      flows.set(userKey,{t:"format",accountId:flow.accountId,formatId:format.id,adminId:flow.adminId});
+      return renderUi(telegramUserId,`✅ Format <b>${escapeHtml(name)}</b> dibuat.\n\nSekarang kirim isi format: teks atau foto + caption.`,cancelKeyboard(false),{parse_mode:"HTML"});
+    }
+
+    /* -------------------------
+       FORMAT CONTENT
     -------------------------- */
     if (flow.t === "format") {
+      const formats = await getPromotionFormats(flow.accountId);
+      const format = formats.find(x=>x.id===String(flow.formatId));
+      if(!format) { flows.delete(userKey); return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan."); }
       if (ctx.message.photo?.length) {
-        const photo = ctx.message.photo[ctx.message.photo.length - 1];
-        const caption = ctx.message.caption || "";
-
-        const { error } = await sb
-          .from("account_settings")
-          .update({
-            media_type: "photo",
-            message: "",
-            media_file_id: photo.file_id,
-            caption
-          })
-          .eq("account_id", flow.accountId);
-
-        if (error) throw error;
-
-        await recordHistory(flow.accountId, adminRow.id, {
-          action: "format_update",
-          status: "success",
-          details: { type: "photo", has_caption: Boolean(caption) }
-        });
-
-        flows.delete(userKey);
-        return renderFormatDetail(ctx, flow.accountId, "✅ Format foto berhasil disimpan.");
-      }
-
-      if (ctx.message.text) {
-        const message = ctx.message.text.trim();
-        if (!message) {
-          return renderUi(
-            telegramUserId,
-            "❌ Format teks tidak boleh kosong.",
-            cancelKeyboard(false)
-          );
-        }
-
-        const { error } = await sb
-          .from("account_settings")
-          .update({
-            media_type: "text",
-            message,
-            media_file_id: null,
-            caption: null
-          })
-          .eq("account_id", flow.accountId);
-
-        if (error) throw error;
-
-        await recordHistory(flow.accountId, adminRow.id, {
-          action: "format_update",
-          status: "success",
-          details: { type: "text" }
-        });
-
-        flows.delete(userKey);
-        return renderFormatDetail(ctx, flow.accountId, "✅ Format teks berhasil disimpan.");
-      }
-
-      return renderUi(
-        telegramUserId,
-        "❌ Format tidak didukung. Kirim teks atau foto.",
-        cancelKeyboard(false)
-      );
+        const photo=ctx.message.photo[ctx.message.photo.length-1];
+        format.media_type="photo"; format.message=""; format.media_file_id=photo.file_id; format.caption=ctx.message.caption||"";
+      } else if (ctx.message.text) {
+        const message=ctx.message.text.trim();
+        if(!message)return renderUi(telegramUserId,"❌ Format teks tidak boleh kosong.",cancelKeyboard(false));
+        format.media_type="text"; format.message=message; format.media_file_id=null; format.caption=null;
+      } else return renderUi(telegramUserId,"❌ Format tidak didukung. Kirim teks atau foto.",cancelKeyboard(false));
+      format.updated_at=new Date().toISOString();
+      await savePromotionFormats(flow.accountId,formats);
+      await recordHistory(flow.accountId,adminRow.id,{action:"format_update",status:"success",details:{format_id:format.id,format_name:format.name,type:format.media_type}});
+      flows.delete(userKey);
+      return renderFormatDetail(ctx,flow.accountId,format.id,"✅ Isi format berhasil disimpan.");
     }
 
     /* -------------------------
-       DELAY
+       FORMAT DELAY
     -------------------------- */
     if (flow.t === "delay") {
-      const minutes = parseMinutes(ctx.message.text);
-      if (!minutes) {
-        return renderUi(
-          telegramUserId,
-          "❌ Jeda tidak valid. Contoh: <code>10 menit</code> atau <code>1 jam</code>.",
-          cancelKeyboard(false),
-          { parse_mode: "HTML" }
-        );
-      }
-
-      const { error } = await sb
-        .from("account_settings")
-        .update({ interval_minutes: minutes })
-        .eq("account_id", flow.accountId);
-
-      if (error) throw error;
-
-      const settings = await getAccountSettings(flow.accountId);
-
-      // Apply new delay to a running scheduler without creating a second task.
-      if (settings?.active && schedulerTasks.has(String(flow.accountId))) {
-        scheduleAccount(
-          flow.accountId,
-          Math.max(1000, minutes * 60 * 1000)
-        );
-      }
-
-      await recordHistory(flow.accountId, adminRow.id, {
-        action: "delay_update",
-        status: "success",
-        details: { interval_minutes: minutes }
-      });
-
-      flows.delete(userKey);
-      return showAccount(
-        ctx,
-        flow.accountId,
-        `✅ Jeda disimpan: <b>${escapeHtml(formatInterval(minutes))}</b>`
-      );
+      const minutes=parseMinutes(ctx.message.text);
+      if(!minutes)return renderUi(telegramUserId,"❌ Jeda tidak valid. Contoh: <code>10 menit</code> atau <code>1 jam</code>.",cancelKeyboard(false),{parse_mode:"HTML"});
+      const formats=await getPromotionFormats(flow.accountId); const f=formats.find(x=>x.id===String(flow.formatId));
+      if(!f)return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan.");
+      f.interval_minutes=minutes; f.updated_at=new Date().toISOString(); await savePromotionFormats(flow.accountId,formats);
+      flows.delete(userKey); return renderFormatDetail(ctx,flow.accountId,f.id,`✅ Jeda disimpan: <b>${escapeHtml(formatInterval(minutes))}</b>`);
     }
 
     /* -------------------------
-       DURATION
+       FORMAT DURATION
     -------------------------- */
     if (flow.t === "duration") {
-      const hours = parseHours(ctx.message.text);
-      if (!hours) {
-        return renderUi(
-          telegramUserId,
-          "❌ Durasi tidak valid. Contoh: <code>3 hari</code> atau <code>12 jam</code>.",
-          cancelKeyboard(false),
-          { parse_mode: "HTML" }
-        );
+      const hours=parseHours(ctx.message.text);
+      if(!hours)return renderUi(telegramUserId,"❌ Durasi tidak valid. Contoh: <code>3 hari</code> atau <code>12 jam</code>.",cancelKeyboard(false),{parse_mode:"HTML"});
+      const formats=await getPromotionFormats(flow.accountId); const f=formats.find(x=>x.id===String(flow.formatId));
+      if(!f)return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan.");
+      f.duration_hours=hours; if(f.active)f.expires_at=new Date(Date.now()+hours*3600000).toISOString(); f.updated_at=new Date().toISOString();
+      await savePromotionFormats(flow.accountId,formats); flows.delete(userKey); return renderFormatDetail(ctx,flow.accountId,f.id,`✅ Durasi disimpan: <b>${escapeHtml(formatDuration(hours))}</b>`);
+    }
+
+    /* -------------------------
+       FORMAT TIME WINDOW
+    -------------------------- */
+    if (flow.t === "time") {
+      const raw=String(ctx.message.text||"").trim();
+      if(raw === "00:00 - 00:00") {
+        const formats=await getPromotionFormats(flow.accountId); const f=formats.find(x=>x.id===String(flow.formatId));
+        if(!f)return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan.");
+        f.start_time=null;f.stop_time=null;await savePromotionFormats(flow.accountId,formats);flows.delete(userKey);return renderFormatDetail(ctx,flow.accountId,f.id,"✅ Waktu dijadikan tanpa batas.");
       }
-
-      const current = await getAccountSettings(flow.accountId);
-      const update = { duration_hours: hours };
-
-      if (current?.active) {
-        update.expires_at = new Date(
-          Date.now() + hours * 60 * 60 * 1000
-        ).toISOString();
-      }
-
-      const { error } = await sb
-        .from("account_settings")
-        .update(update)
-        .eq("account_id", flow.accountId);
-
-      if (error) throw error;
-
-      await recordHistory(flow.accountId, adminRow.id, {
-        action: "duration_update",
-        status: "success",
-        details: { duration_hours: hours }
-      });
-
-      flows.delete(userKey);
-      return showAccount(
-        ctx,
-        flow.accountId,
-        `✅ Durasi disimpan: <b>${escapeHtml(formatDuration(hours))}</b>`
-      );
+      const m=raw.match(/^\s*(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s*$/);
+      const a=parseTimeHHMM(m?.[1]), b=parseTimeHHMM(m?.[2]);
+      if(!a||!b)return renderUi(telegramUserId,"❌ Format waktu salah. Contoh: <code>08:00 - 22:00</code>.",cancelKeyboard(false),{parse_mode:"HTML"});
+      const formats=await getPromotionFormats(flow.accountId); const f=formats.find(x=>x.id===String(flow.formatId));
+      if(!f)return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan.");
+      f.start_time=a;f.stop_time=b;await savePromotionFormats(flow.accountId,formats);flows.delete(userKey);return renderFormatDetail(ctx,flow.accountId,f.id,`✅ Waktu disimpan: <b>${a} - ${b}</b>`);
     }
 
     /* -------------------------
@@ -4721,31 +4794,15 @@ async function restoreSessions() {
 }
 
 async function restoreRunningPromotions() {
-  const { data, error } = await sb
-    .from("account_settings")
-    .select("account_id,active,expires_at,interval_minutes")
-    .eq("active", true);
-
-  if (error) throw error;
-
-  for (const row of data || []) {
-    if (
-      !row.expires_at ||
-      new Date(row.expires_at) <= new Date()
-    ) {
-      await sb
-        .from("account_settings")
-        .update({
-          active: false,
-          expires_at: null,
-          started_at: null,
-        })
-        .eq("account_id", row.account_id);
-      continue;
+  const {data,error}=await sb.from("telegram_accounts").select("id");
+  if(error)throw error;
+  for(const row of data||[]){
+    const formats=await getPromotionFormats(row.id);
+    for(const f of formats){
+      if(!f.active)continue;
+      if(!f.expires_at||new Date(f.expires_at)<=new Date()){await stopFormat(row.id,f.id,null);continue;}
+      scheduleFormat(row.id,f.id,0);
     }
-
-    // Each account gets its own independent task.
-    scheduleAccount(row.account_id, 0);
   }
 }
 
