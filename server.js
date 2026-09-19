@@ -1272,6 +1272,89 @@ function settingsSummary(account, settings) {
   ].filter(Boolean).join("\n");
 }
 
+function formatDetailText(account, settings) {
+  const hasText = settings?.media_type === "text" && String(settings?.message || "").trim();
+  const hasPhoto = settings?.media_type === "photo" && settings?.media_file_id;
+  const hasFormat = Boolean(hasText || hasPhoto);
+
+  if (!hasFormat) {
+    return [
+      `📝 <b>FORMAT PROMOSI</b>`,
+      `👤 Account: <b>${escapeHtml(account.label || "Akun Telegram")}</b>`,
+      "",
+      "⚠️ <b>Belum ada format promosi.</b>",
+      "",
+      "Buat format dengan mengirim teks atau foto + caption."
+    ].join("\n");
+  }
+
+  const separator = "━━━━━━━━━━━━━━━━━━";
+  const body = hasText
+    ? String(settings.message).trim()
+    : (settings.caption ? String(settings.caption).trim() : "Foto tanpa caption");
+
+  const bodyLimit = 2500;
+  const safeBody = body.length > bodyLimit
+    ? `${body.slice(0, bodyLimit)}\n… <i>(format dipotong di tampilan)</i>`
+    : body;
+
+  const scheduleLines = settings?.active
+    ? [
+        `🟢 <b>Status</b>: AKTIF`,
+        settings?.started_at
+          ? `🕐 <b>Mulai</b>: ${escapeHtml(formatDate(settings.started_at))}`
+          : null,
+        settings?.expires_at
+          ? `🛑 <b>Stop</b>: ${escapeHtml(formatDate(settings.expires_at))}`
+          : null
+      ].filter(Boolean)
+    : [
+        `🔴 <b>Status</b>: NONAKTIF`
+      ];
+
+  return [
+    `📝 <b>FORMAT PROMOSI</b>`,
+    `👤 Account: <b>${escapeHtml(account.label || "Akun Telegram")}</b>`,
+    separator,
+    `📄 <b>ISI FORMAT</b>`,
+    hasPhoto ? "🖼️ <b>Media</b>: Foto" : "📝 <b>Media</b>: Teks",
+    `<blockquote>${escapeHtml(safeBody)}</blockquote>`,
+    separator,
+    `⚙️ <b>PENGATURAN</b>`,
+    `⏱️ <b>Jeda</b>: ${escapeHtml(formatInterval(settings?.interval_minutes))}`,
+    `📅 <b>Durasi</b>: ${escapeHtml(formatDuration(settings?.duration_hours))}`,
+    ...scheduleLines
+  ].join("\n");
+}
+
+function formatDetailKeyboard(accountId, settings, hasFormat = true) {
+  const kb = new InlineKeyboard();
+
+  if (hasFormat) {
+    kb.text("✏️ Edit Format", `promo:format:edit:${accountId}`).row();
+  } else {
+    kb.text("➕ Buat Format", `promo:format:edit:${accountId}`).row();
+  }
+
+  kb
+    .text("⏱️ Atur Jeda", `promo:delay:${accountId}`)
+    .row()
+    .text("📅 Atur Durasi", `promo:duration:${accountId}`)
+    .row();
+
+  if (settings?.active) {
+    kb.text("⏹️ Stop", `promo:stop:${accountId}`);
+  } else {
+    kb.text("▶️ Mulai", `promo:start:${accountId}`);
+  }
+
+  kb
+    .row()
+    .text("⬅️ Kembali", `account:open:${accountId}`);
+
+  return kb;
+}
+
 /* =========================================================
    HISTORY / AUDIT
 ========================================================= */
@@ -2955,6 +3038,39 @@ async function showAccount(ctx, accountId, prefixMessage = "") {
   );
 }
 
+async function renderFormatDetail(ctx, accountId, prefixMessage = "") {
+  const { account, settings } = await getAccountBundle(accountId);
+
+  if (!account) {
+    return replaceUi(
+      ctx,
+      "❌ Account tidak ditemukan.",
+      backDashboardKeyboard(),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  const safeSettings = settings || await ensureAccountSettings(account.id);
+  const hasFormat = Boolean(
+    (safeSettings?.media_type === "text" && String(safeSettings?.message || "").trim()) ||
+    (safeSettings?.media_type === "photo" && safeSettings?.media_file_id)
+  );
+
+  const message = [
+    prefixMessage,
+    formatDetailText(account, safeSettings),
+    "",
+    hasFormat ? null : "💡 <i>Gunakan tombol <b>➕ Buat Format</b> untuk menambahkan format pertama.</i>"
+  ].filter(Boolean).join("\n");
+
+  return replaceUi(
+    ctx,
+    message,
+    formatDetailKeyboard(account.id, safeSettings, hasFormat),
+    { parse_mode: "HTML" }
+  );
+}
+
 /* =========================================================
    CHAT LOADING ANIMATION
    Menu loading is shown as an animated message in the chat itself.
@@ -3425,6 +3541,32 @@ bot.callbackQuery(/^promo:format:(\d+)$/, async ctx => {
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
   const account = await getAccount(accountId);
+  const settings = account ? (await getAccountSettings(accountId)) || await ensureAccountSettings(accountId) : null;
+
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  const hasFormat = Boolean(
+    (settings?.media_type === "text" && String(settings?.message || "").trim()) ||
+    (settings?.media_type === "photo" && settings?.media_file_id)
+  );
+
+  return replaceUi(
+    ctx,
+    formatDetailText(account, settings),
+    formatDetailKeyboard(accountId, settings, hasFormat),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery(/^promo:format:edit:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccount(accountId);
 
   if (!account) {
     return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
@@ -3438,12 +3580,13 @@ bot.callbackQuery(/^promo:format:(\d+)$/, async ctx => {
 
   return replaceUi(
     ctx,
-    `📝 <b>FORMAT PROMOSI • ${escapeHtml(account.label)}</b>\n\n` +
+    `✏️ <b>EDIT FORMAT PROMOSI</b>\n\n` +
+      `Account: <b>${escapeHtml(account.label)}</b>\n\n` +
       `Kirim salah satu:\n` +
       `• Teks biasa\n` +
       `• Foto saja\n` +
       `• Foto + caption\n\n` +
-      `Format ini hanya berlaku untuk account yang sedang dipilih.`,
+      `Format yang dikirim akan menggantikan isi format saat ini.`,
     cancelKeyboard(false),
     { parse_mode: "HTML" }
   );
@@ -4224,7 +4367,7 @@ bot.on("message", async (ctx, next) => {
         });
 
         flows.delete(userKey);
-        return showAccount(ctx, flow.accountId, "✅ Format foto berhasil disimpan.");
+        return renderFormatDetail(ctx, flow.accountId, "✅ Format foto berhasil disimpan.");
       }
 
       if (ctx.message.text) {
@@ -4256,7 +4399,7 @@ bot.on("message", async (ctx, next) => {
         });
 
         flows.delete(userKey);
-        return showAccount(ctx, flow.accountId, "✅ Format teks berhasil disimpan.");
+        return renderFormatDetail(ctx, flow.accountId, "✅ Format teks berhasil disimpan.");
       }
 
       return renderUi(
