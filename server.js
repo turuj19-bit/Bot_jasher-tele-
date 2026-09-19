@@ -492,9 +492,9 @@ async function renderUi(userId, text, keyboard, options = {}) {
 }
 
 async function replaceUi(ctx, text, keyboard, options = {}) {
-  // Menu navigation intentionally creates a fresh UI message below the
-  // previous one. This keeps the chat history readable and lets every menu
-  // open as its own professional panel instead of overwriting the old panel.
+  // Every menu owns exactly one UI message. Opening another menu removes the
+  // previous panel first, so the chat does not fill up with stale menus.
+  await deleteSavedUi(ctx.from.id);
   const extra = { reply_markup: keyboard };
   if (options.parse_mode) extra.parse_mode = options.parse_mode;
   const msg = await bot.api.sendMessage(ctx.chat?.id || ctx.from.id, text, extra);
@@ -506,7 +506,8 @@ async function renderStart(ctx, text, keyboard) {
   const userId = ctx.from.id;
 
   return withUiLock(userId, async () => {
-    // /start also creates a fresh main panel instead of editing an older one.
+    // Main panel is a fresh banner panel; remove the previous menu first.
+    await deleteSavedUi(userId);
     if (START_BANNER_FILE_ID) {
       try {
         const msg = await ctx.replyWithPhoto(START_BANNER_FILE_ID, {
@@ -574,15 +575,15 @@ function dashboardText(ctx, stats, extra = "", role = "") {
   // Every value that may be copied sits in its own <code> element, so a single
   // tap copies just that value (never one big block).
   return [
-    "🛡️ <b>ADMIN CONTROL CENTER</b>",
+    "🎛️ <b>PANEL KONTROL</b>",
     rule,
-    `👤 <b>${escapeHtml(name)}</b>`,
+    `👤 <b>Nama: ${escapeHtml(name)}</b>`,
     `🆔 ID Telegram · <code>${escapeHtml(ctx.from.id)}</code>`,
     `🔗 Username · <code>${escapeHtml(username)}</code>`,
     roleLabel ? `🎖️ Role · <code>${roleLabel}</code>` : null,
     `🤖 Versi bot · <code>v${escapeHtml(BOT_VERSION)}</code>`,
     rule,
-    `<blockquote>✨ <b>Panel admin sesuai akun Telegram yang sedang digunakan.</b>\n${escapeHtml(intro)}</blockquote>`,
+    `<blockquote>✨ <b>Panel sesuai akun Telegram yang digunakan.</b>\n${escapeHtml(intro)}</blockquote>`,
     "",
     "📊 <b>STATUS SISTEM</b>",
     `👥 Admin aktif · <b>${stats.admins}</b>`,
@@ -669,18 +670,17 @@ function accountMenu(account, settings) {
   const kb = new InlineKeyboard();
   kb.text("📊 Status", `account:status:${account.id}`).row();
   kb.text("⚙️ Pengaturan", `account:settings:${account.id}`).row();
-  if (account.status === "connected") kb.text("🔌 Putuskan", `account:disconnect:${account.id}`);
-  else kb.text("🔗 Connect", `account:connect:${account.id}`);
+  if (account.status === "connected") kb.text("🔌 Putus", `account:disconnect:${account.id}`);
+  else kb.text("🔗 Hubungkan", `account:connect:${account.id}`);
   kb.row();
-  kb.text("👥 Target", `group:list:${account.id}:0`).row();
-  kb.text("➕ Tambah Target", `group:add:${account.id}`).row();
+  kb.text("👥 Grup", `group:list:${account.id}:0`).row();
+  kb.text("➕ Tambah Grup", `group:add:${account.id}`).row();
   kb.text("📝 Format", `promo:list:${account.id}:0`).row();
-  kb.text("➕ Tambah Format", `promo:add:${account.id}`).row();
-  kb.text("⏱️ Jeda", `promo:list:${account.id}:0`).row();
-  kb.text("📅 Durasi", `promo:list:${account.id}:0`).row();
+  kb.text("➕ Format Baru", `promo:add:${account.id}`).row();
   kb.text("▶️ Format Aktif", `promo:active:${account.id}:0`).row();
+  kb.text("⏹ Stop Promosi", `promo:stopall:${account.id}`).row();
   kb.text("📋 Riwayat", `history:list:${account.id}:0`).row();
-  kb.text("🏷️ Label", `account:label:${account.id}`).row();
+  kb.text("🏷️ Nama", `account:label:${account.id}`).row();
   kb.text("🗑️ Hapus", `account:remove:${account.id}`).row();
   kb.text("⬅️ Kembali", "accounts:list:0");
   return kb;
@@ -732,22 +732,19 @@ function formatDetailKeyboard(accountId, format) {
 function groupListKeyboard(rows, accountId, page, hasNext) {
   const kb = new InlineKeyboard();
 
-  for (const group of rows) {
-    const icon = group.enabled ? "✅" : (group.can_send ? "⬜" : "🚫");
-    const label = `${icon} ${safeButtonText(group.title, 24)}`;
-    kb.text(label, `group:toggle:${group.id}`)
-      .text("🗑", `group:remove:${group.id}`)
-      .row();
+  // Only groups/channels Telegram reports as writable are shown as targets.
+  // Tapping the group name itself toggles the target state.
+  for (const group of rows.filter(g => g.can_send)) {
+    const icon = group.enabled ? "✅" : "❌";
+    kb.text(`${icon} ${safeButtonText(group.title, 34)}`, `group:toggle:${group.id}`).row();
   }
 
   if (page > 0) kb.text("◀️", `group:list:${accountId}:${page - 1}`);
   kb.text("🏠", "menu:dashboard");
   if (hasNext) kb.text("▶️", `group:list:${accountId}:${page + 1}`);
   kb.row();
-  kb.text("➕ Tambah Target", `group:add:${accountId}`)
-    .text("🔎 Deteksi Ulang", `group:refresh:${accountId}`);
-  kb.row();
-  kb.text("◀️ Account", `account:open:${accountId}`);
+  kb.text("🔄 Deteksi Grup", `group:refresh:${accountId}`).row();
+  kb.text("⬅️ Akun", `account:open:${accountId}`);
 
   return kb;
 }
@@ -1352,6 +1349,7 @@ async function listGroups(accountId, page = 0) {
       .from("account_groups")
       .select("*")
       .eq("account_id", accountId)
+      .eq("can_send", true)
       .order("title", { ascending: true })
       .range(offset, offset + GROUP_PAGE_SIZE),
     sb
@@ -1413,7 +1411,7 @@ function settingsSummary(account, settings) {
   const telegramName = account.label || account.username || account.phone || "Akun Telegram";
   const username = account.username ? `@${account.username}` : "belum ada username";
   return [
-    `📱 <b>AKUN TELEGRAM TERHUBUNG</b>`,
+    `📱 <b>AKUN TERKAIT</b>`,
     `👤 Nama: <b>${escapeHtml(telegramName)}</b>`,
     `🔗 Username: <code>${escapeHtml(username)}</code>`,
     `🆔 Telegram ID: <code>${escapeHtml(account.telegram_user_id || "belum login")}</code>`,
@@ -1439,7 +1437,7 @@ function formatDetailText(account, settings) {
   if (!hasFormat) {
     return [
       `📝 <b>FORMAT PROMOSI</b>`,
-      `👤 Account: <b>${escapeHtml(account.label || "Akun Telegram")}</b>`,
+      `👤 Nama: <b>${escapeHtml(account.label || "Akun Telegram")}</b>`,
       "",
       "⚠️ <b>Belum ada format promosi.</b>",
       "",
@@ -1473,7 +1471,7 @@ function formatDetailText(account, settings) {
 
   return [
     `📝 <b>FORMAT PROMOSI</b>`,
-    `👤 Account: <b>${escapeHtml(account.label || "Akun Telegram")}</b>`,
+    `👤 Nama: <b>${escapeHtml(account.label || "Akun Telegram")}</b>`,
     separator,
     `📄 <b>ISI FORMAT</b>`,
     hasPhoto ? "🖼️ <b>Media</b>: Foto" : "📝 <b>Media</b>: Teks",
@@ -2860,10 +2858,19 @@ async function connectStoredAccount(ctx, accountId, adminId) {
   if (!client) return false;
 
   const identity = await getMeFromClient(client);
+  const account = await getAccount(accountId);
+  const derivedLabel =
+    [identity.firstName, identity.lastName].filter(Boolean).join(" ").trim() ||
+    identity.username ||
+    account?.phone ||
+    "Akun Telegram";
   const { error } = await sb
     .from("telegram_accounts")
     .update({
+      label: derivedLabel.slice(0, 80),
       telegram_user_id: identity.telegramUserId,
+      username: identity.username || null,
+      phone: account?.phone || null,
       status: "connected",
     })
     .eq("id", accountId);
@@ -3315,9 +3322,11 @@ async function startChatLoading(ctx, title = "Memproses menu...") {
     timer = setTimeout(async () => {
       timer = null;
       if (stopped) return;
-      index = (index + 1) % frames.length;
-      await edit();
-      tick();
+      if (index < frames.length - 1) {
+        index += 1;
+        await edit();
+        tick();
+      }
     }, frameMs);
   };
   tick();
@@ -3427,7 +3436,7 @@ bot.callbackQuery("menu:dashboard", async ctx => {
   }));
 
   const menu = adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu();
-  return replaceUi(ctx, dashboardText(ctx, stats, "", adminRow.role), menu, { parse_mode: "HTML" });
+  return renderStart(ctx, dashboardText(ctx, stats, "", adminRow.role), menu);
 });
 
 /* =========================================================
@@ -3834,6 +3843,19 @@ bot.callbackQuery(/^promo:toggle:(\d+):([^:]+)$/, async ctx => {
    FORMAT START / STOP
 ========================================================= */
 
+bot.callbackQuery(/^promo:stopall:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  try {
+    await stopAllFormats(accountId, adminRow.id);
+    return showAccount(ctx, accountId, "⏹️ <b>Semua promosi dihentikan.</b>");
+  } catch (e) {
+    return showAccount(ctx, accountId, `❌ ${escapeHtml(safeErrorMessage(e))}`);
+  }
+});
+
 bot.callbackQuery(/^promo:start:(\d+):([^:]+)$/, async ctx => {
   const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
   const accountId=String(ctx.match[1]),formatId=String(ctx.match[2]);
@@ -3895,11 +3917,11 @@ bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
       "",
       result.rows.length
         ? result.rows.map((g, i) =>
-            `${String(page * GROUP_PAGE_SIZE + i + 1).padStart(2, "0")}. ${g.enabled ? "✅" : "⬜"} <b>${escapeHtml(g.title)}</b>\n   ${g.can_send ? "🟢 Bisa kirim" : "🔴 Tidak bisa kirim"}`
+            `${g.enabled ? "✅" : "❌"} <b>${escapeHtml(g.title)}</b>`
           ).join("\n\n")
         : "<i>Belum ada grup yang terdeteksi. Tekan Tambah Target / Deteksi Ulang.</i>",
       "",
-      "Pilih nama grup untuk ON/OFF target. Hanya grup/channel yang terdeteksi dan diizinkan menerima pesan yang dapat dijadikan target."
+      "Tekan nama grup untuk memilih / membatalkan target."
     ].join("\n");
 
     return replaceUi(
@@ -3942,7 +3964,7 @@ bot.callbackQuery(/^group:add:(\d+)$/, async ctx => {
       ctx,
       accountId,
       0,
-      `🔎 <b>GRUP TERDETEKSI</b>\n\n${allowed.length} grup/channel yang diizinkan menerima pesan sudah dimasukkan ke daftar target. Tekan nama grup untuk ON/OFF.`
+      `🔎 <b>GRUP TERDETEKSI</b>\n\n${allowed.length} grup yang bisa menerima pesan tersedia. Tekan nama grup untuk memilih target.`
     );
   } catch (e) {
     return replaceUi(
@@ -4006,7 +4028,7 @@ async function renderGroupPageDirect(ctx, accountId, page, prefix = "") {
     "",
     result.rows.length
       ? result.rows.map((g, i) =>
-          `${String(page * GROUP_PAGE_SIZE + i + 1).padStart(2, "0")}. ${g.enabled ? "✅" : "⬜"} <b>${escapeHtml(g.title)}</b>\n   ${g.can_send ? "🟢 Bisa kirim" : "🔴 Tidak bisa kirim"}`
+          `${g.enabled ? "✅" : "❌"} <b>${escapeHtml(g.title)}</b>`
         ).join("\n\n")
       : "<i>Belum ada grup.</i>"
   ].filter(Boolean).join("\n");
