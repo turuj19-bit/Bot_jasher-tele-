@@ -5461,7 +5461,12 @@ process.once("SIGTERM", () => {
       console.error("RESTORE SESSIONS:", safeErrorMessage(e, 800));
     });
 
-    await restoreRunningPromotions();
+    // Restore running promotions in the background too. A broken/stale
+    // promotion record must never prevent the admin Telegram bot from starting.
+    void restoreRunningPromotions().catch(e => {
+      console.error("RESTORE PROMOTIONS:", safeErrorMessage(e, 800));
+    });
+
     await bot.start({
       onStart: info => {
         console.log(`Telegram admin bot started as @${info?.username || "bot"}.`);
