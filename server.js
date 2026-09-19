@@ -1350,7 +1350,11 @@ async function getMeFromClient(client) {
     telegramUserId: Number(me.id),
     username: me.username || null,
     firstName: me.firstName || null,
-    lastName: me.lastName || null
+    lastName: me.lastName || null,
+    // For the connected account, Telegram's own User object is the
+    // authoritative source. Do not trust the number typed during login
+    // when displaying/saving the account identity.
+    phone: normalizePhone(me.phone) || null
   };
 }
 
@@ -1380,7 +1384,8 @@ bot.callbackQuery(/^promo:failures:([a-f0-9]+)$/, async ctx => {
     "❌ <b>DAFTAR GROUP GAGAL</b>",
     "━━━━━━━━━━━━━━━━━━",
     `📝 <b>Format:</b> ${escapeHtml(report.formatName || "-")}`,
-    `👤 <b>Username:</b> ${escapeHtml(report.accountUsername ? `@${report.accountUsername}` : "-")}`,
+    `👤 <b>Nama:</b> ${escapeHtml(report.accountName || report.accountLabel || "-")}`,
+    `🔗 <b>Username:</b> ${escapeHtml(report.accountUsername ? `@${report.accountUsername}` : "-")}`,
     `🆔 <b>ID Akun:</b> <code>${escapeHtml(report.accountTelegramId || "-")}</code>`,
     `📱 <b>Nomor:</b> <code>${escapeHtml(report.accountPhone || "-")}</code>`,
     "━━━━━━━━━━━━━━━━━━"
@@ -1892,6 +1897,28 @@ async function sendPromotionReport(account, format, total, success, failed, fail
   const admin = await getAdminByTelegramId(recipientId).catch(() => null);
   if (!admin) return;
 
+  // Refresh identity from the authenticated Telegram session immediately
+  // before building the report. This prevents stale/wrong phone data in the
+  // promotion result and keeps the displayed name tied to the connected
+  // Telegram account itself.
+  let liveIdentity = null;
+  try {
+    const client = await clientFor(account.id);
+    if (client) liveIdentity = await getMeFromClient(client);
+  } catch (e) {
+    console.warn("PROMOTION IDENTITY REFRESH:", safeErrorMessage(e, 220));
+  }
+
+  const accountName =
+    [liveIdentity?.firstName, liveIdentity?.lastName].filter(Boolean).join(" ").trim() ||
+    account.label ||
+    liveIdentity?.username ||
+    "Akun Telegram";
+
+  const accountUsername = liveIdentity?.username || account.username || null;
+  const accountTelegramId = liveIdentity?.telegramUserId || account.telegram_user_id || null;
+  const accountPhone = liveIdentity?.phone || account.phone || null;
+
   const failedRows = failures.map(x => ({
     groupId: x.groupId || null,
     groupTitle: x.groupTitle || "Group tanpa nama",
@@ -1901,10 +1928,11 @@ async function sendPromotionReport(account, format, total, success, failed, fail
   const token = rememberPromotionReport({
     accountId: String(account.id),
     formatId: String(format.id),
-    accountLabel: account.label,
-    accountUsername: account.username,
-    accountTelegramId: account.telegram_user_id,
-    accountPhone: account.phone,
+    accountLabel: accountName,
+    accountName,
+    accountUsername,
+    accountTelegramId,
+    accountPhone,
     formatName: format.name,
     failedRows
   });
@@ -1913,9 +1941,10 @@ async function sendPromotionReport(account, format, total, success, failed, fail
     "📊 <b>HASIL PROMOSI</b>",
     "━━━━━━━━━━━━━━━━━━",
     `📝 <b>Format:</b> ${escapeHtml(format.name || "-")}`,
-    `👤 <b>Username:</b> ${escapeHtml(account.username ? `@${account.username}` : "-")}`,
-    `🆔 <b>ID Akun:</b> <code>${escapeHtml(account.telegram_user_id || "-")}</code>`,
-    `📱 <b>Nomor:</b> <code>${escapeHtml(account.phone || "-")}</code>`,
+    `👤 <b>Nama:</b> ${escapeHtml(accountName)}`,
+    `🔗 <b>Username:</b> ${escapeHtml(accountUsername ? `@${accountUsername}` : "-")}`,
+    `🆔 <b>ID Akun:</b> <code>${escapeHtml(accountTelegramId || "-")}</code>`,
+    `📱 <b>Nomor:</b> <code>${escapeHtml(accountPhone || "-")}</code>`,
     "━━━━━━━━━━━━━━━━━━",
     "📤 <b>HASIL PENGIRIMAN</b>",
     `Total group dipilih: <b>${total}</b>`,
@@ -3054,7 +3083,7 @@ async function startLogin(ctx, accountId, phone, options = {}) {
         label: derivedLabel.slice(0, 80),
         telegram_user_id: identity.telegramUserId,
         username: identity.username || null,
-        phone,
+        phone: identity.phone || phone,
         session_string: sessionEncrypted,
         status: "connected"
       })
@@ -3088,7 +3117,7 @@ async function startLogin(ctx, accountId, phone, options = {}) {
     const successText = [
       "✅ <b>Login berhasil</b>",
       "",
-      `📱 Nomor <code>${escapeHtml(phone)}</code>`,
+      `📱 Nomor <code>${escapeHtml(identity.phone || phone)}</code>`,
       `👤 Akun <code>${escapeHtml(derivedLabel)}</code>`,
       "🔒 Session tersimpan (terenkripsi).",
       "🟢 Status: connected",
@@ -3212,7 +3241,7 @@ async function connectStoredAccount(ctx, accountId, adminId) {
       label: derivedLabel.slice(0, 80),
       telegram_user_id: identity.telegramUserId,
       username: identity.username || null,
-      phone: account?.phone || null,
+      phone: identity.phone || account?.phone || null,
       status: "connected",
     })
     .eq("id", accountId);
