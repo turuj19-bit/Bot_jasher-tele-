@@ -947,9 +947,9 @@ async function getPromotionFormats(accountId) {
 }
 
 async function savePromotionFormats(accountId, formats) {
-  // Keep the existing Supabase client path for JSONB updates. The previous
-  // hand-built REST PATCH could reach PostgREST with an invalid/empty body and
-  // return PGRST102 even though JSON.stringify() succeeded locally.
+  // Keep the existing Supabase client path used by the rest of the bot.
+  // The previous direct REST PATCH was the source of PGRST102
+  // ("Empty or invalid json") on the format-save step.
   const normalized = (formats || []).map(normalizeFormat);
   const jsonFormats = JSON.parse(JSON.stringify(normalized));
 
@@ -957,18 +957,20 @@ async function savePromotionFormats(accountId, formats) {
     .from("account_settings")
     .update({ formats: jsonFormats })
     .eq("account_id", accountId)
-    .select("account_id")
+    .select("formats")
     .maybeSingle();
 
   if (error) {
-    throw new Error(`Supabase formats update gagal (${error.code || "ERROR"}): ${error.message || error}`);
+    throw new Error(`Supabase formats update gagal: ${error.message || error.code || "unknown error"}`);
   }
 
   if (!data) {
-    throw new Error("Pengaturan akun tidak ditemukan saat menyimpan format.");
+    throw new Error("Setting account tidak ditemukan saat menyimpan format.");
   }
 
-  return jsonFormats.map(normalizeFormat);
+  return Array.isArray(data.formats)
+    ? data.formats.map(normalizeFormat)
+    : jsonFormats.map(normalizeFormat);
 }
 
 async function getPromotionFormat(accountId, formatId) {
@@ -5043,25 +5045,8 @@ bot.on("message", async (ctx, next) => {
        FORMAT NAME ADD
     -------------------------- */
     if (flow.t === "format_add_name") {
-      if (!ctx.message.text) {
-        return renderUi(
-          telegramUserId,
-          "❌ Nama format harus berupa teks.\n\nContoh: <code>PROMO NOKOS</code>",
-          cancelKeyboard(false),
-          { parse_mode: "HTML" }
-        );
-      }
-
-      const name = String(ctx.message.text).trim().replace(/\s+/g, " ").slice(0, 60);
-      if (name.length < 2) {
-        return renderUi(
-          telegramUserId,
-          "❌ Nama format terlalu pendek. Minimal 2 karakter.",
-          cancelKeyboard(false),
-          { parse_mode: "HTML" }
-        );
-      }
-
+      const name = String(ctx.message.text || "").trim().replace(/\s+/g," ").slice(0,60);
+      if (name.length < 2) return renderUi(telegramUserId,"❌ Nama format terlalu pendek.",cancelKeyboard(false));
       const formats = await getPromotionFormats(flow.accountId);
       const format = normalizeFormat({id:newFormatId(),name});
       formats.push(format);
