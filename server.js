@@ -5443,30 +5443,22 @@ process.once("SIGTERM", () => {
   try {
     await ensureBootstrapOwners();
 
-    // Legacy import must never prevent the new bot from starting.
-    // If an old table/schema differs from the expected legacy shape,
-    // the warning is logged and the migration can be retried on a later restart.
-    try {
-      await migrateLegacyData();
-    } catch (e) {
-      console.error(
-        "LEGACY MIGRATION WARNING:",
-        safeErrorMessage(e, 800)
-      );
-    }
+    // Start the admin Telegram bot before any non-essential restore/migration work.
+    // A stale legacy table, promotion record, or GramJS session must never block
+    // the admin bot from reaching Telegram polling.
+    void migrateLegacyData().catch(e => {
+      console.error("LEGACY MIGRATION WARNING:", safeErrorMessage(e, 800));
+    });
 
-    // Restore user sessions in the background so a stuck GramJS account
-    // cannot prevent the admin Telegram bot from starting.
     void restoreSessions().catch(e => {
       console.error("RESTORE SESSIONS:", safeErrorMessage(e, 800));
     });
 
-    // Restore running promotions in the background too. A broken/stale
-    // promotion record must never prevent the admin Telegram bot from starting.
     void restoreRunningPromotions().catch(e => {
       console.error("RESTORE PROMOTIONS:", safeErrorMessage(e, 800));
     });
 
+    console.log("STARTUP: starting Telegram admin bot...");
     await bot.start({
       onStart: info => {
         console.log(`Telegram admin bot started as @${info?.username || "bot"}.`);
