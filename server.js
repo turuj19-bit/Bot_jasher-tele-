@@ -947,15 +947,21 @@ async function getPromotionFormats(accountId) {
 }
 
 async function savePromotionFormats(accountId, formats) {
+  // Keep the JSONB payload strictly JSON-serializable. More importantly,
+  // do not request the updated row back here: some PostgREST/Supabase setups
+  // return an empty response for UPDATE, and forcing .select().single() then
+  // turns a successful write into the misleading "Empty or invalid json"
+  // error. The callers already have the normalized formats in memory.
   const normalized = (formats || []).map(normalizeFormat);
-  const { data, error } = await sb
+  const jsonFormats = JSON.parse(JSON.stringify(normalized));
+
+  const { error } = await sb
     .from("account_settings")
-    .update({ formats: normalized })
-    .eq("account_id", accountId)
-    .select("*")
-    .single();
+    .update({ formats: jsonFormats })
+    .eq("account_id", accountId);
+
   if (error) throw error;
-  return Array.isArray(data.formats) ? data.formats.map(normalizeFormat) : [];
+  return jsonFormats.map(normalizeFormat);
 }
 
 async function getPromotionFormat(accountId, formatId) {
@@ -5030,77 +5036,14 @@ bot.on("message", async (ctx, next) => {
        FORMAT NAME ADD
     -------------------------- */
     if (flow.t === "format_add_name") {
-      // Telegram photo messages do not have ctx.message.text. The old code
-      // converted that missing value to "" and incorrectly reported
-      // "Nama format terlalu pendek". Keep the normal text-name flow intact,
-      // but also accept a photo directly (using its caption as the name when
-      // present, or a safe automatic name when no caption was supplied).
-      const rawName = String(ctx.message.text || ctx.message.caption || "")
-        .trim()
-        .replace(/\s+/g, " ")
-        .slice(0, 60);
-
+      const name = String(ctx.message.text || "").trim().replace(/\s+/g," ").slice(0,60);
+      if (name.length < 2) return renderUi(telegramUserId,"❌ Nama format terlalu pendek.",cancelKeyboard(false));
       const formats = await getPromotionFormats(flow.accountId);
-      const hasPhoto = Boolean(ctx.message.photo?.length);
-
-      if (!rawName && !hasPhoto) {
-        return renderUi(
-          telegramUserId,
-          "❌ Nama format harus berupa teks (minimal 2 karakter).\n\nContoh: <code>PROMO NOKOS</code>",
-          cancelKeyboard(false),
-          { parse_mode: "HTML" }
-        );
-      }
-
-      const name = rawName || `Format ${formats.length + 1}`;
-      const format = normalizeFormat({ id: newFormatId(), name });
-
-      // If the user sent the media together with the name/caption, save the
-      // media immediately instead of forcing a second upload.
-      if (hasPhoto) {
-        const photo = ctx.message.photo[ctx.message.photo.length - 1];
-        format.media_type = "photo";
-        format.message = "";
-        format.media_file_id = photo.file_id;
-        format.caption = ctx.message.caption || "";
-      }
-
+      const format = normalizeFormat({id:newFormatId(),name});
       formats.push(format);
-      await savePromotionFormats(flow.accountId, formats);
-
-      // Photo was already saved, so finish the flow. Text-only names keep the
-      // original two-step behavior: name first, then content.
-      if (hasPhoto) {
-        await recordHistory(flow.accountId, adminRow.id, {
-          action: "format_update",
-          status: "success",
-          details: {
-            format_id: format.id,
-            format_name: format.name,
-            type: "photo"
-          }
-        });
-        flows.delete(userKey);
-        return renderFormatDetail(
-          ctx,
-          flow.accountId,
-          format.id,
-          `✅ Format <b>${escapeHtml(name)}</b> dibuat dan foto langsung disimpan.`
-        );
-      }
-
-      flows.set(userKey, {
-        t: "format",
-        accountId: flow.accountId,
-        formatId: format.id,
-        adminId: flow.adminId
-      });
-      return renderUi(
-        telegramUserId,
-        `✅ Format <b>${escapeHtml(name)}</b> dibuat.\n\nSekarang kirim isi format: teks atau foto + caption.`,
-        cancelKeyboard(false),
-        { parse_mode: "HTML" }
-      );
+      await savePromotionFormats(flow.accountId,formats);
+      flows.set(userKey,{t:"format",accountId:flow.accountId,formatId:format.id,adminId:flow.adminId});
+      return renderUi(telegramUserId,`✅ Format <b>${escapeHtml(name)}</b> dibuat.\n\nSekarang kirim isi format: teks atau foto + caption.`,cancelKeyboard(false),{parse_mode:"HTML"});
     }
 
     /* -------------------------
