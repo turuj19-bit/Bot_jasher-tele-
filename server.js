@@ -947,20 +947,36 @@ async function getPromotionFormats(accountId) {
 }
 
 async function savePromotionFormats(accountId, formats) {
-  // Keep the JSONB payload strictly JSON-serializable. More importantly,
-  // do not request the updated row back here: some PostgREST/Supabase setups
-  // return an empty response for UPDATE, and forcing .select().single() then
-  // turns a successful write into the misleading "Empty or invalid json"
-  // error. The callers already have the normalized formats in memory.
+  // Write the JSONB value through Supabase REST directly. This avoids the
+  // malformed/empty request-body path that was still producing
+  // "Empty or invalid json" in the current runtime.
   const normalized = (formats || []).map(normalizeFormat);
   const jsonFormats = JSON.parse(JSON.stringify(normalized));
+  const supabaseUrl = String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+  const serviceKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 
-  const { error } = await sb
-    .from("account_settings")
-    .update({ formats: jsonFormats })
-    .eq("account_id", accountId);
+  if (!supabaseUrl || !serviceKey) {
+    throw new Error("SUPABASE_URL atau SUPABASE_SERVICE_ROLE_KEY belum tersedia.");
+  }
 
-  if (error) throw error;
+  const endpoint = `${supabaseUrl}/rest/v1/account_settings?account_id=eq.${encodeURIComponent(String(accountId))}`;
+  const response = await fetch(endpoint, {
+    method: "PATCH",
+    headers: {
+      apikey: serviceKey,
+      Authorization: `Bearer ${serviceKey}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Prefer: "return=minimal"
+    },
+    body: JSON.stringify({ formats: jsonFormats })
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Supabase formats update gagal (${response.status}): ${detail || response.statusText}`);
+  }
+
   return jsonFormats.map(normalizeFormat);
 }
 
