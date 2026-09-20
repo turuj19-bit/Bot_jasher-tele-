@@ -947,34 +947,25 @@ async function getPromotionFormats(accountId) {
 }
 
 async function savePromotionFormats(accountId, formats) {
-  // Write the JSONB value through Supabase REST directly. This avoids the
-  // malformed/empty request-body path that was still producing
-  // "Empty or invalid json" in the current runtime.
+  // Keep the existing Supabase client path for JSONB updates. The previous
+  // hand-built REST PATCH could reach PostgREST with an invalid/empty body and
+  // return PGRST102 even though JSON.stringify() succeeded locally.
   const normalized = (formats || []).map(normalizeFormat);
   const jsonFormats = JSON.parse(JSON.stringify(normalized));
-  const supabaseUrl = String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
-  const serviceKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 
-  if (!supabaseUrl || !serviceKey) {
-    throw new Error("SUPABASE_URL atau SUPABASE_SERVICE_ROLE_KEY belum tersedia.");
+  const { data, error } = await sb
+    .from("account_settings")
+    .update({ formats: jsonFormats })
+    .eq("account_id", accountId)
+    .select("account_id")
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Supabase formats update gagal (${error.code || "ERROR"}): ${error.message || error}`);
   }
 
-  const endpoint = `${supabaseUrl}/rest/v1/account_settings?account_id=eq.${encodeURIComponent(String(accountId))}`;
-  const response = await fetch(endpoint, {
-    method: "PATCH",
-    headers: {
-      apikey: serviceKey,
-      Authorization: `Bearer ${serviceKey}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      Prefer: "return=minimal"
-    },
-    body: JSON.stringify({ formats: jsonFormats })
-  });
-
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(`Supabase formats update gagal (${response.status}): ${detail || response.statusText}`);
+  if (!data) {
+    throw new Error("Pengaturan akun tidak ditemukan saat menyimpan format.");
   }
 
   return jsonFormats.map(normalizeFormat);
@@ -5052,8 +5043,25 @@ bot.on("message", async (ctx, next) => {
        FORMAT NAME ADD
     -------------------------- */
     if (flow.t === "format_add_name") {
-      const name = String(ctx.message.text || "").trim().replace(/\s+/g," ").slice(0,60);
-      if (name.length < 2) return renderUi(telegramUserId,"❌ Nama format terlalu pendek.",cancelKeyboard(false));
+      if (!ctx.message.text) {
+        return renderUi(
+          telegramUserId,
+          "❌ Nama format harus berupa teks.\n\nContoh: <code>PROMO NOKOS</code>",
+          cancelKeyboard(false),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      const name = String(ctx.message.text).trim().replace(/\s+/g, " ").slice(0, 60);
+      if (name.length < 2) {
+        return renderUi(
+          telegramUserId,
+          "❌ Nama format terlalu pendek. Minimal 2 karakter.",
+          cancelKeyboard(false),
+          { parse_mode: "HTML" }
+        );
+      }
+
       const formats = await getPromotionFormats(flow.accountId);
       const format = normalizeFormat({id:newFormatId(),name});
       formats.push(format);
