@@ -4233,8 +4233,8 @@ bot.callbackQuery(/^promo:add:(\d+)$/, async ctx => {
   if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const account = await getAccount(accountId);
   if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), {parse_mode:"HTML"});
-  flows.set(String(ctx.from.id), { t:"format_add_name", accountId, adminId:adminRow.id });
-  return replaceUi(ctx, `➕ <b>TAMBAH FORMAT</b>\n\nMasukkan <b>nama format</b>.\nContoh: <code>PROMO NOKOS</code>`, cancelKeyboard(false), {parse_mode:"HTML"});
+  flows.set(String(ctx.from.id), { t:"format_add", accountId, adminId:adminRow.id });
+  return replaceUi(ctx, `➕ <b>TAMBAH FORMAT</b>\n\nKirim <b>isi format promosi</b> sekarang:\n• Teks (panjang/pendek bebas), atau\n• Foto (dengan/tanpa caption)`, cancelKeyboard(false), {parse_mode:"HTML"});
 });
 
 bot.callbackQuery(/^promo:view:(\d+):([^:]+)$/, async ctx => {
@@ -5065,45 +5065,36 @@ bot.on("message", async (ctx, next) => {
     }
 
     /* -------------------------
-       FORMAT NAME ADD
-    -------------------------- */
-    if (flow.t === "format_add_name") {
-      if (!ctx.message.text) {
-        return renderUi(telegramUserId,"❌ Nama format harus berupa <b>teks singkat</b>, bukan foto/media.\n\nContoh: <code>PROMO NOKOS</code>\nIsi promosi dikirim di langkah berikutnya.",cancelKeyboard(false),{parse_mode:"HTML"});
-      }
-      const name = cleanText(ctx.message.text).trim().replace(/\s+/g," ");
-      if (name.length < 2) return renderUi(telegramUserId,"❌ Nama format terlalu pendek.",cancelKeyboard(false));
-      if (Array.from(name).length > 60) {
-        return renderUi(telegramUserId,"❌ Nama format terlalu panjang (maks. 60 karakter).\n\nKirim <b>nama singkat</b> saja, contoh: <code>PROMO NOKOS</code>\nIsi promosi dikirim di langkah berikutnya.",cancelKeyboard(false),{parse_mode:"HTML"});
-      }
-      const formats = await getPromotionFormats(flow.accountId);
-      const format = normalizeFormat({id:newFormatId(),name});
-      formats.push(format);
-      await savePromotionFormats(flow.accountId,formats);
-      flows.set(userKey,{t:"format",accountId:flow.accountId,formatId:format.id,adminId:flow.adminId});
-      return renderUi(telegramUserId,`✅ Format <b>${escapeHtml(name)}</b> dibuat.\n\nSekarang kirim isi format: teks atau foto + caption.`,cancelKeyboard(false),{parse_mode:"HTML"});
-    }
-
-    /* -------------------------
        FORMAT CONTENT
     -------------------------- */
-    if (flow.t === "format") {
+    if (flow.t === "format" || flow.t === "format_add") {
+      const isNew = flow.t === "format_add";
       const formats = await getPromotionFormats(flow.accountId);
-      const format = formats.find(x=>x.id===String(flow.formatId));
-      if(!format) { flows.delete(userKey); return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan."); }
+      let format;
+      if (isNew) {
+        // Format baru: nama otomatis (Format 1, Format 2, ...), tanpa batas panjang isi.
+        const usedNames = new Set(formats.map(x => x.name));
+        let n = formats.length + 1;
+        while (usedNames.has(`Format ${n}`)) n++;
+        format = normalizeFormat({ id: newFormatId(), name: `Format ${n}` });
+        formats.push(format); // baru disimpan setelah isi format valid
+      } else {
+        format = formats.find(x=>x.id===String(flow.formatId));
+        if(!format) { flows.delete(userKey); return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan."); }
+      }
       if (ctx.message.photo?.length) {
         const photo=ctx.message.photo[ctx.message.photo.length-1];
         format.media_type="photo"; format.message=""; format.media_file_id=photo.file_id; format.caption=ctx.message.caption||"";
       } else if (ctx.message.text) {
         const message=ctx.message.text.trim();
-        if(!message)return renderUi(telegramUserId,"❌ Format teks tidak boleh kosong.",cancelKeyboard(false));
+        if(!message)return replaceUi(ctx,"❌ Format teks tidak boleh kosong.",cancelKeyboard(false));
         format.media_type="text"; format.message=message; format.media_file_id=null; format.caption=null;
-      } else return renderUi(telegramUserId,"❌ Format tidak didukung. Kirim teks atau foto.",cancelKeyboard(false));
+      } else return replaceUi(ctx,"❌ Format tidak didukung. Kirim teks atau foto.",cancelKeyboard(false));
       format.updated_at=new Date().toISOString();
       await savePromotionFormats(flow.accountId,formats);
       await recordHistory(flow.accountId,adminRow.id,{action:"format_update",status:"success",details:{format_id:format.id,format_name:format.name,type:format.media_type}});
       flows.delete(userKey);
-      return renderFormatDetail(ctx,flow.accountId,format.id,"✅ Isi format berhasil disimpan.");
+      return renderFormatDetail(ctx,flow.accountId,format.id,isNew?`✅ <b>Format berhasil dibuat</b> (${escapeHtml(format.name)}).`:"✅ Isi format berhasil disimpan.");
     }
 
     /* -------------------------
@@ -5111,7 +5102,7 @@ bot.on("message", async (ctx, next) => {
     -------------------------- */
     if (flow.t === "delay") {
       const minutes=parseMinutes(ctx.message.text);
-      if(!minutes)return renderUi(telegramUserId,"❌ Jeda tidak valid. Contoh: <code>10 menit</code> atau <code>1 jam</code>.",cancelKeyboard(false),{parse_mode:"HTML"});
+      if(!minutes)return replaceUi(ctx,"❌ Jeda tidak valid. Contoh: <code>10 menit</code> atau <code>1 jam</code>.",cancelKeyboard(false),{parse_mode:"HTML"});
       const formats=await getPromotionFormats(flow.accountId); const f=formats.find(x=>x.id===String(flow.formatId));
       if(!f)return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan.");
       f.interval_minutes=minutes; f.updated_at=new Date().toISOString(); await savePromotionFormats(flow.accountId,formats);
@@ -5123,7 +5114,7 @@ bot.on("message", async (ctx, next) => {
     -------------------------- */
     if (flow.t === "duration") {
       const hours=parseHours(ctx.message.text);
-      if(!hours)return renderUi(telegramUserId,"❌ Durasi tidak valid. Contoh: <code>3 hari</code> atau <code>12 jam</code>.",cancelKeyboard(false),{parse_mode:"HTML"});
+      if(!hours)return replaceUi(ctx,"❌ Durasi tidak valid. Contoh: <code>3 hari</code> atau <code>12 jam</code>.",cancelKeyboard(false),{parse_mode:"HTML"});
       const formats=await getPromotionFormats(flow.accountId); const f=formats.find(x=>x.id===String(flow.formatId));
       if(!f)return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan.");
       f.duration_hours=hours; if(f.active)f.expires_at=new Date(Date.now()+hours*3600000).toISOString(); f.updated_at=new Date().toISOString();
@@ -5142,7 +5133,7 @@ bot.on("message", async (ctx, next) => {
       }
       const m=raw.match(/^\s*(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s*$/);
       const a=parseTimeHHMM(m?.[1]), b=parseTimeHHMM(m?.[2]);
-      if(!a||!b)return renderUi(telegramUserId,"❌ Format waktu salah. Contoh: <code>08:00 - 22:00</code>.",cancelKeyboard(false),{parse_mode:"HTML"});
+      if(!a||!b)return replaceUi(ctx,"❌ Format waktu salah. Contoh: <code>08:00 - 22:00</code>.",cancelKeyboard(false),{parse_mode:"HTML"});
       const formats=await getPromotionFormats(flow.accountId); const f=formats.find(x=>x.id===String(flow.formatId));
       if(!f)return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan.");
       f.start_time=a;f.stop_time=b;f.updated_at=new Date().toISOString();await savePromotionFormats(flow.accountId,formats);flows.delete(userKey);return renderFormatDetail(ctx,flow.accountId,f.id,`✅ Waktu disimpan: <b>${a} - ${b}</b>`);
@@ -5321,9 +5312,16 @@ bot.on("message", async (ctx, next) => {
 
     // Do not leak session material or internal credentials.
     const message = safeErrorMessage(e, 700);
+    const errorText = `❌ <b>Gagal memproses input.</b>\n\n${escapeHtml(message)}`;
+
+    // Alur format: kirim notifikasi sebagai pesan baru di bagian bawah chat.
+    if (String(flow?.t || "").startsWith("format")) {
+      return replaceUi(ctx, errorText, cancelKeyboard(false), { parse_mode: "HTML" });
+    }
+
     return renderUi(
       telegramUserId,
-      `❌ <b>Gagal memproses input.</b>\n\n${escapeHtml(message)}`,
+      errorText,
       cancelKeyboard(false),
       { parse_mode: "HTML" }
     );
