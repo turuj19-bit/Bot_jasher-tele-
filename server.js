@@ -140,9 +140,24 @@ function safeButtonText(value, max = 30) {
     .join("");
 }
 
+// PostgREST/Postgres menolak seluruh JSON ("Empty or invalid json" / PGRST102)
+// bila ada karakter NUL atau surrogate UTF-16 yang terbelah. Surrogate terbelah
+// biasanya muncul saat teks berisi emoji / huruf fancy (𝗕𝗼𝗹𝗱 dll, 2 unit UTF-16)
+// dipotong dengan .slice(). Dua helper ini mencegahnya.
+function cleanText(value) {
+  return String(value ?? "")
+    .replace(/\u0000/g, "")
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
+}
+
+// Potong berdasarkan jumlah karakter sebenarnya (code point), bukan unit UTF-16.
+function truncateText(value, max) {
+  return Array.from(cleanText(value)).slice(0, max).join("");
+}
+
 function safeErrorMessage(error, max = 500) {
   const raw = String(error?.message || error || "Kesalahan tidak diketahui");
-  return raw.replace(/\s+/g, " ").slice(0, max);
+  return truncateText(raw.replace(/\s+/g, " "), max);
 }
 
 function isOwnerId(telegramUserId) {
@@ -899,11 +914,11 @@ function newFormatId() {
 function normalizeFormat(row = {}) {
   return {
     id: String(row.id || newFormatId()),
-    name: String(row.name || "Format Baru").trim().slice(0, 60) || "Format Baru",
+    name: truncateText(String(row.name || "Format Baru").trim(), 60) || "Format Baru",
     media_type: row.media_type === "photo" ? "photo" : "text",
-    message: String(row.message || ""),
+    message: cleanText(row.message || ""),
     media_file_id: row.media_file_id || null,
-    caption: row.caption || null,
+    caption: row.caption ? cleanText(row.caption) : null,
     interval_minutes: Math.max(1, Number(row.interval_minutes || 10)),
     duration_hours: Math.max(1, Number(row.duration_hours || 1)),
     start_time: row.start_time || null,
@@ -951,7 +966,11 @@ async function savePromotionFormats(accountId, formats) {
   // The previous direct REST PATCH was the source of PGRST102
   // ("Empty or invalid json") on the format-save step.
   const normalized = (formats || []).map(normalizeFormat);
-  const jsonFormats = JSON.parse(JSON.stringify(normalized));
+  // Bersihkan semua string (NUL / surrogate terbelah) sebelum dikirim ke PostgREST.
+  const jsonFormats = JSON.parse(
+    JSON.stringify(normalized),
+    (_key, value) => (typeof value === "string" ? cleanText(value) : value)
+  );
 
   const { data, error } = await sb
     .from("account_settings")
@@ -1735,7 +1754,7 @@ async function recordHistory(accountId, adminId, payload = {}) {
       group_title: payload.groupTitle || null,
       action: payload.action || payload.actionType || "unknown",
       status: payload.status || "success",
-      error: payload.error ? String(payload.error).slice(0, 1000) : null
+      error: payload.error ? truncateText(payload.error, 1000) : null
     };
 
     const { error } = await sb.from("promotion_history").insert(row);
@@ -1821,7 +1840,7 @@ async function renderHistory(ctx, accountId, page = 0) {
       "-";
 
     const errorLine = row.error
-      ? `\n⚠️ ${escapeHtml(String(row.error).slice(0, 120))}`
+      ? `\n⚠️ ${escapeHtml(truncateText(row.error, 120))}`
       : "";
 
     lines.push(
@@ -1919,7 +1938,7 @@ function classifySendError(error) {
     return "Telegram meminta menunggu sebelum mengirim lagi";
   }
 
-  return raw ? raw.replace(/\s+/g, " ").slice(0, 160) : "Kesalahan tidak diketahui";
+  return raw ? truncateText(raw.replace(/\s+/g, " "), 160) : "Kesalahan tidak diketahui";
 }
 
 function rememberPromotionReport(report) {
@@ -3132,7 +3151,7 @@ async function startLogin(ctx, accountId, phone, options = {}) {
     const { data: updated, error } = await sb
       .from("telegram_accounts")
       .update({
-        label: derivedLabel.slice(0, 80),
+        label: truncateText(derivedLabel, 80),
         telegram_user_id: identity.telegramUserId,
         username: identity.username || null,
         phone: identity.phone || phone,
@@ -3290,7 +3309,7 @@ async function connectStoredAccount(ctx, accountId, adminId) {
   const { error } = await sb
     .from("telegram_accounts")
     .update({
-      label: derivedLabel.slice(0, 80),
+      label: truncateText(derivedLabel, 80),
       telegram_user_id: identity.telegramUserId,
       username: identity.username || null,
       phone: identity.phone || account?.phone || null,
@@ -3692,7 +3711,7 @@ async function renderFormatDetail(ctx, accountId, formatId, prefixMessage = "") 
     "━━━━━━━━━━━━━━━━━━",
     "📄 <b>ISI FORMAT</b>",
     format.media_type === "photo" ? "🖼️ Media: Foto" : "📝 Media: Teks",
-    `<blockquote>${escapeHtml(String(body).slice(0, 2500))}</blockquote>`,
+    `<blockquote>${escapeHtml(truncateText(body, 2500))}</blockquote>`,
     "━━━━━━━━━━━━━━━━━━",
     "⚙️ <b>PENGATURAN</b>",
     `⏱️ Jeda: <b>${escapeHtml(formatInterval(format.interval_minutes))}</b>`,
@@ -4293,7 +4312,11 @@ bot.callbackQuery(/^promo:toggle:(\d+):([^:]+)$/, async ctx => {
   const accountId=String(ctx.match[1]),formatId=String(ctx.match[2]);
   if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const formats=await getPromotionFormats(accountId); const f=formats.find(x=>x.id===formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
-  if(f.active) await stopFormat(accountId,formatId,adminRow.id); else await startFormat(accountId,formatId,adminRow.id);
+  try {
+    if(f.active) await stopFormat(accountId,formatId,adminRow.id); else await startFormat(accountId,formatId,adminRow.id);
+  } catch(e) {
+    return renderFormatDetail(ctx,accountId,formatId,`❌ ${escapeHtml(safeErrorMessage(e))}`);
+  }
   return renderFormatDetail(ctx,accountId,formatId,f.active?"🔴 Format dinonaktifkan.":"🟢 Format diaktifkan.");
 });
 
@@ -5015,7 +5038,7 @@ bot.on("message", async (ctx, next) => {
         );
       }
 
-      const label = ctx.message.text.trim().replace(/\s+/g, " ").slice(0, 80);
+      const label = truncateText(ctx.message.text.trim().replace(/\s+/g, " "), 80);
       if (label.length < 2) {
         return renderUi(
           telegramUserId,
@@ -5045,8 +5068,14 @@ bot.on("message", async (ctx, next) => {
        FORMAT NAME ADD
     -------------------------- */
     if (flow.t === "format_add_name") {
-      const name = String(ctx.message.text || "").trim().replace(/\s+/g," ").slice(0,60);
+      if (!ctx.message.text) {
+        return renderUi(telegramUserId,"❌ Nama format harus berupa <b>teks singkat</b>, bukan foto/media.\n\nContoh: <code>PROMO NOKOS</code>\nIsi promosi dikirim di langkah berikutnya.",cancelKeyboard(false),{parse_mode:"HTML"});
+      }
+      const name = cleanText(ctx.message.text).trim().replace(/\s+/g," ");
       if (name.length < 2) return renderUi(telegramUserId,"❌ Nama format terlalu pendek.",cancelKeyboard(false));
+      if (Array.from(name).length > 60) {
+        return renderUi(telegramUserId,"❌ Nama format terlalu panjang (maks. 60 karakter).\n\nKirim <b>nama singkat</b> saja, contoh: <code>PROMO NOKOS</code>\nIsi promosi dikirim di langkah berikutnya.",cancelKeyboard(false),{parse_mode:"HTML"});
+      }
       const formats = await getPromotionFormats(flow.accountId);
       const format = normalizeFormat({id:newFormatId(),name});
       formats.push(format);
