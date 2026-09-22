@@ -472,15 +472,15 @@ function userPurchaseText(subscription = null) {
     "",
     "⭐ <b>ADMIN VIP — Rp10.000 / bulan</b>",
     "• Semua fitur Admin Biasa",
-    "• Dapat menambah Admin Biasa di bawahnya",
-    "• Dapat membuka penjualan/pendaftaran bot untuk pengguna lain",
-    "• Tetap tanpa Promosi Chat Privat",
+    "• Bisa tambah maksimal <b>20 Admin Biasa</b>",
+    "• Bisa membuka penjualan/pendaftaran bot untuk pengguna lain",
+    "• <b>Tidak</b> memiliki Promosi Chat Privat",
     "",
     "💎 <b>ADMIN PREMIUM — Rp15.000 / bulan</b>",
     "• Semua fitur Admin VIP",
-    "• Promosi Chat Privat",
-    "• Dapat menambah Admin Biasa",
-    "• Dapat membuka penjualan/pendaftaran bot untuk pengguna lain",
+    "• Bisa tambah <b>Admin Biasa tanpa batas</b>",
+    "• Mendapat fitur <b>Promosi Chat Privat</b>",
+    "• Bisa membuka penjualan/pendaftaran bot untuk pengguna lain",
     "",
     "⏳ <b>Masa aktif: 1 bulan</b>",
     "Perpanjangan dapat dilakukan sebelum atau setelah masa aktif habis.",
@@ -508,6 +508,27 @@ function userOrderText(ctx, role, subscription = null) {
   const name = [first, last].filter(Boolean).join(" ") || "-";
   const username = ctx.from?.username ? `@${ctx.from.username}` : "-";
   const tgId = String(ctx.from?.id || "-");
+  const benefits = {
+    ADMIN_ANAK: [
+      "• Promosi ke grup",
+      "• Kelola akun Telegram, format, dan target grup",
+      "• Tidak bisa tambah admin",
+      "• Tidak ada Promosi Chat Privat"
+    ],
+    ADMIN_VIP: [
+      "• Semua fitur Admin Biasa",
+      "• Bisa tambah maksimal 20 Admin Biasa",
+      "• Bisa membuka penjualan/pendaftaran bot",
+      "• Tidak ada Promosi Chat Privat"
+    ],
+    ADMIN_PREMIUM: [
+      "• Semua fitur Admin VIP",
+      "• Bisa tambah Admin Biasa tanpa batas",
+      "• Promosi Chat Privat tersedia",
+      "• Bisa membuka penjualan/pendaftaran bot"
+    ]
+  }[role] || [];
+
   return [
     "🧾 <b>ORDER AKSES BOT</b>",
     "━━━━━━━━━━━━━━━━━━",
@@ -519,12 +540,18 @@ function userOrderText(ctx, role, subscription = null) {
     "⏳ Masa aktif: <b>1 bulan</b>",
     subscription && !subscriptionIsActive(subscription) ? "🔄 Status: <b>Perpanjangan</b>" : "🆕 Status: <b>Pendaftaran Baru</b>",
     "",
-    "Silakan buka chat Owner melalui tombol di bawah lalu kirim order ini untuk diproses."
+    "📌 <b>Keuntungan paket:</b>",
+    ...benefits,
+    "",
+    "📤 Tekan tombol <b>💬 Buka Chat Owner</b>. Order ini akan otomatis disiapkan di kolom pesan, lalu tinggal tekan <b>Kirim</b>."
   ].join("\n");
 }
 
 function ownerOrderUrl(text) {
-  return `https://t.me/${OWNER_CONTACT}?text=${encodeURIComponent(text.replace(/<[^>]+>/g, ""))}`;
+  const draft = text.replace(/<[^>]+>/g, "");
+  // tg://resolve opens the peer directly in Telegram and pre-fills the draft.
+  // No `profile` parameter is used, so the link requests chat view.
+  return `tg://resolve?domain=${OWNER_CONTACT}&text=${encodeURIComponent(draft)}`;
 }
 
 async function getAdminByTelegramId(telegramUserId) {
@@ -4337,7 +4364,7 @@ bot.callbackQuery(/^user:order:(ADMIN_ANAK|ADMIN_VIP|ADMIN_PREMIUM)$/, async ctx
   const subscription = await getUserSubscription(ctx.from.id);
   const orderText = userOrderText(ctx, role, subscription);
   const kb = new InlineKeyboard()
-    .url("📤 Kirim Order ke Owner", ownerOrderUrl(orderText))
+    .url("💬 Buka Chat Owner", ownerOrderUrl(orderText))
     .row()
     .text("⬅️ Pilih Paket", "user:purchase")
     .row()
