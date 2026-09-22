@@ -588,7 +588,7 @@ function dashboardText(ctx, stats, extra = "", role = "") {
   const last = String(ctx.from?.last_name || "").trim();
   const name = [first, last].filter(Boolean).join(" ") || "Admin";
   const username = ctx.from?.username ? `@${ctx.from.username}` : "-";
-  const roleLabel = role ? (role === "OWNER" ? "OWNER" : "ADMIN") : "";
+  const roleLabel = role ? ({ OWNER: "OWNER", ADMIN_PREMIUM: "ADMIN PREMIUM", ADMIN_VIP: "ADMIN VIP", ADMIN_ANAK: "ADMIN ANAK" }[role] || role) : "";
   const rule = "━━━━━━━━━━━━━━━━━━";
 
   const intro =
@@ -688,12 +688,21 @@ function ownerDashboardMenu() {
     .text("➕ Tambah Akun", "account:add");
 }
 
-function adminDashboardMenu() {
-  return new InlineKeyboard()
+function adminDashboardMenu(adminRow = null) {
+  const kb = new InlineKeyboard()
     .text("📱 Akun Telegram", "accounts:list:0")
-    .row()
-    .text("➕ Tambah Akun", "account:add")
-    .text("📊 Refresh", "menu:dashboard");
+    .row();
+
+  if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow?.role)) {
+    kb.text("👥 Admin Anak", "admin:list:0")
+      .text("📊 Refresh", "menu:dashboard")
+      .row();
+  } else {
+    kb.text("📊 Refresh", "menu:dashboard").row();
+  }
+
+  kb.text("➕ Tambah Akun", "account:add");
+  return kb;
 }
 
 function backDashboardKeyboard() {
@@ -845,27 +854,27 @@ function historyKeyboard(accountId, page, hasNext) {
   return kb;
 }
 
-function adminListKeyboard(admins, page, hasNext) {
+function adminListKeyboard(admins, page, hasNext, viewer = null) {
   const kb = new InlineKeyboard();
 
   for (const a of admins) {
-    const role = a.role === "OWNER" ? "👑" : "👨‍💼";
-    const label = a.telegram_user_id
-      ? `${role} ${a.telegram_user_id}`
-      : `${role} -`;
-
-    kb.text(
-      safeButtonText(label, 32),
-      `admin:view:${a.id}`
-    ).row();
+    const roleIcon = a.role === "OWNER" ? "👑" : a.role === "ADMIN_PREMIUM" ? "💎" : a.role === "ADMIN_VIP" ? "⭐" : "👤";
+    const label = `${roleIcon} ${a.telegram_user_id || "-"}`;
+    kb.text(safeButtonText(label, 32), `admin:view:${a.id}`).row();
   }
 
   if (page > 0) kb.text("◀️", `admin:list:${page - 1}`);
   kb.text("🏠", "menu:dashboard");
   if (hasNext) kb.text("▶️", `admin:list:${page + 1}`);
   kb.row();
-  kb.text("➕ Tambah Admin", "admin:add");
-  kb.text("❌ Hapus Admin", "admin:delete");
+
+  if (viewer?.role === "OWNER") {
+    kb.text("➕ Tambah Admin", "admin:add");
+    kb.text("❌ Putus Admin", "admin:delete");
+  } else if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(viewer?.role)) {
+    kb.text("➕ Tambah Admin Anak", "admin:add");
+    kb.text("❌ Putus Admin Anak", "admin:delete");
+  }
 
   return kb;
 }
@@ -1241,27 +1250,39 @@ async function listAccounts(page = 0, adminRow = null) {
   };
 }
 
-async function listAdmins(page = 0) {
+async function listAdmins(page = 0, viewer = null) {
   const offset = page * ADMIN_PAGE_SIZE;
+  const isOwner = viewer?.role === "OWNER";
+  const isManager = ["ADMIN_VIP", "ADMIN_PREMIUM"].includes(viewer?.role);
+  let query = sb
+    .from("admins")
+    .select("*")
+    .eq("active", true)
+    .order("created_at", { ascending: true });
 
-  const [{ data, error }, { count, error: countError }] = await Promise.all([
-    sb
-      .from("admins")
-      .select("*")
-      .eq("active", true)
-      .order("role", { ascending: true })
-      .order("created_at", { ascending: true })
-      .range(offset, offset + ADMIN_PAGE_SIZE),
-    sb.from("admins").select("*", { count: "exact", head: true }).eq("active", true)
-  ]);
+  if (!isOwner) {
+    if (!isManager) {
+      query = query.eq("id", viewer?.id || -1);
+    } else {
+      query = query.or(`id.eq.${viewer.id},parent_admin_id.eq.${viewer.id}`);
+    }
+  }
 
-  if (error) throw error;
-  if (countError) throw countError;
+  const rowsResult = await query.range(offset, offset + ADMIN_PAGE_SIZE - 1);
+  if (rowsResult.error) throw rowsResult.error;
+
+  let countQuery = sb.from("admins").select("id", { count: "exact", head: true }).eq("active", true);
+  if (!isOwner) {
+    if (!isManager) countQuery = countQuery.eq("id", viewer?.id || -1);
+    else countQuery = countQuery.or(`id.eq.${viewer.id},parent_admin_id.eq.${viewer.id}`);
+  }
+  const countResult = await countQuery;
+  if (countResult.error) throw countResult.error;
 
   return {
-    rows: (data || []).slice(0, ADMIN_PAGE_SIZE),
-    total: Number(count || 0),
-    hasNext: offset + ADMIN_PAGE_SIZE < Number(count || 0)
+    rows: rowsResult.data || [],
+    total: Number(countResult.count || 0),
+    hasNext: offset + ADMIN_PAGE_SIZE < Number(countResult.count || 0)
   };
 }
 
@@ -4029,7 +4050,7 @@ bot.command("start", async ctx => {
     flows.delete(userKey);
 
     const text = dashboardText(ctx, stats, "", adminRow.role);
-    const menu = adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu();
+    const menu = adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu(adminRow);
     const rendered = await renderStart(ctx, text, menu);
 
     // Remove the "/start" command itself so the chat only keeps the dashboard.
@@ -4057,7 +4078,7 @@ bot.callbackQuery("menu:dashboard", async ctx => {
     groups: 0
   }));
 
-  const menu = adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu();
+  const menu = adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu(adminRow);
   return renderStart(ctx, dashboardText(ctx, stats, "", adminRow.role), menu);
 });
 
@@ -4973,107 +4994,127 @@ bot.callbackQuery(/^history:list:(\d+):(\d+)$/, async ctx => {
 ========================================================= */
 
 bot.callbackQuery(/^admin:list:(\d+)$/, async ctx => {
-  const owner = await requireAdmin(ctx, { ownerOnly: true });
-  if (!owner) return;
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  if (!["OWNER", "ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow.role)) {
+    return ctx.answerCallbackQuery("Admin Anak tidak memiliki akses ke menu admin.", { show_alert: true });
+  }
 
   await ctx.answerCallbackQuery().catch(() => {});
-  const page = Number(ctx.match[1]);
+  const page = Math.max(0, Number(ctx.match[1]));
 
   try {
-    const result = await listAdmins(Math.max(0, page));
+    const result = await listAdmins(page, adminRow);
+    const title = adminRow.role === "OWNER" ? "DAFTAR ADMIN" : "DAFTAR ADMIN ANAK";
     const lines = [
-      "👥 <b>DAFTAR ADMIN</b>",
-      `Total aktif: <b>${result.total}</b>`,
-      `Halaman: <b>${Math.max(0, page) + 1}</b>`,
+      `👥 <b>${title}</b>`,
+      `Total terlihat: <b>${result.total}</b>`,
+      `Halaman: <b>${page + 1}</b>`,
       "",
       result.rows.length
-        ? result.rows.map((a, i) =>
-            `${String(Math.max(0, page) * ADMIN_PAGE_SIZE + i + 1).padStart(2, "0")}. ${a.role === "OWNER" ? "👑" : "👨‍💼"} <b>${escapeHtml(a.role)}</b>\n   🆔 <code>${escapeHtml(a.telegram_user_id)}</code>`
-          ).join("\n\n")
-        : "<i>Belum ada admin.</i>",
+        ? result.rows.map((a, i) => {
+            const icon = a.role === "OWNER" ? "👑" : a.role === "ADMIN_PREMIUM" ? "💎" : a.role === "ADMIN_VIP" ? "⭐" : "👤";
+            return `${String(page * ADMIN_PAGE_SIZE + i + 1).padStart(2, "0")}. ${icon} <b>${escapeHtml(a.role)}</b>\n   🆔 <code>${escapeHtml(a.telegram_user_id)}</code>`;
+          }).join("\n\n")
+        : "<i>Belum ada admin yang dapat dilihat.</i>",
       "",
-      "ADMIN UTAMA dapat menambah/menghapus admin anak."
+      adminRow.role === "OWNER"
+        ? "OWNER dapat mengelola Admin VIP dan Admin Premium."
+        : adminRow.role === "ADMIN_VIP"
+          ? "Admin VIP dapat mengelola maksimal 20 Admin Anak miliknya sendiri."
+          : "Admin Premium dapat mengelola Admin Anak miliknya sendiri tanpa batas."
     ].join("\n");
 
-    return replaceUi(
-      ctx,
-      lines,
-      adminListKeyboard(result.rows, Math.max(0, page), result.hasNext),
-      { parse_mode: "HTML" }
-    );
+    return replaceUi(ctx, lines, adminListKeyboard(result.rows, page, result.hasNext, adminRow), { parse_mode: "HTML" });
   } catch (e) {
-    return replaceUi(
-      ctx,
-      `❌ Gagal mengambil daftar admin.\n\n${escapeHtml(safeErrorMessage(e))}`,
-      backDashboardKeyboard(),
-      { parse_mode: "HTML" }
-    );
+    return replaceUi(ctx, `❌ Gagal mengambil daftar admin.\n\n${escapeHtml(safeErrorMessage(e))}`, backDashboardKeyboard(), { parse_mode: "HTML" });
   }
 });
 
 bot.callbackQuery("admin:add", async ctx => {
-  const owner = await requireAdmin(ctx, { ownerOnly: true });
-  if (!owner) return;
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
 
   await ctx.answerCallbackQuery().catch(() => {});
-  flows.set(String(ctx.from.id), {
-    t: "admin_add",
-    adminId: owner.id
-  });
 
-  return replaceUi(
-    ctx,
-    "➕ <b>TAMBAH ADMIN ANAK</b>\n\nKirim Telegram user ID admin baru.\n\nContoh: <code>7607446655</code>",
-    cancelKeyboard(true),
-    { parse_mode: "HTML" }
-  );
+  if (adminRow.role === "OWNER") {
+    return replaceUi(
+      ctx,
+      "➕ <b>TAMBAH ADMIN</b>\n\nPilih jenis admin yang akan disetujui:",
+      new InlineKeyboard()
+        .text("⭐ Admin VIP", "admin:add:vip")
+        .text("💎 Admin Premium", "admin:add:premium")
+        .row()
+        .text("⬅️ Admin", "admin:list:0"),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  if (!["ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow.role)) {
+    return ctx.answerCallbackQuery("Admin Anak tidak dapat menambah admin.", { show_alert: true });
+  }
+
+  const countResult = await sb.from("admins").select("id", { count: "exact", head: true })
+    .eq("parent_admin_id", adminRow.id).eq("active", true);
+  if (countResult.error) throw countResult.error;
+  if (adminRow.role === "ADMIN_VIP" && Number(countResult.count || 0) >= 20) {
+    return replaceUi(ctx, "⚠️ <b>Batas Admin VIP tercapai.</b>\n\nAdmin VIP maksimal memiliki 20 Admin Anak aktif.", new InlineKeyboard().text("⬅️ Admin Anak", "admin:list:0"), { parse_mode: "HTML" });
+  }
+
+  flows.set(String(ctx.from.id), { t: "admin_add", adminId: adminRow.id, adminRole: "ADMIN_ANAK" });
+  return replaceUi(ctx, "➕ <b>TAMBAH ADMIN ANAK</b>\n\nKirim Telegram user ID Admin Anak yang ingin kamu setujui.\n\nAdmin Anak ini hanya akan terlihat dan dikelola oleh kamu.", cancelKeyboard(false), { parse_mode: "HTML" });
+});
+
+bot.callbackQuery("admin:add:vip", async ctx => {
+  const owner = await requireAdmin(ctx, { ownerOnly: true });
+  if (!owner) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+  flows.set(String(ctx.from.id), { t: "admin_add", adminId: owner.id, adminRole: "ADMIN_VIP" });
+  return replaceUi(ctx, "⭐ <b>TAMBAH ADMIN VIP</b>\n\nKirim Telegram user ID Admin VIP yang ingin kamu setujui.", cancelKeyboard(true), { parse_mode: "HTML" });
+});
+
+bot.callbackQuery("admin:add:premium", async ctx => {
+  const owner = await requireAdmin(ctx, { ownerOnly: true });
+  if (!owner) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+  flows.set(String(ctx.from.id), { t: "admin_add", adminId: owner.id, adminRole: "ADMIN_PREMIUM" });
+  return replaceUi(ctx, "💎 <b>TAMBAH ADMIN PREMIUM</b>\n\nKirim Telegram user ID Admin Premium yang ingin kamu setujui.", cancelKeyboard(true), { parse_mode: "HTML" });
 });
 
 bot.callbackQuery("admin:delete", async ctx => {
-  const owner = await requireAdmin(ctx, { ownerOnly: true });
-  if (!owner) return;
-
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  if (!["OWNER", "ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow.role)) {
+    return ctx.answerCallbackQuery("Admin Anak tidak dapat memutus admin.", { show_alert: true });
+  }
   await ctx.answerCallbackQuery().catch(() => {});
-  flows.set(String(ctx.from.id), {
-    t: "admin_delete",
-    adminId: owner.id
-  });
-
-  return replaceUi(
-    ctx,
-    "❌ <b>HAPUS ADMIN ANAK</b>\n\nKirim Telegram user ID admin anak yang akan dihapus.\n\nOwner/ADMIN UTAMA tidak dapat dihapus.",
-    cancelKeyboard(true),
-    { parse_mode: "HTML" }
-  );
+  flows.set(String(ctx.from.id), { t: "admin_delete", adminId: adminRow.id });
+  return replaceUi(ctx,
+    adminRow.role === "OWNER"
+      ? "❌ <b>PUTUS ADMIN</b>\n\nKirim Telegram user ID Admin VIP atau Admin Premium yang akan diputus."
+      : "❌ <b>PUTUS ADMIN ANAK</b>\n\nKirim Telegram user ID Admin Anak yang kamu setujui sebelumnya.",
+    cancelKeyboard(adminRow.role === "OWNER"), { parse_mode: "HTML" });
 });
 
 bot.callbackQuery(/^admin:view:(\d+)$/, async ctx => {
-  const owner = await requireAdmin(ctx, { ownerOnly: true });
-  if (!owner) return;
-
+  const viewer = await requireAdmin(ctx);
+  if (!viewer) return;
+  if (!["OWNER", "ADMIN_VIP", "ADMIN_PREMIUM"].includes(viewer.role)) return;
   await ctx.answerCallbackQuery().catch(() => {});
-  const adminId = String(ctx.match[1]);
+  const adminId = Number(ctx.match[1]);
 
-  const { data, error } = await sb
-    .from("admins")
-    .select("*")
-    .eq("id", adminId)
-    .maybeSingle();
+  const { data, error } = await sb.from("admins").select("*").eq("id", adminId).eq("active", true).maybeSingle();
+  if (error || !data) return replaceUi(ctx, "❌ Admin tidak ditemukan.", new InlineKeyboard().text("◀️ Admin", "admin:list:0"), { parse_mode: "HTML" });
 
-  if (error || !data) {
-    return replaceUi(ctx, "❌ Admin tidak ditemukan.", new InlineKeyboard().text("◀️ Admin", "admin:list:0"), { parse_mode: "HTML" });
-  }
+  const visible = viewer.role === "OWNER" || data.id === viewer.id || (data.parent_admin_id && data.parent_admin_id === viewer.id);
+  if (!visible) return ctx.answerCallbackQuery("Admin ini bukan bagian dari hierarki kamu.", { show_alert: true });
 
-  return replaceUi(
-    ctx,
-    `👨‍💼 <b>DETAIL ADMIN</b>\n\n` +
-      `Role: <b>${escapeHtml(data.role)}</b>\n` +
-      `Telegram ID: <code>${escapeHtml(data.telegram_user_id)}</code>\n` +
-      `Username: ${escapeHtml(data.username ? `@${data.username}` : "-")}\n` +
-      `Status: <b>${data.active ? "active" : "disabled"}</b>`,
-    new InlineKeyboard().text("◀️ Admin", "admin:list:0").text("🏠", "menu:dashboard"),
-    { parse_mode: "HTML" }
-  );
+  const icon = data.role === "OWNER" ? "👑" : data.role === "ADMIN_PREMIUM" ? "💎" : data.role === "ADMIN_VIP" ? "⭐" : "👤";
+  const parentText = data.parent_admin_id ? `<code>${escapeHtml(data.parent_admin_id)}</code>` : "-";
+  return replaceUi(ctx,
+    `${icon} <b>DETAIL ADMIN</b>\n\nRole: <b>${escapeHtml(data.role)}</b>\nTelegram ID: <code>${escapeHtml(data.telegram_user_id)}</code>\nUsername: ${escapeHtml(data.username ? `@${data.username}` : "-")}\nStatus: <b>${data.active ? "active" : "disabled"}</b>\nParent Admin: ${parentText}`,
+    new InlineKeyboard().text("◀️ Admin", "admin:list:0").text("🏠", "menu:dashboard"), { parse_mode: "HTML" });
 });
 
 /* =========================================================
@@ -5437,173 +5478,128 @@ bot.on("message", async (ctx, next) => {
     }
 
     /* -------------------------
-       ADMIN ADD
+       ADMIN ADD / APPROVE
     -------------------------- */
     if (flow.t === "admin_add") {
-      if (adminRow.role !== "OWNER") {
+      const allowedRoles = ["OWNER", "ADMIN_VIP", "ADMIN_PREMIUM"];
+      if (!allowedRoles.includes(adminRow.role)) {
         flows.delete(userKey);
-        return renderUi(
-          telegramUserId,
-          "⛔ Akses ditolak.",
-          backDashboardKeyboard(),
-          { parse_mode: "HTML" }
-        );
+        return renderUi(telegramUserId, "⛔ Akses ditolak.", backDashboardKeyboard(), { parse_mode: "HTML" });
       }
 
       const targetId = parsePositiveTelegramId(ctx.message.text);
       if (!targetId) {
-        return renderUi(
-          telegramUserId,
-          "❌ Telegram ID harus berupa angka positif.",
-          cancelKeyboard(true),
-          { parse_mode: "HTML" }
-        );
+        return renderUi(telegramUserId, "❌ Telegram ID harus berupa angka positif.", cancelKeyboard(adminRow.role === "OWNER"), { parse_mode: "HTML" });
+      }
+      if (targetId === Number(adminRow.telegram_user_id)) {
+        return renderUi(telegramUserId, "❌ Kamu tidak dapat menambahkan diri sendiri.", cancelKeyboard(adminRow.role === "OWNER"), { parse_mode: "HTML" });
       }
 
-      const existing = await sb
-        .from("admins")
-        .select("*")
-        .eq("telegram_user_id", targetId)
-        .maybeSingle();
+      const role = flow.adminRole || (adminRow.role === "OWNER" ? "ADMIN_VIP" : "ADMIN_ANAK");
+      if (adminRow.role === "OWNER" && !["ADMIN_VIP", "ADMIN_PREMIUM"].includes(role)) {
+        return renderUi(telegramUserId, "❌ Role admin tidak valid.", cancelKeyboard(true), { parse_mode: "HTML" });
+      }
+      if (adminRow.role !== "OWNER" && role !== "ADMIN_ANAK") {
+        return renderUi(telegramUserId, "⛔ Admin VIP/Premium hanya dapat menambah Admin Anak.", cancelKeyboard(false), { parse_mode: "HTML" });
+      }
 
+      if (role === "ADMIN_ANAK") {
+        const countResult = await sb.from("admins").select("id", { count: "exact", head: true })
+          .eq("parent_admin_id", adminRow.id).eq("active", true);
+        if (countResult.error) throw countResult.error;
+        if (adminRow.role === "ADMIN_VIP" && Number(countResult.count || 0) >= 20) {
+          return replaceUi(ctx, "⚠️ <b>Batas Admin VIP tercapai.</b>\n\nAdmin VIP maksimal memiliki 20 Admin Anak aktif.", new InlineKeyboard().text("⬅️ Admin Anak", "admin:list:0"), { parse_mode: "HTML" });
+        }
+      }
+
+      const existing = await sb.from("admins").select("*").eq("telegram_user_id", targetId).maybeSingle();
       if (existing.error) throw existing.error;
 
       if (existing.data) {
         if (existing.data.active) {
-          flows.delete(userKey);
-          return replaceUi(
-            ctx,
-            `ℹ️ Telegram ID <code>${targetId}</code> sudah terdaftar sebagai <b>${escapeHtml(existing.data.role)}</b>.`,
-            new InlineKeyboard().text("👥 Admin", "admin:list:0"),
-            { parse_mode: "HTML" }
-          );
+          return replaceUi(ctx, `ℹ️ Telegram ID <code>${targetId}</code> sudah terdaftar sebagai <b>${escapeHtml(existing.data.role)}</b>.`, new InlineKeyboard().text("👥 Admin", "admin:list:0"), { parse_mode: "HTML" });
         }
 
-        const { error } = await sb
-          .from("admins")
-          .update({ role: "ADMIN", active: true })
-          .eq("id", existing.data.id);
+        // A previously disconnected admin may be approved again by its new parent.
+        const { error } = await sb.from("admins").update({
+          role,
+          active: true,
+          parent_admin_id: role === "ADMIN_ANAK" ? adminRow.id : null,
+          updated_at: new Date().toISOString()
+        }).eq("id", existing.data.id);
         if (error) throw error;
       } else {
-        const { error } = await sb
-          .from("admins")
-          .insert({
-            telegram_user_id: targetId,
-            role: "ADMIN",
-            active: true
-          });
+        const { error } = await sb.from("admins").insert({
+          telegram_user_id: targetId,
+          role,
+          active: true,
+          parent_admin_id: role === "ADMIN_ANAK" ? adminRow.id : null
+        });
         if (error) throw error;
       }
 
       flows.delete(userKey);
-      return replaceUi(
-        ctx,
-        `✅ <b>ADMIN ANAK DITAMBAHKAN</b>\n\nTelegram ID <code>${targetId}</code> sekarang dapat mengelola akun Telegram dan promosi.\n\nMenu manajemen admin tetap hanya tersedia untuk OWNER.`,
+      const roleLabel = role === "ADMIN_PREMIUM" ? "ADMIN PREMIUM" : role === "ADMIN_VIP" ? "ADMIN VIP" : "ADMIN ANAK";
+      return replaceUi(ctx,
+        `✅ <b>${roleLabel} DITAMBAHKAN</b>\n\nTelegram ID <code>${targetId}</code> sekarang aktif.\n${role === "ADMIN_ANAK" ? "Admin Anak ini hanya berada di bawah akun kamu." : "Admin ini berada di bawah OWNER."}`,
         new InlineKeyboard().text("👥 Daftar Admin", "admin:list:0").row().text("🏠 Dashboard", "menu:dashboard"),
-        { parse_mode: "HTML" }
-      );
+        { parse_mode: "HTML" });
     }
 
     /* -------------------------
-       ADMIN DELETE
+       ADMIN DISCONNECT / REMOVE
     -------------------------- */
     if (flow.t === "admin_delete") {
-      if (adminRow.role !== "OWNER") {
+      if (!["OWNER", "ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow.role)) {
         flows.delete(userKey);
-        return renderUi(
-          telegramUserId,
-          "⛔ Akses ditolak.",
-          backDashboardKeyboard(),
-          { parse_mode: "HTML" }
-        );
+        return renderUi(telegramUserId, "⛔ Akses ditolak.", backDashboardKeyboard(), { parse_mode: "HTML" });
       }
 
       const targetId = parsePositiveTelegramId(ctx.message.text);
-      if (!targetId) {
-        return renderUi(
-          telegramUserId,
-          "❌ Telegram ID harus berupa angka positif.",
-          cancelKeyboard(true)
-        );
-      }
+      if (!targetId) return renderUi(telegramUserId, "❌ Telegram ID harus berupa angka positif.", cancelKeyboard(adminRow.role === "OWNER"), { parse_mode: "HTML" });
+      if (isOwnerId(targetId)) return renderUi(telegramUserId, "⛔ OWNER tidak dapat diputus.", cancelKeyboard(true), { parse_mode: "HTML" });
 
-      if (isOwnerId(targetId)) {
-        return renderUi(
-          telegramUserId,
-          "⛔ Telegram ID OWNER dari ENV tidak dapat dihapus dari sistem.",
-          cancelKeyboard(true),
-          { parse_mode: "HTML" }
-        );
-      }
-
-      const existing = await sb
-        .from("admins")
-        .select("*")
-        .eq("telegram_user_id", targetId)
-        .maybeSingle();
-
+      const existing = await sb.from("admins").select("*").eq("telegram_user_id", targetId).maybeSingle();
       if (existing.error) throw existing.error;
-
-      if (!existing.data || existing.data.role !== "ADMIN") {
+      if (!existing.data || !existing.data.active) {
         flows.delete(userKey);
-        return replaceUi(
-          ctx,
-          `❌ Admin anak dengan Telegram ID <code>${targetId}</code> tidak ditemukan.`,
-          new InlineKeyboard().text("👥 Admin", "admin:list:0"),
-          { parse_mode: "HTML" }
-        );
+        return replaceUi(ctx, `❌ Admin dengan Telegram ID <code>${targetId}</code> tidak ditemukan atau sudah tidak aktif.`, new InlineKeyboard().text("👥 Admin", "admin:list:0"), { parse_mode: "HTML" });
       }
 
-      const ownerResult = await sb
-        .from("admins")
-        .select("id,telegram_user_id")
-        .eq("role", "OWNER")
-        .eq("active", true)
-        .order("id", { ascending: true })
-        .limit(1)
-        .maybeSingle();
+      const target = existing.data;
+      const canRemove = adminRow.role === "OWNER"
+        ? ["ADMIN_VIP", "ADMIN_PREMIUM"].includes(target.role)
+        : target.role === "ADMIN_ANAK" && Number(target.parent_admin_id) === Number(adminRow.id);
 
-      if (ownerResult.error) throw ownerResult.error;
-      const ownerTelegramUserId = ownerResult.data?.telegram_user_id;
-
-      if (!ownerTelegramUserId) {
-        throw new Error("ADMIN UTAMA aktif tidak ditemukan.");
+      if (!canRemove) {
+        return renderUi(telegramUserId, "⛔ Admin tersebut bukan bagian dari hierarki yang bisa kamu kelola.", cancelKeyboard(adminRow.role === "OWNER"), { parse_mode: "HTML" });
       }
 
-      // Preserve FK integrity: telegram_accounts.created_by points to
-      // admins.telegram_user_id, so reassign accounts before deleting admin.
-      const reassignAccounts = await sb
-        .from("telegram_accounts")
-        .update({ created_by: ownerTelegramUserId })
-        .eq("created_by", targetId);
-
-      if (reassignAccounts.error) throw reassignAccounts.error;
-
-      // Preserve audit history while removing the admin row referenced by
-      // promotion_history.admin_id.
-      const detachHistory = await sb
-        .from("promotion_history")
-        .update({ admin_id: ownerResult.data.id })
-        .eq("admin_id", existing.data.id);
-
-      if (detachHistory.error) throw detachHistory.error;
-
-      const { error } = await sb
-        .from("admins")
-        .delete()
-        .eq("id", existing.data.id)
-        .eq("role", "ADMIN");
-
+      // Disconnect access without deleting historical identity. Children remain stored,
+      // but inactive parent/children can no longer access the admin menu.
+      const { error } = await sb.from("admins").update({
+        active: false,
+        updated_at: new Date().toISOString()
+      }).eq("id", target.id);
       if (error) throw error;
 
+      // If a VIP/Premium is disconnected, disconnect its direct Admin Anak too so
+      // there is no orphaned active admin below a removed parent.
+      if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(target.role)) {
+        const { error: childError } = await sb.from("admins").update({
+          active: false,
+          updated_at: new Date().toISOString()
+        }).eq("parent_admin_id", target.id).eq("active", true);
+        if (childError) throw childError;
+      }
+
       flows.delete(userKey);
-      return replaceUi(
-        ctx,
-        `✅ Admin anak <code>${targetId}</code> telah dihapus.\n\nAkun Telegram dan promosi tidak ikut dihentikan karena admin hanya merupakan controller.`,
+      return replaceUi(ctx,
+        `✅ <b>ADMIN DIPUTUS</b>\n\nTelegram ID <code>${targetId}</code> (${escapeHtml(target.role)}) sudah dinonaktifkan.\n\nAkses admin dicabut tanpa menghapus data account/promosi yang sudah ada.`,
         new InlineKeyboard().text("👥 Daftar Admin", "admin:list:0").row().text("🏠 Dashboard", "menu:dashboard"),
-        { parse_mode: "HTML" }
-      );
+        { parse_mode: "HTML" });
     }
+
   } catch (e) {
     console.error("MESSAGE FLOW:", safeErrorMessage(e));
 
