@@ -5226,7 +5226,7 @@ function privatePromoUserId(user) {
   return id && /^\d+$/.test(id) ? id : null;
 }
 
-function isPrivatePromoExpectedSkipError(error) {
+function privatePromoErrorFingerprint(error) {
   const raw = String(
     error?.message ||
     error?.errorMessage ||
@@ -5238,27 +5238,76 @@ function isPrivatePromoExpectedSkipError(error) {
   const code = String(
     error?.errorMessage ||
     error?.rpcError ||
+    error?.code ||
     error?.constructor?.name ||
     ""
   ).toLowerCase();
 
-  const fingerprint = `${code} ${raw}`;
+  const combined = `${code} ${raw}`;
+  const normalized = combined.replace(/[^a-z0-9]+/g, "_");
+  const compact = normalized.replace(/_/g, "");
+  return { combined, normalized, compact };
+}
 
-  return (
-    fingerprint.includes("user_privacy_restricted") ||
-    fingerprint.includes("privacy_prevention") ||
-    fingerprint.includes("user_is_blocked") ||
-    fingerprint.includes("user_not_mutual_contact") ||
-    fingerprint.includes("peer_id_invalid") ||
-    fingerprint.includes("input_user_deactivated") ||
-    fingerprint.includes("user_id_invalid") ||
-    fingerprint.includes("user_not_found") ||
-    fingerprint.includes("chat_write_forbidden") ||
-    fingerprint.includes("chat_forbidden") ||
-    fingerprint.includes("user_banned_in_channel") ||
-    fingerprint.includes("recipient is not a member") ||
-    fingerprint.includes("cannot message")
+function privatePromoErrorCategory(error) {
+  const { combined, normalized, compact } = privatePromoErrorFingerprint(error);
+  const has = (...needles) => needles.some(n =>
+    normalized.includes(n) || compact.includes(n.replace(/_/g, "")) || combined.includes(n.replace(/_/g, " "))
   );
+
+  if (has(
+    "user_privacy_restricted",
+    "privacy_prevention",
+    "user_privacy_restricted_error",
+    "userprivacyrestrictederror",
+    "privacyrestrictederror"
+  )) return "Privasi user membatasi pesan";
+
+  if (has(
+    "user_not_mutual_contact",
+    "usernotmutualcontacterror",
+    "not_mutual_contact"
+  )) return "Bukan mutual contact";
+
+  if (has(
+    "user_is_blocked",
+    "userisblockederror",
+    "user_blocked",
+    "userblockederror"
+  )) return "User memblokir akun";
+
+  if (has(
+    "peer_id_invalid",
+    "peeridinvaliderror",
+    "input_user_invalid",
+    "inputuserinvaliderror",
+    "user_id_invalid",
+    "user_not_found"
+  )) return "User tidak dapat diakses";
+
+  if (has(
+    "input_user_deactivated",
+    "inputuserdeactivatederror",
+    "user_deactivated",
+    "userdeactivatederror",
+    "user_deleted"
+  )) return "Akun user sudah dihapus/nonaktif";
+
+  if (has(
+    "chat_write_forbidden",
+    "chat_forbidden",
+    "user_banned_in_channel",
+    "recipient_is_not_a_member",
+    "cannot_message",
+    "you_cant_write",
+    "you_cannot_write"
+  )) return "Telegram tidak mengizinkan pengiriman";
+
+  return null;
+}
+
+function isPrivatePromoExpectedSkipError(error) {
+  return Boolean(privatePromoErrorCategory(error));
 }
 
 function privatePromoErrorLabel(error) {
@@ -5270,9 +5319,8 @@ function privatePromoErrorLabel(error) {
     "Kesalahan tidak diketahui"
   ).replace(/\s+/g, " ").trim();
 
-  if (isPrivatePromoExpectedSkipError(error)) {
-    return "Tidak dapat menghubungi user / dibatasi privasi";
-  }
+  const category = privatePromoErrorCategory(error);
+  if (category) return category;
 
   if (/flood_wait|wait of\s+\d+\s*seconds?/i.test(raw)) {
     return "Telegram meminta jeda sebelum pengiriman berikutnya";
@@ -5365,6 +5413,23 @@ async function collectPrivatePromoTargets(client, sourceRows, userKey, onGroupPr
   return { targets, sourceFailures };
 }
 
+function bumpPrivatePromoReason(bucket, reason) {
+  if (!reason) return;
+  bucket[reason] = Number(bucket[reason] || 0) + 1;
+}
+
+function privatePromoReasonLines(title, bucket, limit = 5) {
+  const entries = Object.entries(bucket || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit);
+  if (!entries.length) return [];
+  return [
+    "",
+    `📋 <b>${title}</b>`,
+    ...entries.map(([reason, count]) => `• ${escapeHtml(reason)}: <b>${count}</b>`)
+  ];
+}
+
 async function runPrivatePromotion(userKey, accountId, groupRows, message, adminRow) {
   const state = privatePromotionRuns.get(userKey);
   if (!state) return;
@@ -5376,7 +5441,14 @@ async function runPrivatePromotion(userKey, accountId, groupRows, message, admin
   state.running = true;
   state.stopRequested = false;
   state.startedAt = Date.now();
-  state.stats = { total: 0, success: 0, failed: 0, skipped: 0 };
+  state.stats = {
+    total: 0,
+    success: 0,
+    failed: 0,
+    skipped: 0,
+    skipReasons: {},
+    failureReasons: {}
+  };
   state.sourceFailures = [];
 
   await renderUi(
@@ -5503,13 +5575,30 @@ async function runPrivatePromotion(userKey, accountId, groupRows, message, admin
             break;
           }
 
-          if (isPrivatePromoExpectedSkipError(retryError)) state.stats.skipped++;
-          else state.stats.failed++;
+          const retryCategory = privatePromoErrorCategory(retryError);
+          if (retryCategory) {
+            state.stats.skipped++;
+            bumpPrivatePromoReason(state.stats.skipReasons, retryCategory);
+          } else {
+            state.stats.failed++;
+            bumpPrivatePromoReason(
+              state.stats.failureReasons,
+              privatePromoErrorLabel(retryError)
+            );
+          }
         }
-      } else if (isPrivatePromoExpectedSkipError(error)) {
-        state.stats.skipped++;
       } else {
-        state.stats.failed++;
+        const category = privatePromoErrorCategory(error);
+        if (category) {
+          state.stats.skipped++;
+          bumpPrivatePromoReason(state.stats.skipReasons, category);
+        } else {
+          state.stats.failed++;
+          bumpPrivatePromoReason(
+            state.stats.failureReasons,
+            privatePromoErrorLabel(error)
+          );
+        }
       }
     }
 
@@ -5554,7 +5643,14 @@ async function renderPrivatePromoFinished(userKey, accountId, groupTitles, admin
   const state = privatePromotionRuns.get(userKey);
   if (!state) return;
 
-  const stats = state.stats || { total: 0, success: 0, failed: 0, skipped: 0 };
+  const stats = state.stats || {
+    total: 0,
+    success: 0,
+    failed: 0,
+    skipped: 0,
+    skipReasons: {},
+    failureReasons: {}
+  };
   const sourceFailures = Array.isArray(state.sourceFailures) ? state.sourceFailures : [];
 
   const lines = [
@@ -5570,6 +5666,9 @@ async function renderPrivatePromoFinished(userKey, accountId, groupTitles, admin
       ? groupTitles.map(title => `• ${escapeHtml(title)}`).join("\n")
       : "• -"
   ];
+
+  lines.push(...privatePromoReasonLines("Alasan Skip", stats.skipReasons));
+  lines.push(...privatePromoReasonLines("Alasan Gagal", stats.failureReasons));
 
   if (sourceFailures.length) {
     lines.push(
@@ -5601,6 +5700,8 @@ async function renderPrivatePromoFinished(userKey, accountId, groupTitles, admin
           success: stats.success,
           failed: stats.failed,
           skipped: stats.skipped,
+          skip_reasons: stats.skipReasons || {},
+          failure_reasons: stats.failureReasons || {},
           source_groups: groupTitles
         }
       });
