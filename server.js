@@ -114,6 +114,14 @@ const MAX_PROMOTION_REPORTS = 200;
 const groupSearches = new Map();
 const MAX_GROUP_SEARCHES = 100;
 
+// Private-promotion runtime state. This feature is intentionally kept in memory
+// so it does not require any database/schema change and never touches the
+// existing scheduler/session state.
+const privatePromotionRuns = new Map();
+const PRIVATE_PROMO_PAGE_SIZE = 8;
+const PRIVATE_PROMO_DELAY_MS = 5000;
+const PRIVATE_PROMO_MAX_FLOOD_WAIT_MS = 15 * 60 * 1000;
+
 const ACCOUNT_PAGE_SIZE = 8;
 const HISTORY_PAGE_SIZE = 8;
 const GROUP_PAGE_SIZE = 8;
@@ -694,7 +702,9 @@ function ownerDashboardMenu() {
     .text("👥 Admin", "admin:list:0")
     .text("📊 Refresh", "menu:dashboard")
     .row()
-    .text("➕ Tambah Akun", "account:add");
+    .text("➕ Tambah Akun", "account:add")
+    .row()
+    .text("📢 Promosi Chat Privat", "privatepromo:accounts:0");
 }
 
 function adminDashboardMenu(adminRow = null) {
@@ -710,7 +720,8 @@ function adminDashboardMenu(adminRow = null) {
     kb.text("📊 Refresh", "menu:dashboard").row();
   }
 
-  kb.text("➕ Tambah Akun", "account:add");
+  kb.text("➕ Tambah Akun", "account:add").row();
+  kb.text("📢 Promosi Chat Privat", "privatepromo:accounts:0");
   return kb;
 }
 
@@ -5011,6 +5022,875 @@ bot.callbackQuery(/^group:remove:(\d+)$/, async ctx => {
   return renderGroupPageDirect(ctx, group.account_id, 0, `🗑 <b>${escapeHtml(group.title)}</b> dihapus dari daftar target.`);
 });
 
+
+/* =========================================================
+   PRIVATE CHAT PROMOTION
+   Uses the already-connected GramJS user account. No database/schema
+   changes are required. This feature has its own runtime state so the
+   existing group-promotion scheduler/session system remains untouched.
+========================================================= */
+
+function privatePromoAccountKeyboard(accounts, page, hasNext) {
+  const kb = new InlineKeyboard();
+
+  for (const account of accounts) {
+    kb
+      .text(
+        `${accountStatusIcon(account)} ${safeButtonText(account.label, 28)}`,
+        `privatepromo:account:${account.id}`
+      )
+      .row();
+  }
+
+  if (page > 0) kb.text("◀️", `privatepromo:accounts:${page - 1}`);
+  kb.text("🏠", "menu:dashboard");
+  if (hasNext) kb.text("▶️", `privatepromo:accounts:${page + 1}`);
+  kb.row();
+
+  return kb;
+}
+
+async function listConnectedPrivatePromoAccounts(page = 0, adminRow = null) {
+  const offset = Math.max(0, Number(page) || 0) * PRIVATE_PROMO_PAGE_SIZE;
+  let query = sb
+    .from("telegram_accounts")
+    .select("*")
+    .eq("status", "connected")
+    .order("created_at", { ascending: false })
+    .range(offset, offset + PRIVATE_PROMO_PAGE_SIZE);
+
+  if (adminRow?.role !== "OWNER") {
+    query = query.eq("created_by", adminRow?.telegram_user_id);
+  }
+
+  const { data, error } = await query;
+  if (error) throw error;
+
+  let countQuery = sb
+    .from("telegram_accounts")
+    .select("id", { count: "exact", head: true })
+    .eq("status", "connected");
+
+  if (adminRow?.role !== "OWNER") {
+    countQuery = countQuery.eq("created_by", adminRow?.telegram_user_id);
+  }
+
+  const countResult = await countQuery;
+  if (countResult.error) throw countResult.error;
+
+  const rows = (data || []).slice(0, PRIVATE_PROMO_PAGE_SIZE);
+  const total = Number(countResult.count || 0);
+
+  return {
+    rows,
+    total,
+    page: Math.max(0, Number(page) || 0),
+    hasNext: offset + PRIVATE_PROMO_PAGE_SIZE < total
+  };
+}
+
+async function getPrivatePromoSourceGroups(accountId) {
+  const { data, error } = await sb
+    .from("account_groups")
+    .select("*")
+    .eq("account_id", accountId)
+    .order("title", { ascending: true });
+
+  if (error) throw error;
+  return data || [];
+}
+
+function privatePromoGroupsKeyboard(rows, selectedIds, page = 0) {
+  const kb = new InlineKeyboard();
+  const selected = selectedIds instanceof Set ? selectedIds : new Set(selectedIds || []);
+
+  for (const row of rows) {
+    const id = String(row.id);
+    const icon = selected.has(id) ? "☑️" : "⬜";
+    kb
+      .text(
+        `${icon} ${safeButtonText(row.title, 30)}`,
+        `privatepromo:group:${id}:${page}`
+      )
+      .row();
+  }
+
+  const hasPrev = page > 0;
+  const hasNext = (page + 1) * PRIVATE_PROMO_PAGE_SIZE < rows._privatePromoTotal;
+
+  if (hasPrev) kb.text("◀️", `privatepromo:groups:${page - 1}`);
+  kb.text("🏠", "menu:dashboard");
+  if (hasNext) kb.text("▶️", `privatepromo:groups:${page + 1}`);
+  kb.row();
+
+  kb.text("✅ Lanjut", "privatepromo:groups:continue").row();
+  kb.text("🔄 Deteksi Grup", "privatepromo:groups:refresh").row();
+  kb.text("❌ Batal", "privatepromo:cancel");
+
+  return kb;
+}
+
+async function renderPrivatePromoGroups(ctx, page = 0, notice = "") {
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+
+  if (!state?.accountId) {
+    return replaceUi(
+      ctx,
+      "⚠️ <b>Sesi Promosi Chat Privat tidak tersedia.</b>",
+      new InlineKeyboard().text("📢 Promosi Chat Privat", "privatepromo:accounts:0").row()
+        .text("🏠 Menu Utama", "menu:dashboard"),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  const account = await getAccount(state.accountId);
+  if (!account) {
+    privatePromotionRuns.delete(userKey);
+    return replaceUi(
+      ctx,
+      "❌ Akun Telegram tidak ditemukan.",
+      backDashboardKeyboard(),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  let rows = await getPrivatePromoSourceGroups(state.accountId);
+  const total = rows.length;
+  const maxPage = Math.max(0, Math.ceil(total / PRIVATE_PROMO_PAGE_SIZE) - 1);
+  const safePage = Math.min(Math.max(0, Number(page) || 0), maxPage);
+  const start = safePage * PRIVATE_PROMO_PAGE_SIZE;
+  const visible = rows.slice(start, start + PRIVATE_PROMO_PAGE_SIZE);
+
+  // Keep total attached only to this local array instance for keyboard pagination.
+  visible._privatePromoTotal = total;
+
+  const selectedCount = state.selectedGroupIds?.size || 0;
+  const text = [
+    notice,
+    "📢 <b>PROMOSI CHAT PRIVAT</b>",
+    "━━━━━━━━━━━━━━━━━━",
+    `📱 Akun pengirim: <b>${escapeHtml(account.label)}</b>`,
+    `👥 Grup tersedia: <b>${total}</b>`,
+    `☑️ Grup dipilih: <b>${selectedCount}</b>`,
+    "",
+    visible.length
+      ? visible.map(row => {
+          const icon = state.selectedGroupIds.has(String(row.id)) ? "☑️" : "⬜";
+          return `${icon} <b>${escapeHtml(row.title || "Tanpa Nama")}</b>`;
+        }).join("\n")
+      : "<i>Belum ada grup yang terdeteksi untuk akun ini.</i>",
+    "",
+    "Pilih satu atau beberapa grup sumber member, lalu tekan <b>✅ Lanjut</b>."
+  ].filter(Boolean).join("\n");
+
+  return replaceUi(
+    ctx,
+    text,
+    privatePromoGroupsKeyboard(visible, state.selectedGroupIds, safePage),
+    { parse_mode: "HTML" }
+  );
+}
+
+async function resolvePrivatePromoSourceEntities(client, groupRows) {
+  const wanted = new Set(
+    (groupRows || []).map(row => String(row.telegram_group_id || "")).filter(Boolean)
+  );
+  const found = new Map();
+
+  for await (const dialog of client.iterDialogs({})) {
+    const entity = dialog?.entity;
+    if (!entity) continue;
+
+    const isGroup = Boolean(dialog.isGroup);
+    const isChannel = Boolean(dialog.isChannel);
+    if (!isGroup && !isChannel) continue;
+
+    const telegramId = String(entity.id?.value ?? entity.id ?? "");
+    if (telegramId && wanted.has(telegramId)) {
+      found.set(telegramId, {
+        entity,
+        title: dialog.title || entity.title || "Tanpa Nama"
+      });
+    }
+
+    if (found.size >= wanted.size) break;
+  }
+
+  return found;
+}
+
+function privatePromoUserId(user) {
+  const raw = user?.id?.value ?? user?.id ?? null;
+  const id = raw == null ? null : String(raw);
+  return id && /^\d+$/.test(id) ? id : null;
+}
+
+function isPrivatePromoExpectedSkipError(error) {
+  const raw = String(
+    error?.message ||
+    error?.errorMessage ||
+    error?.rpcError ||
+    error ||
+    ""
+  ).toLowerCase();
+
+  const code = String(
+    error?.errorMessage ||
+    error?.rpcError ||
+    error?.constructor?.name ||
+    ""
+  ).toLowerCase();
+
+  const fingerprint = `${code} ${raw}`;
+
+  return (
+    fingerprint.includes("user_privacy_restricted") ||
+    fingerprint.includes("privacy_prevention") ||
+    fingerprint.includes("user_is_blocked") ||
+    fingerprint.includes("user_not_mutual_contact") ||
+    fingerprint.includes("peer_id_invalid") ||
+    fingerprint.includes("input_user_deactivated") ||
+    fingerprint.includes("user_id_invalid") ||
+    fingerprint.includes("user_not_found") ||
+    fingerprint.includes("chat_write_forbidden") ||
+    fingerprint.includes("chat_forbidden") ||
+    fingerprint.includes("user_banned_in_channel") ||
+    fingerprint.includes("recipient is not a member") ||
+    fingerprint.includes("cannot message")
+  );
+}
+
+function privatePromoErrorLabel(error) {
+  const raw = String(
+    error?.message ||
+    error?.errorMessage ||
+    error?.rpcError ||
+    error ||
+    "Kesalahan tidak diketahui"
+  ).replace(/\s+/g, " ").trim();
+
+  if (isPrivatePromoExpectedSkipError(error)) {
+    return "Tidak dapat menghubungi user / dibatasi privasi";
+  }
+
+  if (/flood_wait|wait of\s+\d+\s*seconds?/i.test(raw)) {
+    return "Telegram meminta jeda sebelum pengiriman berikutnya";
+  }
+
+  return truncateText(raw, 180);
+}
+
+function privatePromoStopKeyboard() {
+  return new InlineKeyboard()
+    .text("🛑 Stop Promosi", "privatepromo:stop");
+}
+
+function sleepMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+async function sleepPrivatePromoWithStop(userKey, ms) {
+  let remaining = Math.max(0, Number(ms) || 0);
+
+  while (remaining > 0) {
+    const state = privatePromotionRuns.get(userKey);
+    if (!state || state.stopRequested) return false;
+
+    const step = Math.min(1000, remaining);
+    await sleepMs(step);
+    remaining -= step;
+  }
+
+  return true;
+}
+
+async function collectPrivatePromoTargets(client, sourceRows, userKey, onGroupProgress) {
+  const entities = await resolvePrivatePromoSourceEntities(client, sourceRows);
+  const targets = new Map();
+  const sourceFailures = [];
+  let selfId = null;
+
+  try {
+    const me = await client.getMe();
+    selfId = privatePromoUserId(me);
+  } catch (_) {}
+
+  for (const row of sourceRows) {
+    if (privatePromotionRuns.get(userKey)?.stopRequested) break;
+
+    const source = entities.get(String(row.telegram_group_id || ""));
+    if (!source?.entity) {
+      sourceFailures.push({
+        title: row.title || "Tanpa Nama",
+        reason: "Akun tidak memiliki akses ke grup sumber"
+      });
+      continue;
+    }
+
+    try {
+      let groupCount = 0;
+
+      for await (const user of client.iterParticipants(source.entity)) {
+        if (privatePromotionRuns.get(userKey)?.stopRequested) break;
+
+        const userId = privatePromoUserId(user);
+        if (!userId) continue;
+
+        // Never target bots, deleted accounts, or the sender account itself.
+        if (user?.bot === true || user?.deleted === true) continue;
+        if (selfId && userId === selfId) continue;
+
+        if (!targets.has(userId)) {
+          targets.set(userId, user);
+          groupCount++;
+        }
+      }
+
+      if (typeof onGroupProgress === "function") {
+        await onGroupProgress(row, groupCount, targets.size);
+      }
+    } catch (error) {
+      sourceFailures.push({
+        title: row.title || "Tanpa Nama",
+        reason: privatePromoErrorLabel(error)
+      });
+
+      if (typeof onGroupProgress === "function") {
+        await onGroupProgress(row, 0, targets.size, error);
+      }
+    }
+  }
+
+  return { targets, sourceFailures };
+}
+
+async function runPrivatePromotion(userKey, accountId, groupRows, message, adminRow) {
+  const state = privatePromotionRuns.get(userKey);
+  if (!state) return;
+
+  const client = await clientFor(accountId);
+  if (!client) throw new Error("Session akun Telegram tidak tersedia atau sudah tidak terhubung.");
+
+  const groupTitles = groupRows.map(x => x.title || "Tanpa Nama");
+  state.running = true;
+  state.stopRequested = false;
+  state.startedAt = Date.now();
+  state.stats = { total: 0, success: 0, failed: 0, skipped: 0 };
+  state.sourceFailures = [];
+
+  await renderUi(
+    userKey,
+    [
+      "📢 <b>Promosi Chat Privat</b>",
+      "",
+      "⏳ Mengambil member dari grup sumber...",
+      `👥 Grup sumber: <b>${groupRows.length}</b>`,
+      `📚 ${escapeHtml(groupTitles.join(", "))}`,
+      "",
+      "Tunggu sampai daftar target selesai dikumpulkan."
+    ].join("\n"),
+    privatePromoStopKeyboard(),
+    { parse_mode: "HTML" }
+  );
+
+  const collected = await collectPrivatePromoTargets(
+    client,
+    groupRows,
+    userKey,
+    async (row, added, total) => {
+      await renderUi(
+        userKey,
+        [
+          "📢 <b>Promosi Chat Privat</b>",
+          "",
+          `📚 Membaca: <b>${escapeHtml(row.title || "Tanpa Nama")}</b>`,
+          `👥 Target unik sementara: <b>${total}</b>`,
+          `➕ Member baru dari grup ini: <b>${added}</b>`,
+          "",
+          "⏳ Pengumpulan target masih berjalan..."
+        ].join("\n"),
+        privatePromoStopKeyboard(),
+        { parse_mode: "HTML" }
+      ).catch(() => {});
+    }
+  );
+
+  state.sourceFailures = collected.sourceFailures;
+  const targets = Array.from(collected.targets.entries());
+  state.stats.total = targets.length;
+
+  if (state.stopRequested) {
+    state.running = false;
+    return renderPrivatePromoFinished(userKey, accountId, groupTitles, adminRow, true);
+  }
+
+  if (!targets.length) {
+    state.running = false;
+    return renderPrivatePromoFinished(userKey, accountId, groupTitles, adminRow, false);
+  }
+
+  await renderUi(
+    userKey,
+    [
+      "📢 <b>Promosi Chat Privat</b>",
+      "",
+      `👥 Target: <b>0/${targets.length}</b>`,
+      "✅ Berhasil: <b>0</b>",
+      "❌ Gagal: <b>0</b>",
+      "⏭️ Skip: <b>0</b>",
+      "",
+      "▶️ Pengiriman dimulai..."
+    ].join("\n"),
+    privatePromoStopKeyboard(),
+    { parse_mode: "HTML" }
+  );
+
+  for (let index = 0; index < targets.length; index++) {
+    const currentState = privatePromotionRuns.get(userKey);
+    if (!currentState || currentState.stopRequested) break;
+
+    const [, user] = targets[index];
+    const targetNumber = index + 1;
+
+    try {
+      await client.sendMessage(user, { message: cleanText(message) });
+      state.stats.success++;
+    } catch (error) {
+      const floodWaitMs = extractFloodWaitMs(error);
+
+      if (floodWaitMs > 0) {
+        if (floodWaitMs > PRIVATE_PROMO_MAX_FLOOD_WAIT_MS) {
+          state.sourceFailures.push({
+            title: "Telegram rate limit",
+            reason: `Pengiriman dihentikan. Telegram meminta menunggu ${Math.ceil(floodWaitMs / 1000)} detik.`
+          });
+          state.stopRequested = true;
+          break;
+        }
+
+        await renderUi(
+          userKey,
+          [
+            "📢 <b>Promosi Chat Privat</b>",
+            "",
+            `👤 Target: <b>${targetNumber}/${targets.length}</b>`,
+            `✅ Berhasil: <b>${state.stats.success}</b>`,
+            `❌ Gagal: <b>${state.stats.failed}</b>`,
+            `⏭️ Skip: <b>${state.stats.skipped}</b>`,
+            "",
+            `⏸️ Telegram meminta tunggu <b>${Math.ceil(floodWaitMs / 1000)} detik</b>.`,
+            "Mengikuti batas Telegram dan tidak mencoba melewatinya."
+          ].join("\n"),
+          privatePromoStopKeyboard(),
+          { parse_mode: "HTML" }
+        ).catch(() => {});
+
+        const waited = await sleepPrivatePromoWithStop(userKey, floodWaitMs);
+        if (!waited) break;
+
+        // Retry this same target once after the exact Telegram wait.
+        try {
+          await client.sendMessage(user, { message: cleanText(message) });
+          state.stats.success++;
+        } catch (retryError) {
+          if (extractFloodWaitMs(retryError) > 0) {
+            state.sourceFailures.push({
+              title: "Telegram rate limit",
+              reason: "Pengiriman dihentikan karena Telegram kembali memberikan rate limit."
+            });
+            state.stopRequested = true;
+            break;
+          }
+
+          if (isPrivatePromoExpectedSkipError(retryError)) state.stats.skipped++;
+          else state.stats.failed++;
+        }
+      } else if (isPrivatePromoExpectedSkipError(error)) {
+        state.stats.skipped++;
+      } else {
+        state.stats.failed++;
+      }
+    }
+
+    const after = privatePromotionRuns.get(userKey);
+    if (!after || after.stopRequested) break;
+
+    await renderUi(
+      userKey,
+      [
+        "📢 <b>Promosi Chat Privat</b>",
+        "",
+        `👤 Target: <b>${targetNumber}/${targets.length}</b>`,
+        `✅ Berhasil: <b>${state.stats.success}</b>`,
+        `❌ Gagal: <b>${state.stats.failed}</b>`,
+        `⏭️ Skip: <b>${state.stats.skipped}</b>`,
+        "",
+        `📚 Grup sumber: <b>${groupRows.length}</b>`
+      ].join("\n"),
+      privatePromoStopKeyboard(),
+      { parse_mode: "HTML" }
+    ).catch(() => {});
+
+    // Deliberate, modest pacing between targets. This is not intended to
+    // bypass Telegram anti-spam controls.
+    if (targetNumber < targets.length) {
+      const continued = await sleepPrivatePromoWithStop(userKey, PRIVATE_PROMO_DELAY_MS);
+      if (!continued) break;
+    }
+  }
+
+  state.running = false;
+  return renderPrivatePromoFinished(
+    userKey,
+    accountId,
+    groupTitles,
+    adminRow,
+    Boolean(state.stopRequested)
+  );
+}
+
+async function renderPrivatePromoFinished(userKey, accountId, groupTitles, adminRow, stopped) {
+  const state = privatePromotionRuns.get(userKey);
+  if (!state) return;
+
+  const stats = state.stats || { total: 0, success: 0, failed: 0, skipped: 0 };
+  const sourceFailures = Array.isArray(state.sourceFailures) ? state.sourceFailures : [];
+
+  const lines = [
+    stopped ? "🛑 <b>PROMOSI CHAT PRIVAT DIHENTIKAN</b>" : "📊 <b>PROMOSI CHAT PRIVAT SELESAI</b>",
+    "",
+    `👥 Total Target: <b>${stats.total}</b>`,
+    `✅ Berhasil: <b>${stats.success}</b>`,
+    `❌ Gagal: <b>${stats.failed}</b>`,
+    `⏭️ Skip: <b>${stats.skipped}</b>`,
+    "",
+    `📚 Grup sumber: <b>${groupTitles.length}</b>`,
+    groupTitles.length
+      ? groupTitles.map(title => `• ${escapeHtml(title)}`).join("\n")
+      : "• -"
+  ];
+
+  if (sourceFailures.length) {
+    lines.push(
+      "",
+      `⚠️ <b>Catatan sumber/rate limit:</b> ${sourceFailures.length}`,
+      ...sourceFailures.slice(0, 5).map(item =>
+        `• ${escapeHtml(item.title)} — ${escapeHtml(item.reason)}`
+      )
+    );
+  }
+
+  await renderUi(
+    userKey,
+    lines.join("\n"),
+    new InlineKeyboard()
+      .text("📢 Promosi Lagi", "privatepromo:accounts:0")
+      .row()
+      .text("🏠 Menu Utama", "menu:dashboard"),
+    { parse_mode: "HTML" }
+  );
+
+  try {
+    if (accountId && adminRow?.id) {
+      await recordHistory(accountId, adminRow.id, {
+        action: "private_promotion",
+        status: stopped ? "stopped" : "success",
+        details: {
+          total_target: stats.total,
+          success: stats.success,
+          failed: stats.failed,
+          skipped: stats.skipped,
+          source_groups: groupTitles
+        }
+      });
+    }
+  } catch (error) {
+    console.warn("PRIVATE PROMOTION HISTORY:", safeErrorMessage(error, 300));
+  }
+
+  // Keep the completed result available briefly for the stop/status callbacks,
+  // then remove it without touching any account/session data.
+  setTimeout(() => {
+    const current = privatePromotionRuns.get(userKey);
+    if (current && !current.running) privatePromotionRuns.delete(userKey);
+  }, 10 * 60 * 1000);
+}
+
+/* -------------------------
+   PRIVATE PROMOTION MENU
+-------------------------- */
+
+bot.callbackQuery(/^privatepromo:accounts:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const page = Math.max(0, Number(ctx.match[1] || 0));
+
+  try {
+    const result = await listConnectedPrivatePromoAccounts(page, adminRow);
+    const lines = [
+      "📢 <b>PROMOSI CHAT PRIVAT</b>",
+      "━━━━━━━━━━━━━━━━━━",
+      "Pilih akun Telegram yang sudah terhubung. Pesan privat akan dikirim oleh <b>akun Telegram tersebut</b>, bukan bot.",
+      "",
+      `📱 Akun terhubung: <b>${result.total}</b>`,
+      result.rows.length
+        ? result.rows.map((account, i) =>
+            `${String(page * PRIVATE_PROMO_PAGE_SIZE + i + 1).padStart(2, "0")}. ${accountStatusIcon(account)} <b>${escapeHtml(account.label)}</b>\n   🆔 <code>${escapeHtml(account.telegram_user_id || "-")}</code>`
+          ).join("\n\n")
+        : "<i>Belum ada akun Telegram yang terhubung.</i>"
+    ].join("\n");
+
+    return replaceUi(
+      ctx,
+      lines,
+      privatePromoAccountKeyboard(result.rows, result.page, result.hasNext),
+      { parse_mode: "HTML" }
+    );
+  } catch (error) {
+    return replaceUi(
+      ctx,
+      `❌ Gagal mengambil akun terhubung.\n\n${escapeHtml(safeErrorMessage(error))}`,
+      backDashboardKeyboard(),
+      { parse_mode: "HTML" }
+    );
+  }
+});
+
+bot.callbackQuery(/^privatepromo:account:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  const account = await getAccountForAdmin(accountId, adminRow);
+
+  if (!account) {
+    return replaceUi(
+      ctx,
+      "❌ Akun Telegram tidak ditemukan atau bukan milik admin ini.",
+      new InlineKeyboard().text("⬅️ Akun", "privatepromo:accounts:0").row()
+        .text("🏠 Menu Utama", "menu:dashboard"),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  if (account.status !== "connected") {
+    return replaceUi(
+      ctx,
+      "⚠️ <b>Akun belum terhubung.</b>\n\nPilih akun Telegram yang statusnya terhubung.",
+      new InlineKeyboard().text("📱 Pilih Akun", "privatepromo:accounts:0"),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  const client = await clientFor(accountId);
+  if (!client) {
+    return replaceUi(
+      ctx,
+      "❌ Session akun Telegram tidak dapat digunakan. Hubungkan kembali akun tersebut dari menu Akun Telegram.",
+      new InlineKeyboard().text("📱 Pilih Akun", "privatepromo:accounts:0").row()
+        .text("🏠 Menu Utama", "menu:dashboard"),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  privatePromotionRuns.set(String(ctx.from.id), {
+    accountId,
+    adminId: adminRow.id,
+    selectedGroupIds: new Set(),
+    running: false,
+    stopRequested: false,
+    stats: { total: 0, success: 0, failed: 0, skipped: 0 },
+    sourceFailures: []
+  });
+
+  return renderPrivatePromoGroups(ctx, 0);
+});
+
+bot.callbackQuery(/^privatepromo:group:(\d+):(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+  if (!state || state.running) {
+    return ctx.answerCallbackQuery(
+      state?.running ? "Promosi sedang berjalan." : "Sesi promosi sudah tidak aktif.",
+      { show_alert: true }
+    );
+  }
+
+  const groupId = String(ctx.match[1]);
+  const page = Math.max(0, Number(ctx.match[2] || 0));
+  const { data: group, error } = await sb
+    .from("account_groups")
+    .select("*")
+    .eq("id", groupId)
+    .eq("account_id", state.accountId)
+    .maybeSingle();
+
+  if (error || !group) {
+    return ctx.answerCallbackQuery("Grup tidak ditemukan.", { show_alert: true });
+  }
+
+  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
+
+  if (!state.selectedGroupIds) state.selectedGroupIds = new Set();
+  if (state.selectedGroupIds.has(groupId)) state.selectedGroupIds.delete(groupId);
+  else state.selectedGroupIds.add(groupId);
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  return renderPrivatePromoGroups(ctx, page);
+});
+
+bot.callbackQuery(/^privatepromo:groups:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  const state = privatePromotionRuns.get(String(ctx.from.id));
+  if (!state || state.running) {
+    return ctx.answerCallbackQuery("Sesi promosi tidak aktif.", { show_alert: true });
+  }
+
+  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+  return renderPrivatePromoGroups(ctx, Math.max(0, Number(ctx.match[1] || 0)));
+});
+
+bot.callbackQuery("privatepromo:groups:continue", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+  if (!state || state.running) {
+    return ctx.answerCallbackQuery("Sesi promosi tidak aktif.", { show_alert: true });
+  }
+
+  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
+
+  const selectedIds = Array.from(state.selectedGroupIds || []);
+  if (!selectedIds.length) {
+    return ctx.answerCallbackQuery("Pilih minimal satu grup sumber.", { show_alert: true });
+  }
+
+  state.stage = "message";
+  state.selectedGroupIds = new Set(selectedIds);
+  flows.set(userKey, {
+    t: "private_promo_message",
+    accountId: state.accountId,
+    adminId: adminRow.id
+  });
+  await ctx.answerCallbackQuery().catch(() => {});
+
+  return replaceUi(
+    ctx,
+    [
+      "📢 <b>PROMOSI CHAT PRIVAT</b>",
+      "",
+      `☑️ Grup sumber dipilih: <b>${selectedIds.length}</b>`,
+      "",
+      "Kirim <b>pesan promosi</b> yang akan dikirim ke target.",
+      "",
+      "Setelah pesan diterima, sistem akan mengambil member dari grup yang dipilih, deduplicate berdasarkan Telegram user ID, lalu memproses target satu per satu.",
+      "",
+      "⚠️ Pengiriman tetap mengikuti pembatasan dan rate limit Telegram."
+    ].join("\n"),
+    new InlineKeyboard().text("❌ Batal", "privatepromo:cancel"),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery("privatepromo:groups:refresh", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  const state = privatePromotionRuns.get(String(ctx.from.id));
+  if (!state || state.running) {
+    return ctx.answerCallbackQuery("Sesi promosi tidak aktif.", { show_alert: true });
+  }
+
+  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+
+  try {
+    await withChatLoading(ctx, "Mendeteksi grup...", () => refreshGroups(state.accountId));
+    return renderPrivatePromoGroups(ctx, 0, "✅ Daftar grup berhasil diperbarui.");
+  } catch (error) {
+    return renderPrivatePromoGroups(
+      ctx,
+      0,
+      `⚠️ Deteksi ulang gagal: ${escapeHtml(safeErrorMessage(error, 300))}`
+    );
+  }
+});
+
+bot.callbackQuery("privatepromo:stop", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+  if (!state) {
+    return ctx.answerCallbackQuery("Tidak ada promosi yang sedang berjalan.", { show_alert: true });
+  }
+
+  await ctx.answerCallbackQuery("Permintaan stop diterima. Target yang sedang diproses akan diselesaikan jika memungkinkan.").catch(() => {});
+  state.stopRequested = true;
+
+  if (!state.running) {
+    return renderPrivatePromoFinished(
+      userKey,
+      state.accountId,
+      [],
+      adminRow,
+      true
+    );
+  }
+
+  return renderUi(
+    userKey,
+    [
+      "🛑 <b>STOP PROMOSI</b>",
+      "",
+      "Permintaan penghentian sudah diterima.",
+      "Proses akan berhenti dengan aman pada titik berikutnya."
+    ].join("\n"),
+    new InlineKeyboard(),
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.callbackQuery("privatepromo:cancel", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+
+  if (state?.running) {
+    state.stopRequested = true;
+    return ctx.answerCallbackQuery(
+      "Promosi sedang berjalan. Gunakan Stop Promosi untuk menghentikannya.",
+      { show_alert: true }
+    );
+  }
+
+  privatePromotionRuns.delete(userKey);
+  flows.delete(userKey);
+  await ctx.answerCallbackQuery("Dibatalkan").catch(() => {});
+
+  return replaceUi(
+    ctx,
+    "🏠 <b>Menu utama</b>",
+    adminRow.role === "OWNER" ? ownerDashboardMenu() : adminDashboardMenu(adminRow),
+    { parse_mode: "HTML" }
+  );
+});
+
 /* =========================================================
    HISTORY
 ========================================================= */
@@ -5417,6 +6297,126 @@ bot.on("message", async (ctx, next) => {
       } catch (e) {
         return replaceUi(ctx, `❌ Pencarian grup gagal.\n\n${escapeHtml(safeErrorMessage(e))}`, new InlineKeyboard().text("⬅️ Grup", `group:list:${flow.accountId}:0`), { parse_mode: "HTML" });
       }
+    }
+
+    /* -------------------------
+       PRIVATE PROMOTION: MESSAGE
+    -------------------------- */
+    if (flow.t === "private_promo_message") {
+      const state = privatePromotionRuns.get(userKey);
+
+      if (!state || state.running) {
+        flows.delete(userKey);
+        return renderUi(
+          telegramUserId,
+          "⚠️ Sesi Promosi Chat Privat sudah tidak tersedia atau sedang berjalan.",
+          backDashboardKeyboard(),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      if (!ctx.message.text) {
+        return renderUi(
+          telegramUserId,
+          "❌ Pesan promosi harus berupa teks.",
+          new InlineKeyboard().text("❌ Batal", "privatepromo:cancel"),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      const message = cleanText(String(ctx.message.text).trim());
+      if (!message) {
+        return renderUi(
+          telegramUserId,
+          "❌ Pesan promosi tidak boleh kosong.",
+          new InlineKeyboard().text("❌ Batal", "privatepromo:cancel"),
+          { parse_mode: "HTML" }
+        );
+      }
+
+      const selectedIds = Array.from(state.selectedGroupIds || []);
+      if (!selectedIds.length) {
+        flows.delete(userKey);
+        return renderPrivatePromoGroups(
+          ctx,
+          0,
+          "❌ Tidak ada grup sumber yang dipilih."
+        );
+      }
+
+      const { data: groupRows, error: groupError } = await sb
+        .from("account_groups")
+        .select("*")
+        .eq("account_id", state.accountId)
+        .in("id", selectedIds);
+
+      if (groupError) throw groupError;
+
+      const groupsById = new Map(
+        (groupRows || []).map(row => [String(row.id), row])
+      );
+      const sourceRows = selectedIds
+        .map(id => groupsById.get(String(id)))
+        .filter(Boolean);
+
+      if (!sourceRows.length) {
+        flows.delete(userKey);
+        return renderPrivatePromoGroups(
+          ctx,
+          0,
+          "❌ Grup sumber sudah tidak tersedia."
+        );
+      }
+
+      flows.delete(userKey);
+
+      // The worker owns the same runtime state and can be stopped by the
+      // callback handler while it is collecting/sending targets.
+      state.message = message;
+      state.stage = "running";
+
+      void runPrivatePromotion(
+        userKey,
+        state.accountId,
+        sourceRows,
+        message,
+        adminRow
+      ).catch(async error => {
+        console.error("PRIVATE PROMOTION:", safeErrorMessage(error, 800));
+
+        const current = privatePromotionRuns.get(userKey);
+        if (current) {
+          current.running = false;
+          current.sourceFailures = [
+            ...(current.sourceFailures || []),
+            {
+              title: "Promosi Chat Privat",
+              reason: safeErrorMessage(error, 300)
+            }
+          ];
+
+          await renderUi(
+            userKey,
+            [
+              "❌ <b>PROMOSI CHAT PRIVAT BERHENTI KARENA ERROR</b>",
+              "",
+              `👥 Total Target: <b>${current.stats?.total || 0}</b>`,
+              `✅ Berhasil: <b>${current.stats?.success || 0}</b>`,
+              `❌ Gagal: <b>${current.stats?.failed || 0}</b>`,
+              `⏭️ Skip: <b>${current.stats?.skipped || 0}</b>`,
+              "",
+              `⚠️ ${escapeHtml(safeErrorMessage(error, 500))}`
+            ].join("\n"),
+            new InlineKeyboard()
+              .text("📢 Promosi Lagi", "privatepromo:accounts:0")
+              .row()
+              .text("🏠 Menu Utama", "menu:dashboard"),
+            { parse_mode: "HTML" }
+          ).catch(() => {});
+        }
+      });
+
+      return;
     }
 
     /* -------------------------
