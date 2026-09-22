@@ -110,10 +110,6 @@ const loginRuns = new Map();
 const promotionReports = new Map();
 const MAX_PROMOTION_REPORTS = 200;
 
-// Short-lived search state for the group picker.
-const groupSearches = new Map();
-const MAX_GROUP_SEARCHES = 100;
-
 const ACCOUNT_PAGE_SIZE = 8;
 const HISTORY_PAGE_SIZE = 8;
 const GROUP_PAGE_SIZE = 8;
@@ -769,40 +765,11 @@ function activeFormatKeyboard(formats, accountId) {
   return kb;
 }
 
-function formatDelayKeyboard(accountId, formatId) {
-  return new InlineKeyboard()
-    .text("5 menit", `promo:delayset:${accountId}:${formatId}:5`)
-    .text("10 menit", `promo:delayset:${accountId}:${formatId}:10`)
-    .row()
-    .text("30 menit", `promo:delayset:${accountId}:${formatId}:30`)
-    .text("1 jam", `promo:delayset:${accountId}:${formatId}:60`)
-    .row()
-    .text("2 jam", `promo:delayset:${accountId}:${formatId}:120`)
-    .row()
-    .text("⌨️ Ketik sendiri", `promo:delay:${accountId}:${formatId}`)
-    .row()
-    .text("⬅️ Kembali", `promo:view:${accountId}:${formatId}`);
-}
-
-function formatDurationKeyboard(accountId, formatId) {
-  return new InlineKeyboard()
-    .text("1 jam", `promo:durationset:${accountId}:${formatId}:1`)
-    .text("1 hari", `promo:durationset:${accountId}:${formatId}:24`)
-    .row()
-    .text("3 hari", `promo:durationset:${accountId}:${formatId}:72`)
-    .text("7 hari", `promo:durationset:${accountId}:${formatId}:168`)
-    .row()
-    .text("⌨️ Ketik sendiri", `promo:duration:${accountId}:${formatId}`)
-    .row()
-    .text("⬅️ Kembali", `promo:view:${accountId}:${formatId}`);
-}
-
 function formatDetailKeyboard(accountId, format) {
   const kb = new InlineKeyboard();
   kb.text("✏️ Edit Format", `promo:edit:${accountId}:${format.id}`).row();
   kb.text("⏱️ Atur Jeda", `promo:delay:${accountId}:${format.id}`).row();
   kb.text("📅 Atur Durasi", `promo:duration:${accountId}:${format.id}`).row();
-  kb.text("🕐 Atur Waktu", `promo:time:${accountId}:${format.id}`).row();
   if (format.active) kb.text("⏹️ Stop", `promo:stop:${accountId}:${format.id}`);
   else kb.text("▶️ Mulai", `promo:start:${accountId}:${format.id}`);
   kb.row();
@@ -826,7 +793,6 @@ function groupListKeyboard(rows, accountId, page, hasNext) {
   kb.text("🏠", "menu:dashboard");
   if (hasNext) kb.text("▶️", `group:list:${accountId}:${page + 1}`);
   kb.row();
-  kb.text("🔎 Cari Grup", `group:search:${accountId}`).row();
   kb.text("➕ Tambah Semua Grup", `group:all:${accountId}`).row();
   kb.text("🔄 Deteksi Grup", `group:refresh:${accountId}`).row();
   kb.text("⬅️ Akun", `account:open:${accountId}`);
@@ -959,6 +925,7 @@ function normalizeFormat(row = {}) {
     active: row.active === true,
     started_at: row.started_at || null,
     expires_at: row.expires_at || null,
+    last_report: row.last_report && typeof row.last_report === "object" ? row.last_report : null,
     created_at: row.created_at || new Date().toISOString(),
     updated_at: new Date().toISOString()
   };
@@ -1429,31 +1396,12 @@ async function getMeFromClient(client) {
    PROMOTION FAILURE REPORT
 ========================================================= */
 
-bot.callbackQuery(/^promo:failures:([a-f0-9]+)(?::(\d+))?$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  await ctx.answerCallbackQuery().catch(() => {});
-
-  const token = String(ctx.match[1]);
-  const page = Math.max(0, Number(ctx.match[2] || 0));
-  const report = promotionReports.get(token);
-  if (!report) {
-    return replaceUi(ctx,
-      "⚠️ <b>Data grup gagal sudah tidak tersedia.</b>\n\nJalankan promosi berikutnya untuk membuat laporan baru.",
-      new InlineKeyboard().text("🏠 Menu Utama", "menu:dashboard"),
-      { parse_mode: "HTML" }
-    );
-  }
-
-  const account = await getAccountForAdmin(report.accountId, adminRow);
-  if (!account) return;
-
-  // Keep every detail message safely below Telegram's 4096-character limit.
-  const PAGE_SIZE = 7;
-  const rows = Array.isArray(report.failedRows) ? report.failedRows : [];
-  const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
-  const safePage = Math.min(page, totalPages - 1);
-  const visible = rows.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
+async function renderPromotionFailures(ctx, report, page = 0) {
+  const rows = Array.isArray(report?.failedRows) ? report.failedRows : [];
+  const pageSize = 8;
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.min(Math.max(Number(page) || 0, 0), totalPages - 1);
+  const slice = rows.slice(safePage * pageSize, (safePage + 1) * pageSize);
 
   const lines = [
     "❌ <b>DAFTAR GROUP GAGAL</b>",
@@ -1463,24 +1411,75 @@ bot.callbackQuery(/^promo:failures:([a-f0-9]+)(?::(\d+))?$/, async ctx => {
     `🔗 <b>Username:</b> ${escapeHtml(report.accountUsername ? `@${report.accountUsername}` : "-")}`,
     `🆔 <b>ID Akun:</b> <code>${escapeHtml(report.accountTelegramId || "-")}</code>`,
     `📱 <b>Nomor:</b> <code>${escapeHtml(report.accountPhone || "-")}</code>`,
-    `📄 <b>Halaman:</b> ${safePage + 1}/${totalPages}`,
-    "━━━━━━━━━━━━━━━━━━"
+    "━━━━━━━━━━━━━━━━━━",
+    rows.length ? `Halaman <b>${safePage + 1}/${totalPages}</b> • Total gagal <b>${rows.length}</b>` : "<i>Tidak ada group yang gagal.</i>"
   ];
 
-  if (!visible.length) lines.push("<i>Tidak ada group yang gagal.</i>");
-  else visible.forEach((row,index) => {
-    const number = safePage * PAGE_SIZE + index + 1;
-    lines.push(`${String(number).padStart(2,"0")}. <b>${escapeHtml(truncateText(row.groupTitle,120))}</b>\n   ❌ ${escapeHtml(truncateText(row.reason,220))}`);
-  });
+  if (slice.length) {
+    slice.forEach((row, index) => {
+      const number = safePage * pageSize + index + 1;
+      lines.push(`${String(number).padStart(2, "0")}. <b>${escapeHtml(row.groupTitle)}</b>\n   ❌ ${escapeHtml(row.reason)}`);
+    });
+  }
 
   const kb = new InlineKeyboard();
-  if (safePage > 0) kb.text("◀️", `promo:failures:${token}:${safePage - 1}`);
-  if (safePage < totalPages - 1) kb.text("▶️", `promo:failures:${token}:${safePage + 1}`);
+  if (safePage > 0) {
+    kb.text("◀️", `promo:failures:${report.accountId}:${report.formatId}:${safePage - 1}`);
+  }
+  if (safePage < totalPages - 1) {
+    kb.text("▶️", `promo:failures:${report.accountId}:${report.formatId}:${safePage + 1}`);
+  }
   if (safePage > 0 || safePage < totalPages - 1) kb.row();
   kb.text("⬅️ Kembali ke Hasil", `promo:view:${report.accountId}:${report.formatId}`).row();
   kb.text("🏠 Menu Utama", "menu:dashboard");
 
   return replaceUi(ctx, lines.join("\n\n"), kb, { parse_mode: "HTML" });
+}
+
+// New persistent callback: account + format + page are encoded in the button,
+// so the detail remains available even after a PM2 restart.
+bot.callbackQuery(/^promo:failures:(\d+):([^:]+):(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+
+  const accountId = String(ctx.match[1]);
+  const formatId = String(ctx.match[2]);
+  const page = Number(ctx.match[3] || 0);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
+
+  const format = await getPromotionFormat(accountId, formatId);
+  const report = format?.last_report;
+  if (!report || String(report.accountId) !== accountId || String(report.formatId) !== formatId) {
+    return replaceUi(
+      ctx,
+      "⚠️ <b>Data grup gagal belum tersedia.</b>\n\nJalankan promosi berikutnya agar laporan gagal tersimpan kembali.",
+      new InlineKeyboard().text("🏠 Menu Utama", "menu:dashboard"),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  return renderPromotionFailures(ctx, report, page);
+});
+
+// Backward compatibility for old result messages created before the persistent
+// callback was introduced. These still work while the bot process retains them.
+bot.callbackQuery(/^promo:failures:([a-f0-9]+)(?::(\d+))?$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+  const report = promotionReports.get(String(ctx.match[1]));
+  if (!report) {
+    return replaceUi(
+      ctx,
+      "⚠️ <b>Data grup gagal sudah tidak tersedia.</b>\n\nJalankan promosi berikutnya untuk membuat laporan baru.",
+      new InlineKeyboard().text("🏠 Menu Utama", "menu:dashboard"),
+      { parse_mode: "HTML" }
+    );
+  }
+  const account = await getAccountForAdmin(report.accountId, adminRow);
+  if (!account) return;
+  return renderPromotionFailures(ctx, report, Number(ctx.match[2] || 0));
 });
 
 /* =========================================================
@@ -1495,6 +1494,13 @@ function channelCanSend(entity, client) {
     if (!isGroup && !isChannel) return false;
 
     let canSend = true;
+
+    // Telegram can expose a group/channel in dialogs even when the account
+    // is currently forbidden to post. Check the default restrictions first
+    // so stale/overly-permissive targets do not enter promotion runs.
+    if (entity?.defaultBannedRights?.sendMessages === true) {
+      canSend = false;
+    }
 
     if (isChannel && entity.broadcast) {
       canSend = false;
@@ -1521,7 +1527,7 @@ function channelCanSend(entity, client) {
     }
 
     if (isGroup || (isChannel && !entity.broadcast)) {
-      canSend = true;
+      if (entity?.defaultBannedRights?.sendMessages !== true) canSend = true;
 
       if (isChannel) {
         try {
@@ -1535,14 +1541,19 @@ function channelCanSend(entity, client) {
 
           const p = participant?.participant;
           if (
+            p?.className === "ChannelParticipantCreator" ||
+            p?.className === "ChannelParticipantAdmin"
+          ) {
+            canSend = true;
+          } else if (
             p?.className === "ChannelParticipantBanned" &&
             p.bannedRights?.sendMessages === true
           ) {
             canSend = false;
           }
         } catch (_) {
-          // Keep the old behavior: unknown permission is not enough to discard the group.
-          canSend = true;
+          // Keep the result from defaultBannedRights when participant details
+          // cannot be read; do not turn a known restriction back into true.
         }
       }
     }
@@ -1980,21 +1991,6 @@ function classifySendError(error) {
   return raw ? truncateText(raw.replace(/\s+/g, " "), 160) : "Kesalahan tidak diketahui";
 }
 
-function isSendPermissionError(error) {
-  const msg = String(error?.message || error || "").toLowerCase();
-  return (
-    msg.includes("chat_write_forbidden") ||
-    msg.includes("chat_send_plain_forbidden") ||
-    msg.includes("user_banned_in_channel") ||
-    msg.includes("chat_admin_required") ||
-    msg.includes("chat_restricted") ||
-    msg.includes("not enough rights") ||
-    msg.includes("can't write") ||
-    msg.includes("can't send") ||
-    msg.includes("forbidden")
-  );
-}
-
 function rememberPromotionReport(report) {
   const token = crypto.randomBytes(6).toString("hex");
   promotionReports.set(token, { ...report, createdAt: Date.now() });
@@ -2009,7 +2005,7 @@ function rememberPromotionReport(report) {
 function promotionReportKeyboard(token, failedCount, accountId, formatId) {
   const kb = new InlineKeyboard();
   if (failedCount > 0) {
-    kb.text(`🔎 Cek Grup Gagal (${failedCount})`, `promo:failures:${token}:0`).row();
+    kb.text(`🔎 Cek Grup Gagal (${failedCount})`, `promo:failures:${accountId}:${formatId}:0`).row();
   }
   kb.text("📝 Detail Format", `promo:view:${accountId}:${formatId}`);
   return kb;
@@ -2050,7 +2046,7 @@ async function sendPromotionReport(account, format, total, success, failed, fail
     reason: x.reason || "Kesalahan tidak diketahui"
   }));
 
-  const token = rememberPromotionReport({
+  const reportData = {
     accountId: String(account.id),
     formatId: String(format.id),
     accountLabel: accountName,
@@ -2060,7 +2056,22 @@ async function sendPromotionReport(account, format, total, success, failed, fail
     accountPhone,
     formatName: format.name,
     failedRows
-  });
+  };
+
+  const token = rememberPromotionReport(reportData);
+
+  // Keep the latest detail in the existing JSONB format record. No SQL/schema
+  // change is required, and the button still works after a process restart.
+  try {
+    const persistedFormats = await getPromotionFormats(account.id);
+    const persistedFormat = persistedFormats.find(x => String(x.id) === String(format.id));
+    if (persistedFormat) {
+      persistedFormat.last_report = reportData;
+      await savePromotionFormats(account.id, persistedFormats);
+    }
+  } catch (e) {
+    console.warn("PROMOTION REPORT PERSIST:", safeErrorMessage(e, 220));
+  }
 
   const lines = [
     "📊 <b>HASIL PROMOSI</b>",
@@ -2113,6 +2124,11 @@ async function fireFormat(accountId, formatId) {
 
   const client = await clientFor(accountId);
   if (!client) return { shouldContinue: true, delayMs: 120000 };
+
+  // Revalidate the selected groups against the live Telegram session before
+  // sending. This prevents old/stale can_send=true rows from producing a run
+  // where almost every target immediately fails with a permission error.
+  await refreshGroups(accountId);
 
   const { data: groups, error } = await sb
     .from("account_groups")
@@ -2191,9 +2207,10 @@ async function fireFormat(accountId, formatId) {
       failures.push({ groupId: group.id, groupTitle: group.title, reason });
       floodWaitMs = Math.max(floodWaitMs, extractFloodWaitMs(e));
 
-      if (isSendPermissionError(e)) {
-        await sb.from("account_groups")
-          .update({ enabled: false, can_send: false })
+      if (reason === "Tidak diizinkan mengirim pesan" || reason === "Akun tidak diizinkan mengirim pesan" || reason === "Tidak memiliki izin yang diperlukan") {
+        await sb
+          .from("account_groups")
+          .update({ can_send: false, enabled: false })
           .eq("id", group.id)
           .eq("account_id", accountId)
           .catch(updateError => console.warn("GROUP PERMISSION UPDATE:", safeErrorMessage(updateError, 220)));
@@ -2239,6 +2256,7 @@ async function startFormat(accountId,formatId,adminId){
   const formats=await getPromotionFormats(accountId); const f=formats.find(x=>x.id===String(formatId)); if(!f)throw new Error("Format tidak ditemukan.");
   if(!formatReady(f))throw new Error("Isi format belum dibuat.");
   const client=await clientFor(accountId); if(!client)throw new Error("Account belum connected atau session tidak valid.");
+  await refreshGroups(accountId);
   const {count,error}=await sb.from("account_groups").select("*",{count:"exact",head:true}).eq("account_id",accountId).eq("enabled",true).eq("can_send",true); if(error)throw error;if(!Number(count||0))throw new Error("Belum ada target grup aktif yang bisa dikirimi.");
   const now = new Date();
   const scheduledStartAt = nextFormatStartAt(f, now);
@@ -2446,14 +2464,6 @@ async function fireAccount(accountId) {
       const reason = classifySendError(e);
       failures.set(reason, (failures.get(reason) || 0) + 1);
       floodWaitMs = Math.max(floodWaitMs, extractFloodWaitMs(e));
-
-      if (isSendPermissionError(e)) {
-        await sb.from("account_groups")
-          .update({ enabled: false, can_send: false })
-          .eq("id", group.id)
-          .eq("account_id", accountId)
-          .catch(updateError => console.warn("GROUP PERMISSION UPDATE:", safeErrorMessage(updateError, 220)));
-      }
 
       await recordHistory(accountId, null, {
         accountLabel: account.label,
@@ -3786,7 +3796,6 @@ async function renderFormatDetail(ctx, accountId, formatId, prefixMessage = "") 
     "⚙️ <b>PENGATURAN</b>",
     `⏱️ Jeda: <b>${escapeHtml(formatInterval(format.interval_minutes))}</b>`,
     `📅 Durasi: <b>${escapeHtml(formatDuration(format.duration_hours))}</b>`,
-    `🕐 Waktu: <b>${escapeHtml(formatWindowLabel(format))}</b>`,
     `🟢 Status: <b>${format.active ? "AKTIF" : "NONAKTIF"}</b>`
   ].filter(Boolean).join("\n");
   return replaceUi(ctx, message, formatDetailKeyboard(accountId, format), { parse_mode: "HTML" });
@@ -3806,53 +3815,83 @@ async function renderFormatList(ctx, accountId, prefixMessage = "") {
    No loading text is sent through Telegram's callback notification/toast.
 ========================================================= */
 
-async function startChatLoading(ctx, title = "Memproses...") {
+async function startChatLoading(ctx, title = "Memproses menu...") {
   const chatId = ctx.chat?.id || ctx.from?.id;
-  const frames = ["◐", "◓", "◑", "◒"];
-  const frameMs = 500;
+  // Continuous ping-pong progress: it never gets stuck at the middle/end while
+  // the actual operation is still running. The percentage makes progress easy
+  // to see, while the bar keeps moving until the final UI is ready.
+  const percentages = Array.from({ length: 21 }, (_, i) => i * 5);
+  const frames = percentages.map(percent => {
+    const total = 14;
+    const filled = Math.round((percent / 100) * total);
+    return `${"█".repeat(filled)}${"░".repeat(total - filled)}`;
+  });
+  const sequence = [...frames, ...frames.slice(1, -1).reverse()];
+  const frameMs = 220;
   let index = 0;
   let stopped = false;
   let timer = null;
   let message = null;
   let queue = Promise.resolve();
 
-  const body = () => `⏳ <b>${escapeHtml(title)}</b>\n\n<code>${frames[index]}</code> <i>Sedang bekerja, tunggu sebentar...</i>`;
+  const percentForIndex = () => {
+    const frame = sequence[index] || frames[0];
+    const direct = frames.indexOf(frame);
+    return direct >= 0 ? percentages[direct] : 0;
+  };
+  const body = () => `⏳ <b>${escapeHtml(title)}</b>\n<code>[${sequence[index]}]</code> <b>${percentForIndex()}%</b>`;
+
   const edit = () => {
     queue = queue.then(async () => {
       if (stopped || !message) return;
-      try { await bot.api.editMessageText(chatId, message.message_id, body(), { parse_mode: "HTML" }); } catch (_) {}
+      try {
+        await bot.api.editMessageText(chatId, message.message_id, body(), { parse_mode: "HTML" });
+      } catch (_) {}
     });
     return queue;
   };
+
   message = await bot.api.sendMessage(chatId, body(), { parse_mode: "HTML" });
+
   const tick = () => {
     if (stopped) return;
     timer = setTimeout(async () => {
       timer = null;
       if (stopped) return;
-      index = (index + 1) % frames.length;
+      index = (index + 1) % sequence.length;
       await edit();
       tick();
     }, frameMs);
   };
   tick();
+
   return {
     async stop() {
       stopped = true;
       if (timer) clearTimeout(timer);
       await queue.catch(() => {});
-      if (message) { try { await bot.api.deleteMessage(chatId, message.message_id); } catch (_) {} }
+      if (message) {
+        try { await bot.api.deleteMessage(chatId, message.message_id); } catch (_) {}
+      }
     }
   };
 }
 
-async function withChatLoading(ctx, title, operation) {
-  const loader = await startChatLoading(ctx, title);
-  try { return await operation(); }
-  finally { await loader.stop(); }
-}
+// Put a real animated loader in the chat for callback/menu actions. The
+// callback answer itself stays empty, so Telegram's small top notification
+// never shows messages such as "Memuat..." or "Scanning...".
+bot.on("callback_query", async (ctx, next) => {
+  const data = String(ctx.callbackQuery?.data || "");
+  if (data === "flow:cancel" || data === "admin:cancel") return next();
 
-// Long operations call the loader explicitly; normal menu navigation stays clean.
+  let loader = null;
+  try {
+    loader = await startChatLoading(ctx, "Memproses menu");
+    return await next();
+  } finally {
+    await loader?.stop?.();
+  }
+});
 
 /* =========================================================
    START / DASHBOARD
@@ -4317,7 +4356,7 @@ bot.callbackQuery(/^promo:active:(\d+):\d+$/, async ctx => {
   if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const formats=await getPromotionFormats(accountId);
   const active=formats.filter(x=>x.active);
-  return replaceUi(ctx, `▶️ <b>FORMAT AKTIF</b>\n\n${active.length ? active.map(x=>`🟢 <b>${escapeHtml(x.name)}</b>\n⏱ ${escapeHtml(formatInterval(x.interval_minutes))}\n📅 ${escapeHtml(formatDuration(x.duration_hours))}\n🕐 ${escapeHtml(formatWindowLabel(x))}`).join("\n\n") : "Tidak ada format yang sedang aktif."}`, activeFormatKeyboard(active,accountId), {parse_mode:"HTML"});
+  return replaceUi(ctx, `▶️ <b>FORMAT AKTIF</b>\n\n${active.length ? active.map(x=>`🟢 <b>${escapeHtml(x.name)}</b>\n⏱ ${escapeHtml(formatInterval(x.interval_minutes))}\n📅 ${escapeHtml(formatDuration(x.duration_hours))}`).join("\n\n") : "Tidak ada format yang sedang aktif."}`, activeFormatKeyboard(active,accountId), {parse_mode:"HTML"});
 });
 
 bot.callbackQuery(/^promo:delay:(\d+):([^:]+)$/, async ctx => {
@@ -4326,7 +4365,7 @@ bot.callbackQuery(/^promo:delay:(\d+):([^:]+)$/, async ctx => {
   if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const f=await getPromotionFormat(accountId,formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id),{t:"delay",accountId,formatId,adminId:adminRow.id});
-  return replaceUi(ctx,`⏱️ <b>ATUR JEDA</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nPilih jeda cepat di bawah, atau tekan <b>Ketik sendiri</b> untuk menulis menit/jam.`,formatDelayKeyboard(accountId,formatId),{parse_mode:"HTML"});
+  return replaceUi(ctx,`⏱️ <b>ATUR JEDA</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nContoh: <code>10 menit</code> atau <code>1 jam</code>.`,cancelKeyboard(false),{parse_mode:"HTML"});
 });
 
 bot.callbackQuery(/^promo:duration:(\d+):([^:]+)$/, async ctx => {
@@ -4335,46 +4374,7 @@ bot.callbackQuery(/^promo:duration:(\d+):([^:]+)$/, async ctx => {
   if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const f=await getPromotionFormat(accountId,formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id),{t:"duration",accountId,formatId,adminId:adminRow.id});
-  return replaceUi(ctx,`📅 <b>ATUR DURASI</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nPilih durasi cepat di bawah, atau tekan <b>Ketik sendiri</b> untuk menulis jam/hari.`,formatDurationKeyboard(accountId,formatId),{parse_mode:"HTML"});
-});
-
-bot.callbackQuery(/^promo:delayset:(\d+):([^:]+):(\d+)$/, async ctx => {
-  const adminRow=await requireAdmin(ctx); if(!adminRow)return;
-  await ctx.answerCallbackQuery().catch(()=>{});
-  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]), minutes=Number(ctx.match[3]);
-  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
-  if (!Number.isFinite(minutes) || minutes < 1) return;
-  const formats=await getPromotionFormats(accountId); const f=formats.find(x=>x.id===formatId);
-  if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
-  f.interval_minutes=minutes; f.updated_at=new Date().toISOString();
-  await savePromotionFormats(accountId,formats);
-  flows.delete(String(ctx.from.id));
-  return renderFormatDetail(ctx,accountId,formatId,`✅ Jeda disimpan: <b>${escapeHtml(formatInterval(minutes))}</b>`);
-});
-
-bot.callbackQuery(/^promo:durationset:(\d+):([^:]+):(\d+)$/, async ctx => {
-  const adminRow=await requireAdmin(ctx); if(!adminRow)return;
-  await ctx.answerCallbackQuery().catch(()=>{});
-  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]), hours=Number(ctx.match[3]);
-  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
-  if (!Number.isFinite(hours) || hours < 1) return;
-  const formats=await getPromotionFormats(accountId); const f=formats.find(x=>x.id===formatId);
-  if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
-  f.duration_hours=hours;
-  if(f.active) f.expires_at=new Date(Date.now()+hours*3600000).toISOString();
-  f.updated_at=new Date().toISOString();
-  await savePromotionFormats(accountId,formats);
-  flows.delete(String(ctx.from.id));
-  return renderFormatDetail(ctx,accountId,formatId,`✅ Durasi disimpan: <b>${escapeHtml(formatDuration(hours))}</b>`);
-});
-
-bot.callbackQuery(/^promo:time:(\d+):([^:]+)$/, async ctx => {
-  const adminRow=await requireAdmin(ctx); if(!adminRow)return; await ctx.answerCallbackQuery().catch(()=>{});
-  const accountId=String(ctx.match[1]), formatId=String(ctx.match[2]);
-  if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const f=await getPromotionFormat(accountId,formatId);
-  if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
-  flows.set(String(ctx.from.id),{t:"time",accountId,formatId,adminId:adminRow.id});
-  return replaceUi(ctx,`🕐 <b>ATUR WAKTU</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nKirim: <code>08:00 - 22:00</code>\nAtau <code>00:00 - 00:00</code> untuk tanpa batas waktu.`,cancelKeyboard(false),{parse_mode:"HTML"});
+  return replaceUi(ctx,`📅 <b>ATUR DURASI</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nContoh: <code>3 hari</code> atau <code>12 jam</code>.`,cancelKeyboard(false),{parse_mode:"HTML"});
 });
 
 bot.callbackQuery(/^promo:toggle:(\d+):([^:]+)$/, async ctx => {
@@ -4427,99 +4427,6 @@ bot.callbackQuery(/^promo:stop:(\d+):([^:]+)$/, async ctx => {
 /* =========================================================
    GROUP MANAGEMENT
 ========================================================= */
-
-function rememberGroupSearch(accountId, query, page = 0) {
-  const token = crypto.randomBytes(5).toString("hex");
-  groupSearches.set(token, { accountId: String(accountId), query: String(query || "").trim(), page: Math.max(0, Number(page) || 0), createdAt: Date.now() });
-  while (groupSearches.size > MAX_GROUP_SEARCHES) {
-    const first = groupSearches.keys().next().value;
-    if (!first) break;
-    groupSearches.delete(first);
-  }
-  return token;
-}
-
-function groupSearchKeyboard(rows, accountId, token, page, hasNext) {
-  const kb = new InlineKeyboard();
-  for (const group of rows) {
-    const icon = group.enabled ? "✅" : "❌";
-    kb.text(`${icon} ${safeButtonText(group.title, 34)}`, `group:searchtoggle:${group.id}:${token}`).row();
-  }
-  if (page > 0) kb.text("◀️", `group:searchpage:${token}:${page - 1}`);
-  kb.text("⬅️ Grup", `group:list:${accountId}:0`);
-  if (hasNext) kb.text("▶️", `group:searchpage:${token}:${page + 1}`);
-  kb.row();
-  kb.text("🔎 Cari Lagi", `group:search:${accountId}`);
-  return kb;
-}
-
-async function renderGroupSearch(ctx, token, page = 0) {
-  const state = groupSearches.get(String(token));
-  if (!state) return replaceUi(ctx, "⚠️ <b>Pencarian sudah kedaluwarsa.</b>", backDashboardKeyboard(), { parse_mode: "HTML" });
-  const accountId = String(state.accountId);
-  const query = String(state.query || "").trim();
-  const offset = Math.max(0, Number(page) || 0) * GROUP_PAGE_SIZE;
-  const pattern = `%${query.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
-  const [{ data, error }, { count, error: countError }] = await Promise.all([
-    sb.from("account_groups").select("id,account_id,title,can_send,enabled").eq("account_id", accountId).eq("can_send", true).ilike("title", pattern).order("title", { ascending: true }).range(offset, offset + GROUP_PAGE_SIZE - 1),
-    sb.from("account_groups").select("*", { count: "exact", head: true }).eq("account_id", accountId).eq("can_send", true).ilike("title", pattern)
-  ]);
-  if (error) throw error;
-  if (countError) throw countError;
-  const total = Number(count || 0);
-  const safePage = total ? Math.min(Math.max(0, Number(page) || 0), Math.floor((total - 1) / GROUP_PAGE_SIZE)) : 0;
-  state.page = safePage;
-  const rows = (data || []).slice(0, GROUP_PAGE_SIZE);
-  const text = [
-    "🔎 <b>CARI GRUP</b>",
-    `Kata kunci: <code>${escapeHtml(query)}</code>`,
-    `Ditemukan: <b>${total}</b>`,
-    `Halaman: <b>${safePage + 1}</b>`,
-    "",
-    rows.length ? rows.map(g => `${g.enabled ? "✅" : "❌"} <b>${escapeHtml(g.title)}</b>`).join("\n\n") : "<i>Tidak ada grup yang mengandung kata tersebut.</i>",
-    "",
-    "Tekan nama grup untuk memilih / membatalkan target."
-  ].join("\n");
-  return replaceUi(ctx, text, groupSearchKeyboard(rows, accountId, token, safePage, offset + rows.length < total), { parse_mode: "HTML" });
-}
-
-bot.callbackQuery(/^group:search:(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  await ctx.answerCallbackQuery().catch(() => {});
-  const accountId = String(ctx.match[1]);
-  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
-  flows.set(String(ctx.from.id), { t: "group_search", accountId });
-  return replaceUi(ctx, "🔎 <b>CARI GRUP</b>\n\nKetik sebagian nama/kata yang ingin dicari.\nContoh: <code>lpm</code> — tidak perlu nama lengkap.\n\nBot akan menampilkan grup yang namanya mengandung kata tersebut.", cancelKeyboard(false), { parse_mode: "HTML" });
-});
-
-bot.callbackQuery(/^group:searchpage:([a-f0-9]+):(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  await ctx.answerCallbackQuery().catch(() => {});
-  const token = String(ctx.match[1]);
-  const state = groupSearches.get(token);
-  if (!state) return replaceUi(ctx, "⚠️ Pencarian sudah kedaluwarsa.", backDashboardKeyboard(), { parse_mode: "HTML" });
-  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
-  return renderGroupSearch(ctx, token, Number(ctx.match[2]));
-});
-
-bot.callbackQuery(/^group:searchtoggle:(\d+):([a-f0-9]+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  const groupId = String(ctx.match[1]);
-  const token = String(ctx.match[2]);
-  const state = groupSearches.get(token);
-  if (!state) return ctx.answerCallbackQuery("Pencarian sudah kedaluwarsa.", { show_alert: true });
-  const { data: group, error } = await sb.from("account_groups").select("*").eq("id", groupId).maybeSingle();
-  if (error || !group) return ctx.answerCallbackQuery("Grup tidak ditemukan.", { show_alert: true });
-  if (!await requireAccountAccess(ctx, adminRow, String(group.account_id))) return;
-  if (!group.can_send) return ctx.answerCallbackQuery("Telegram menandai grup ini tidak bisa menerima pesan.", { show_alert: true });
-  await ctx.answerCallbackQuery().catch(() => {});
-  const { error: updateError } = await sb.from("account_groups").update({ enabled: !group.enabled }).eq("id", groupId).eq("account_id", group.account_id);
-  if (updateError) return ctx.answerCallbackQuery("Gagal menyimpan pilihan grup.", { show_alert: true });
-  return renderGroupSearch(ctx, token, state.page);
-});
 
 bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
@@ -4601,7 +4508,7 @@ bot.callbackQuery(/^group:add:(\d+)$/, async ctx => {
   }
 
   try {
-    const rows = await withChatLoading(ctx, "Mendeteksi grup...", () => refreshGroups(accountId));
+    const rows = await refreshGroups(accountId);
     const allowed = rows.filter(x => x.can_send);
     await recordHistory(accountId, adminRow.id, {
       action: "group_scan_add",
@@ -4639,7 +4546,7 @@ bot.callbackQuery(/^group:refresh:(\d+)$/, async ctx => {
   }
 
   try {
-    const rows = await withChatLoading(ctx, "Menyegarkan daftar grup...", () => refreshGroups(accountId));
+    const rows = await refreshGroups(accountId);
     await recordHistory(accountId, adminRow.id, {
       action: "group_refresh",
       status: "success",
@@ -4753,7 +4660,7 @@ bot.callbackQuery(/^group:all:(\d+)$/, async ctx => {
 
   try {
     // Scan first so newly detected writable groups are included too.
-    const rows = await withChatLoading(ctx, "Menambahkan semua grup...", () => refreshGroups(accountId));
+    const rows = await refreshGroups(accountId);
     const allowed = rows.filter(x => x.can_send);
 
     if (allowed.length) {
@@ -5187,22 +5094,6 @@ bot.on("message", async (ctx, next) => {
         deleteOnFailure: false
       });
       return;
-    }
-
-    /* -------------------------
-       GROUP SEARCH
-    -------------------------- */
-    if (flow.t === "group_search") {
-      const query = String(ctx.message.text || "").trim().replace(/\s+/g, " ");
-      if (!query) return replaceUi(ctx, "❌ Kata pencarian tidak boleh kosong. Contoh: <code>lpm</code>.", cancelKeyboard(false), { parse_mode: "HTML" });
-      if (query.length > 80) return replaceUi(ctx, "❌ Kata pencarian terlalu panjang. Maksimal 80 karakter.", cancelKeyboard(false), { parse_mode: "HTML" });
-      try {
-        const token = rememberGroupSearch(flow.accountId, query, 0);
-        flows.delete(userKey);
-        return renderGroupSearch(ctx, token, 0);
-      } catch (e) {
-        return replaceUi(ctx, `❌ Pencarian grup gagal.\n\n${escapeHtml(safeErrorMessage(e))}`, new InlineKeyboard().text("⬅️ Grup", `group:list:${flow.accountId}:0`), { parse_mode: "HTML" });
-      }
     }
 
     /* -------------------------
