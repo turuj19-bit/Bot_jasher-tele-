@@ -1694,7 +1694,7 @@ async function refreshGroups(accountId) {
         .select("telegram_group_id")
         .eq("account_id", accountId);
 
-      if (existingError) throw error;
+      if (existingError) throw existingError;
 
       const existingIds = new Set(
         (existingRows || []).map(row => String(row.telegram_group_id))
@@ -1733,6 +1733,7 @@ async function listGroups(accountId, page = 0) {
       .from("account_groups")
       .select("*", { count: "exact", head: true })
       .eq("account_id", accountId)
+      .eq("can_send", true)
   ]);
 
   if (error) throw error;
@@ -2014,25 +2015,41 @@ function extractFloodWaitMs(error) {
 }
 
 function classifySendError(error) {
-  const raw = String(error?.message || error || "").trim();
+  const raw = String(
+    error?.message ||
+    error?.errorMessage ||
+    error?.rpcError ||
+    error ||
+    ""
+  ).trim();
+  const code = String(
+    error?.errorMessage ||
+    error?.rpcError ||
+    error?.code ||
+    error?.constructor?.name ||
+    ""
+  ).toLowerCase();
   const msg = raw.toLowerCase();
+  const fingerprint = `${code} ${msg}`;
 
+  // Match concrete Telegram RPC errors instead of the generic word
+  // "banned", which can appear in unrelated error text and mislabel the
+  // promotion result.
   if (
-    msg.includes("chat_write_forbidden") ||
-    msg.includes("chat_send_plain_forbidden") ||
-    msg.includes("not enough rights") ||
-    msg.includes("can't write") ||
-    msg.includes("can't send") ||
-    msg.includes("forbidden")
+    fingerprint.includes("user_banned_in_channel") ||
+    fingerprint.includes("userbannedinchannelerror")
   ) {
-    return "Tidak diizinkan mengirim pesan";
+    return "Akun tidak diizinkan mengirim pesan";
   }
 
   if (
-    msg.includes("user_banned_in_channel") ||
-    msg.includes("banned")
+    fingerprint.includes("chat_write_forbidden") ||
+    fingerprint.includes("chat_send_plain_forbidden") ||
+    fingerprint.includes("not enough rights") ||
+    fingerprint.includes("can't write") ||
+    fingerprint.includes("can't send")
   ) {
-    return "Akun tidak diizinkan mengirim pesan";
+    return "Tidak diizinkan mengirim pesan";
   }
 
   if (
@@ -2068,17 +2085,31 @@ function classifySendError(error) {
 }
 
 function isSendPermissionError(error) {
-  const msg = String(error?.message || error || "").toLowerCase();
+  const raw = String(
+    error?.message ||
+    error?.errorMessage ||
+    error?.rpcError ||
+    error ||
+    ""
+  ).toLowerCase();
+  const code = String(
+    error?.errorMessage ||
+    error?.rpcError ||
+    error?.code ||
+    error?.constructor?.name ||
+    ""
+  ).toLowerCase();
+  const fingerprint = `${code} ${raw}`;
+
   return (
-    msg.includes("chat_write_forbidden") ||
-    msg.includes("chat_send_plain_forbidden") ||
-    msg.includes("user_banned_in_channel") ||
-    msg.includes("chat_admin_required") ||
-    msg.includes("chat_restricted") ||
-    msg.includes("not enough rights") ||
-    msg.includes("can't write") ||
-    msg.includes("can't send") ||
-    msg.includes("forbidden")
+    fingerprint.includes("chat_write_forbidden") ||
+    fingerprint.includes("chat_send_plain_forbidden") ||
+    fingerprint.includes("user_banned_in_channel") ||
+    fingerprint.includes("chat_admin_required") ||
+    fingerprint.includes("chat_restricted") ||
+    fingerprint.includes("not enough rights") ||
+    fingerprint.includes("can't write") ||
+    fingerprint.includes("can't send")
   );
 }
 
@@ -2331,6 +2362,12 @@ async function fireFormat(accountId, formatId) {
       const reason = classifySendError(e);
       failures.push({ groupId: group.id, groupTitle: group.title, reason });
       floodWaitMs = Math.max(floodWaitMs, extractFloodWaitMs(e));
+
+      console.warn(
+        `PROMOTION SEND FAIL account=${accountId} group=${group.id} title=${JSON.stringify(truncateText(group.title, 80))} ` +
+        `code=${String(e?.errorMessage || e?.rpcError || e?.code || e?.constructor?.name || "unknown")} ` +
+        `error=${safeErrorMessage(e, 350)}`
+      );
 
       if (isSendPermissionError(e)) {
         // A send error alone must not permanently remove the selected target.
@@ -5055,8 +5092,6 @@ bot.callbackQuery("admin:add", async ctx => {
         .text("⭐ Admin VIP", "admin:add:vip")
         .text("💎 Admin Premium", "admin:add:premium")
         .row()
-        .text("👤 Admin", "admin:add:basic")
-        .row()
         .text("⬅️ Admin", "admin:list:0"),
       { parse_mode: "HTML" }
     );
@@ -5096,9 +5131,10 @@ bot.callbackQuery("admin:add:premium", async ctx => {
 bot.callbackQuery("admin:add:basic", async ctx => {
   const owner = await requireAdmin(ctx, { ownerOnly: true });
   if (!owner) return;
-  await ctx.answerCallbackQuery().catch(() => {});
-  flows.set(String(ctx.from.id), { t: "admin_add", adminId: owner.id, adminRole: "ADMIN_ANAK" });
-  return replaceUi(ctx, "👤 <b>TAMBAH ADMIN</b>\n\nKirim Telegram user ID Admin yang ingin kamu setujui.", cancelKeyboard(true), { parse_mode: "HTML" });
+  return ctx.answerCallbackQuery(
+    "OWNER hanya dapat menambah Admin VIP atau Admin Premium.",
+    { show_alert: true }
+  );
 });
 
 bot.callbackQuery("admin:delete", async ctx => {
@@ -5515,8 +5551,8 @@ bot.on("message", async (ctx, next) => {
       }
 
       const role = flow.adminRole || (adminRow.role === "OWNER" ? "ADMIN_VIP" : "ADMIN_ANAK");
-      if (adminRow.role === "OWNER" && !["ADMIN_VIP", "ADMIN_PREMIUM", "ADMIN_ANAK"].includes(role)) {
-        return renderUi(telegramUserId, "❌ Role admin tidak valid.", cancelKeyboard(true), { parse_mode: "HTML" });
+      if (adminRow.role === "OWNER" && !["ADMIN_VIP", "ADMIN_PREMIUM"].includes(role)) {
+        return renderUi(telegramUserId, "❌ OWNER hanya dapat menambah Admin VIP atau Admin Premium.", cancelKeyboard(true), { parse_mode: "HTML" });
       }
       if (adminRow.role !== "OWNER" && role !== "ADMIN_ANAK") {
         return renderUi(telegramUserId, "⛔ Admin VIP/Premium hanya dapat menambah Admin biasa.", cancelKeyboard(false), { parse_mode: "HTML" });
