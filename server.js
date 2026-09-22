@@ -118,8 +118,6 @@ const MAX_GROUP_SEARCHES = 100;
 // so it does not require any database/schema change and never touches the
 // existing scheduler/session state.
 const privatePromotionRuns = new Map();
-const privatePromoSearches = new Map();
-const MAX_PRIVATE_PROMO_SEARCHES = 100;
 const PRIVATE_PROMO_PAGE_SIZE = 8;
 const PRIVATE_PROMO_DELAY_MS = 5000;
 const PRIVATE_PROMO_MAX_FLOOD_WAIT_MS = 15 * 60 * 1000;
@@ -368,6 +366,167 @@ function decryptSession(encoded) {
    ADMIN AUTHORIZATION
 ========================================================= */
 
+
+const OFFICIAL_CHANNEL = "@jasebvortex";
+const OWNER_CONTACT = "farishost1";
+const ROLE_PRICES = { ADMIN_ANAK: 5000, ADMIN_VIP: 10000, ADMIN_PREMIUM: 15000 };
+const ROLE_LABELS = { ADMIN_ANAK: "ADMIN BIASA", ADMIN_VIP: "ADMIN VIP", ADMIN_PREMIUM: "ADMIN PREMIUM" };
+
+function subscriptionTableMissing(error) {
+  const msg = String(error?.message || error || "").toLowerCase();
+  const code = String(error?.code || "");
+  return code === "PGRST205" || msg.includes("schema cache") || msg.includes("does not exist") || (msg.includes("relation") && msg.includes("not found"));
+}
+
+async function getUserSubscription(telegramUserId) {
+  const { data, error } = await sb
+    .from("bot_subscriptions")
+    .select("*")
+    .eq("telegram_user_id", Number(telegramUserId))
+    .maybeSingle();
+  if (error) {
+    if (subscriptionTableMissing(error)) return null;
+    throw error;
+  }
+  return data || null;
+}
+
+function subscriptionIsActive(row) {
+  return Boolean(row?.active) && (!row.expires_at || new Date(row.expires_at).getTime() > Date.now());
+}
+
+async function saveUserSubscription(payload) {
+  const { data, error } = await sb
+    .from("bot_subscriptions")
+    .upsert({
+      telegram_user_id: Number(payload.telegram_user_id),
+      role: payload.role,
+      active: payload.active !== false,
+      expires_at: payload.expires_at || null,
+      parent_admin_id: payload.parent_admin_id || null,
+      activated_by: payload.activated_by || null,
+      updated_at: new Date().toISOString()
+    }, { onConflict: "telegram_user_id" })
+    .select("*")
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function deactivateExpiredAdmin(adminRow, subscription) {
+  if (!subscription?.expires_at || new Date(subscription.expires_at).getTime() > Date.now()) return;
+  try {
+    await sb.from("admins").update({ active: false, updated_at: new Date().toISOString() }).eq("id", adminRow.id);
+  } catch (_) {}
+}
+
+async function isOfficialChannelMember(userId) {
+  try {
+    const member = await bot.api.getChatMember(OFFICIAL_CHANNEL, Number(userId));
+    const status = String(member?.status || "").toLowerCase();
+    if (["creator", "administrator", "member"].includes(status)) return true;
+    if (status === "restricted") return member?.is_member === true;
+    return false;
+  } catch (error) {
+    console.error("CHANNEL CHECK:", safeErrorMessage(error, 300));
+    return null;
+  }
+}
+
+function joinChannelKeyboard() {
+  return new InlineKeyboard()
+    .url("📢 Join Channel Resmi", "https://t.me/jasebvortex")
+    .row()
+    .text("✅ Saya Sudah Join", "user:checkjoin");
+}
+
+function userJoinText() {
+  return [
+    "🔒 <b>AKSES BOT BELUM TERSEDIA</b>",
+    "━━━━━━━━━━━━━━━━━━",
+    "Untuk melanjutkan, kamu wajib bergabung terlebih dahulu ke <b>Channel Resmi</b> kami.",
+    "",
+    "📢 <b>Channel Resmi:</b> @jasebvortex",
+    "",
+    "Setelah bergabung, tekan tombol <b>✅ Saya Sudah Join</b> untuk mengecek keanggotaan.",
+    "",
+    "⚠️ Selama belum bergabung, proses daftar, pembelian, dan penggunaan bot tidak dapat dilanjutkan."
+  ].join("\n");
+}
+
+function userPurchaseText(subscription = null) {
+  const renewal = subscription && !subscriptionIsActive(subscription);
+  return [
+    renewal ? "🔄 <b>MASA AKTIF HABIS</b>" : "🛒 <b>DAFTAR & BELI AKSES BOT</b>",
+    "━━━━━━━━━━━━━━━━━━",
+    renewal
+      ? "Masa aktif akses kamu sudah berakhir. Silakan pilih role untuk melakukan perpanjangan."
+      : "Pilih role yang sesuai kebutuhan. Semua paket berlaku <b>1 bulan</b> dan dapat diperpanjang.",
+    "",
+    "👤 <b>ADMIN BIASA — Rp5.000 / bulan</b>",
+    "• Akses promosi ke grup",
+    "• Kelola akun Telegram yang terhubung",
+    "• Kelola format dan target promosi",
+    "• Tidak memiliki menu Admin",
+    "• Tidak memiliki Promosi Chat Privat",
+    "",
+    "⭐ <b>ADMIN VIP — Rp10.000 / bulan</b>",
+    "• Semua fitur Admin Biasa",
+    "• Dapat menambah Admin Biasa di bawahnya",
+    "• Dapat membuka penjualan/pendaftaran bot untuk pengguna lain",
+    "• Tetap tanpa Promosi Chat Privat",
+    "",
+    "💎 <b>ADMIN PREMIUM — Rp15.000 / bulan</b>",
+    "• Semua fitur Admin VIP",
+    "• Promosi Chat Privat",
+    "• Dapat menambah Admin Biasa",
+    "• Dapat membuka penjualan/pendaftaran bot untuk pengguna lain",
+    "",
+    "⏳ <b>Masa aktif: 1 bulan</b>",
+    "Perpanjangan dapat dilakukan sebelum atau setelah masa aktif habis.",
+    "",
+    "📌 Setelah memilih paket, bot akan membuat detail order yang siap kamu kirim ke Owner."
+  ].join("\n");
+}
+
+function userPurchaseKeyboard() {
+  return new InlineKeyboard()
+    .text("👤 Order Admin Biasa — 5K", "user:order:ADMIN_ANAK")
+    .row()
+    .text("⭐ Order Admin VIP — 10K", "user:order:ADMIN_VIP")
+    .row()
+    .text("💎 Order Admin Premium — 15K", "user:order:ADMIN_PREMIUM")
+    .row()
+    .url("📢 Channel Resmi", "https://t.me/jasebvortex");
+}
+
+function userOrderText(ctx, role, subscription = null) {
+  const roleLabel = ROLE_LABELS[role] || role;
+  const price = ROLE_PRICES[role] || 0;
+  const first = String(ctx.from?.first_name || "").trim();
+  const last = String(ctx.from?.last_name || "").trim();
+  const name = [first, last].filter(Boolean).join(" ") || "-";
+  const username = ctx.from?.username ? `@${ctx.from.username}` : "-";
+  const tgId = String(ctx.from?.id || "-");
+  return [
+    "🧾 <b>ORDER AKSES BOT</b>",
+    "━━━━━━━━━━━━━━━━━━",
+    `👤 Nama: <b>${escapeHtml(name)}</b>`,
+    `🔗 Username: <b>${escapeHtml(username)}</b>`,
+    `🆔 Telegram ID: <code>${escapeHtml(tgId)}</code>`,
+    `🎖️ Paket: <b>${escapeHtml(roleLabel)}</b>`,
+    `💰 Harga: <b>Rp${price.toLocaleString("id-ID")}</b>`,
+    "⏳ Masa aktif: <b>1 bulan</b>",
+    subscription && !subscriptionIsActive(subscription) ? "🔄 Status: <b>Perpanjangan</b>" : "🆕 Status: <b>Pendaftaran Baru</b>",
+    "",
+    "Silakan buka chat Owner melalui tombol di bawah lalu kirim order ini untuk diproses."
+  ].join("\n");
+}
+
+function ownerOrderUrl(text) {
+  return `https://t.me/${OWNER_CONTACT}?text=${encodeURIComponent(text.replace(/<[^>]+>/g, ""))}`;
+}
+
 async function getAdminByTelegramId(telegramUserId) {
   const { data, error } = await sb
     .from("admins")
@@ -377,7 +536,15 @@ async function getAdminByTelegramId(telegramUserId) {
     .maybeSingle();
 
   if (error) throw error;
-  return data || null;
+  if (!data) return null;
+
+  const subscription = await getUserSubscription(telegramUserId);
+  if (subscription?.expires_at && new Date(subscription.expires_at).getTime() <= Date.now()) {
+    await deactivateExpiredAdmin(data, subscription);
+    return null;
+  }
+  if (subscription && subscription.active === false) return null;
+  return data;
 }
 
 async function ensureBootstrapOwners() {
@@ -608,15 +775,10 @@ function canUsePrivatePromotion(role) {
 
 async function requirePrivatePromotionAccess(ctx, adminRow) {
   if (canUsePrivatePromotion(adminRow?.role)) return true;
-  try {
-    const callbackId = ctx.callbackQuery?.id;
-    if (callbackId) {
-      await ctx.api.answerCallbackQuery(callbackId, {
-        text: "Promosi Chat Privat hanya tersedia untuk Admin Premium dan OWNER.",
-        show_alert: true
-      });
-    }
-  } catch (_) {}
+  await ctx.answerCallbackQuery(
+    "Promosi Chat Privat hanya tersedia untuk Admin Premium dan OWNER.",
+    { show_alert: true }
+  ).catch(() => {});
   return false;
 }
 
@@ -4082,6 +4244,132 @@ async function withChatLoading(ctx, title, operation) {
 // Long operations call the loader explicitly; normal menu navigation stays clean.
 
 /* =========================================================
+   PUBLIC USER ACCESS / CHANNEL GATE / PURCHASE
+========================================================= */
+
+async function renderPublicGate(ctx, notice = "") {
+  const member = await isOfficialChannelMember(ctx.from.id);
+  if (member === true) {
+    const subscription = await getUserSubscription(ctx.from.id);
+    return replaceUi(
+      ctx,
+      userPurchaseText(subscription),
+      userPurchaseKeyboard(),
+      { parse_mode: "HTML" }
+    );
+  }
+  if (member === false) {
+    return replaceUi(
+      ctx,
+      `${notice ? `${escapeHtml(notice)}\n\n` : ""}${userJoinText()}`,
+      joinChannelKeyboard(),
+      { parse_mode: "HTML" }
+    );
+  }
+  return replaceUi(
+    ctx,
+    "⚠️ <b>Belum dapat mengecek keanggotaan.</b>\n\nPastikan kamu sudah join channel resmi, lalu tekan <b>✅ Saya Sudah Join</b> lagi.",
+    joinChannelKeyboard(),
+    { parse_mode: "HTML" }
+  );
+}
+
+async function publicUserAllowed(ctx) {
+  const id = ctx.from?.id;
+  if (!id) return true;
+  const admin = await getAdminByTelegramId(id).catch(() => null);
+  if (admin) return true;
+
+  const member = await isOfficialChannelMember(id);
+  if (member !== true) {
+    await renderPublicGate(ctx, member === false ? "⛔ Kamu belum bergabung ke Channel Resmi." : "⚠️ Keanggotaan belum dapat diverifikasi.");
+    if (ctx.callbackQuery) await ctx.answerCallbackQuery("Silakan join channel resmi terlebih dahulu.", { show_alert: true }).catch(() => {});
+    return false;
+  }
+
+  const subscription = await getUserSubscription(id);
+  if (subscription && subscriptionIsActive(subscription)) return true;
+
+  // Public users are allowed to see the purchase/renewal menu only.
+  const callback = String(ctx.callbackQuery?.data || "");
+  const text = String(ctx.message?.text || "").trim();
+  const allowed = text === "/start" || callback === "user:checkjoin" || callback === "user:purchase" || /^user:order:(ADMIN_ANAK|ADMIN_VIP|ADMIN_PREMIUM)$/.test(callback);
+  if (!allowed) {
+    await replaceUi(ctx, userPurchaseText(subscription), userPurchaseKeyboard(), { parse_mode: "HTML" });
+    if (ctx.callbackQuery) await ctx.answerCallbackQuery("Akses bot belum aktif. Silakan pilih paket terlebih dahulu.", { show_alert: true }).catch(() => {});
+    return false;
+  }
+  return true;
+}
+
+// Public users are gated before all normal bot actions. Admins keep their existing
+// dashboard permissions and are not affected by the customer onboarding gate.
+bot.use(async (ctx, next) => {
+  try {
+    if (await publicUserAllowed(ctx)) return next();
+  } catch (error) {
+    console.error("PUBLIC ACCESS GATE:", safeErrorMessage(error, 500));
+    if (ctx.callbackQuery) await ctx.answerCallbackQuery("Terjadi kesalahan saat memeriksa akses.", { show_alert: true }).catch(() => {});
+    else if (ctx.from?.id) await renderUi(ctx.from.id, "❌ Terjadi kesalahan saat memeriksa akses. Coba lagi sebentar.", joinChannelKeyboard(), { parse_mode: "HTML" }).catch(() => {});
+  }
+});
+
+bot.callbackQuery("user:checkjoin", async ctx => {
+  const member = await isOfficialChannelMember(ctx.from.id);
+  if (member === true) {
+    await ctx.answerCallbackQuery("✅ Kamu sudah bergabung. Akses dilanjutkan.").catch(() => {});
+    const subscription = await getUserSubscription(ctx.from.id);
+    return replaceUi(ctx, userPurchaseText(subscription), userPurchaseKeyboard(), { parse_mode: "HTML" });
+  }
+  if (member === false) {
+    return ctx.answerCallbackQuery("❌ Kamu belum join Channel Resmi. Silakan join terlebih dahulu.", { show_alert: true });
+  }
+  return ctx.answerCallbackQuery("⚠️ Keanggotaan belum dapat diverifikasi. Coba lagi.", { show_alert: true });
+});
+
+bot.callbackQuery(/^user:order:(ADMIN_ANAK|ADMIN_VIP|ADMIN_PREMIUM)$/, async ctx => {
+  const member = await isOfficialChannelMember(ctx.from.id);
+  if (member !== true) {
+    return ctx.answerCallbackQuery("❌ Kamu belum join Channel Resmi. Silakan join terlebih dahulu.", { show_alert: true });
+  }
+
+  const role = String(ctx.match[1]);
+  const subscription = await getUserSubscription(ctx.from.id);
+  const orderText = userOrderText(ctx, role, subscription);
+  const kb = new InlineKeyboard()
+    .url("📤 Kirim Order ke Owner", ownerOrderUrl(orderText))
+    .row()
+    .text("⬅️ Pilih Paket", "user:purchase")
+    .row()
+    .url("📢 Channel Resmi", "https://t.me/jasebvortex");
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  return replaceUi(ctx, orderText, kb, { parse_mode: "HTML" });
+});
+
+bot.callbackQuery("user:purchase", async ctx => {
+  const member = await isOfficialChannelMember(ctx.from.id);
+  if (member !== true) return ctx.answerCallbackQuery("❌ Kamu belum join Channel Resmi. Silakan join terlebih dahulu.", { show_alert: true });
+  await ctx.answerCallbackQuery().catch(() => {});
+  const subscription = await getUserSubscription(ctx.from.id);
+  return replaceUi(ctx, userPurchaseText(subscription), userPurchaseKeyboard(), { parse_mode: "HTML" });
+});
+
+// Best-effort immediate re-gating when Telegram sends a channel membership update.
+bot.on("chat_member", async ctx => {
+  const userId = ctx.chatMember?.user?.id;
+  if (!userId) return;
+  if (String(ctx.chat?.username || "").toLowerCase() !== OFFICIAL_CHANNEL.slice(1).toLowerCase()) return;
+  const status = String(ctx.chatMember?.new_chat_member?.status || "").toLowerCase();
+  if (!["left", "kicked"].includes(status)) return;
+  const admin = await getAdminByTelegramId(userId).catch(() => null);
+  if (admin) return;
+  const subscription = await getUserSubscription(userId).catch(() => null);
+  if (!subscription || !subscriptionIsActive(subscription)) return;
+  await bot.api.sendMessage(userId, userJoinText(), { parse_mode: "HTML", reply_markup: joinChannelKeyboard() }).catch(() => {});
+});
+
+/* =========================================================
    START / DASHBOARD
 ========================================================= */
 
@@ -4108,10 +4396,11 @@ bot.command("start", async ctx => {
     const adminRow = await getAdminByTelegramId(ctx.from.id);
 
     if (!adminRow) {
+      const subscription = await getUserSubscription(ctx.from.id);
       return renderUi(
         ctx.from.id,
-        "⛔ <b>Akses ditolak.</b>\n\nBot ini sekarang hanya digunakan oleh admin yang terdaftar.",
-        new InlineKeyboard(),
+        userPurchaseText(subscription),
+        userPurchaseKeyboard(),
         { parse_mode: "HTML" }
       );
     }
@@ -5122,51 +5411,31 @@ async function getPrivatePromoSourceGroups(accountId) {
   return data || [];
 }
 
-function rememberPrivatePromoSearch(userKey, query, page = 0) {
-  const token = crypto.randomBytes(5).toString("hex");
-  privatePromoSearches.set(token, {
-    userKey: String(userKey),
-    query: String(query || "").trim(),
-    page: Math.max(0, Number(page) || 0),
-    createdAt: Date.now()
-  });
-
-  while (privatePromoSearches.size > MAX_PRIVATE_PROMO_SEARCHES) {
-    const first = privatePromoSearches.keys().next().value;
-    if (!first) break;
-    privatePromoSearches.delete(first);
-  }
-  return token;
-}
-
-function privatePromoGroupsKeyboard(rows, selectedIds, page = 0, total = 0, searchToken = null) {
+function privatePromoGroupsKeyboard(rows, selectedIds, page = 0) {
   const kb = new InlineKeyboard();
   const selected = selectedIds instanceof Set ? selectedIds : new Set(selectedIds || []);
 
   for (const row of rows) {
     const id = String(row.id);
-    // X means not selected. Keep the checked state as a checkbox.
-    const icon = selected.has(id) ? "☑️" : "❌";
+    const icon = selected.has(id) ? "☑️" : "⬜";
     kb
       .text(
         `${icon} ${safeButtonText(row.title, 30)}`,
-        searchToken ? `privatepromo:searchgroup:${id}:${searchToken}:${page}` : `privatepromo:group:${id}:${page}`
+        `privatepromo:group:${id}:${page}`
       )
       .row();
   }
 
   const hasPrev = page > 0;
-  const hasNext = (page + 1) * PRIVATE_PROMO_PAGE_SIZE < total;
-  if (hasPrev) kb.text("◀️", searchToken ? `privatepromo:searchpage:${searchToken}:${page - 1}` : `privatepromo:groups:${page - 1}`);
+  const hasNext = (page + 1) * PRIVATE_PROMO_PAGE_SIZE < rows._privatePromoTotal;
+
+  if (hasPrev) kb.text("◀️", `privatepromo:groups:${page - 1}`);
   kb.text("🏠", "menu:dashboard");
-  if (hasNext) kb.text("▶️", searchToken ? `privatepromo:searchpage:${searchToken}:${page + 1}` : `privatepromo:groups:${page + 1}`);
+  if (hasNext) kb.text("▶️", `privatepromo:groups:${page + 1}`);
   kb.row();
 
-  const allSelected = total > 0 && selected.size >= total;
-  kb.text(allSelected ? "❌ Batalkan Semua Pilihan" : "☑️ Pilih Semua Grup", "privatepromo:groups:all").row();
-  kb.text("🔎 Cari Nama Grup", "privatepromo:search").row();
-  kb.text("🔄 Deteksi Grup", "privatepromo:groups:refresh").row();
   kb.text("✅ Lanjut", "privatepromo:groups:continue").row();
+  kb.text("🔄 Deteksi Grup", "privatepromo:groups:refresh").row();
   kb.text("❌ Batal", "privatepromo:cancel");
 
   return kb;
@@ -5179,7 +5448,7 @@ async function renderPrivatePromoGroups(ctx, page = 0, notice = "") {
   if (!state?.accountId) {
     return replaceUi(
       ctx,
-      "⚠️ <b>Sesi Promosi Chat Privat tidak tersedia.</b>\n\nSilakan buka menu Promosi Chat Privat kembali.",
+      "⚠️ <b>Sesi Promosi Chat Privat tidak tersedia.</b>",
       new InlineKeyboard().text("📢 Promosi Chat Privat", "privatepromo:accounts:0").row()
         .text("🏠 Menu Utama", "menu:dashboard"),
       { parse_mode: "HTML" }
@@ -5204,11 +5473,8 @@ async function renderPrivatePromoGroups(ctx, page = 0, notice = "") {
   const start = safePage * PRIVATE_PROMO_PAGE_SIZE;
   const visible = rows.slice(start, start + PRIVATE_PROMO_PAGE_SIZE);
 
-  // New session: automatically select every detected group.
-  if (!state.groupsInitialized) {
-    state.selectedGroupIds = new Set(rows.map(row => String(row.id)));
-    state.groupsInitialized = true;
-  }
+  // Keep total attached only to this local array instance for keyboard pagination.
+  visible._privatePromoTotal = total;
 
   const selectedCount = state.selectedGroupIds?.size || 0;
   const text = [
@@ -5221,64 +5487,18 @@ async function renderPrivatePromoGroups(ctx, page = 0, notice = "") {
     "",
     visible.length
       ? visible.map(row => {
-          const icon = state.selectedGroupIds.has(String(row.id)) ? "☑️" : "❌";
+          const icon = state.selectedGroupIds.has(String(row.id)) ? "☑️" : "⬜";
           return `${icon} <b>${escapeHtml(row.title || "Tanpa Nama")}</b>`;
-        }).join("\n\n")
+        }).join("\n")
       : "<i>Belum ada grup yang terdeteksi untuk akun ini.</i>",
     "",
-    "Semua grup otomatis dipilih. Kamu bisa membatalkan pilihan tertentu, mencari grup berdasarkan nama, lalu tekan <b>✅ Lanjut</b>."
+    "Pilih satu atau beberapa grup sumber member, lalu tekan <b>✅ Lanjut</b>."
   ].filter(Boolean).join("\n");
 
   return replaceUi(
     ctx,
     text,
-    privatePromoGroupsKeyboard(visible, state.selectedGroupIds, safePage, total),
-    { parse_mode: "HTML" }
-  );
-}
-
-async function renderPrivatePromoSearch(ctx, token, page = 0) {
-  const userKey = String(ctx.from.id);
-  const search = privatePromoSearches.get(String(token));
-  const state = privatePromotionRuns.get(userKey);
-  if (!search || search.userKey !== userKey || !state || state.running) {
-    return replaceUi(
-      ctx,
-      "⚠️ <b>Pencarian grup sudah tidak tersedia.</b>\n\nSilakan buka pencarian grup kembali.",
-      new InlineKeyboard().text("⬅️ Kembali Pilih Grup", "privatepromo:groups:0"),
-      { parse_mode: "HTML" }
-    );
-  }
-
-  const query = String(search.query || "").trim();
-  const allRows = await getPrivatePromoSourceGroups(state.accountId);
-  const filtered = allRows.filter(row => String(row.title || "").toLowerCase().includes(query.toLowerCase()));
-  const total = filtered.length;
-  const maxPage = Math.max(0, Math.ceil(total / PRIVATE_PROMO_PAGE_SIZE) - 1);
-  const safePage = Math.min(Math.max(0, Number(page) || 0), maxPage);
-  const start = safePage * PRIVATE_PROMO_PAGE_SIZE;
-  const visible = filtered.slice(start, start + PRIVATE_PROMO_PAGE_SIZE);
-  search.page = safePage;
-
-  const text = [
-    "🔎 <b>CARI NAMA GRUP</b>",
-    `Kata kunci: <code>${escapeHtml(query)}</code>`,
-    `Ditemukan: <b>${total}</b>`,
-    "",
-    visible.length
-      ? visible.map(row => {
-          const icon = state.selectedGroupIds.has(String(row.id)) ? "☑️" : "❌";
-          return `${icon} <b>${escapeHtml(row.title || "Tanpa Nama")}</b>`;
-        }).join("\n\n")
-      : "<i>Grup dengan nama tersebut tidak ditemukan.</i>",
-    "",
-    "Tekan nama grup untuk memilih atau membatalkan pilihan."
-  ].join("\n");
-
-  return replaceUi(
-    ctx,
-    text,
-    privatePromoGroupsKeyboard(visible, state.selectedGroupIds, safePage, total, token),
+    privatePromoGroupsKeyboard(visible, state.selectedGroupIds, safePage),
     { parse_mode: "HTML" }
   );
 }
@@ -5384,8 +5604,6 @@ function privatePromoErrorCategory(error) {
     "user_deleted"
   )) return "Akun user sudah dihapus/nonaktif";
 
-  if (has("peer_flood", "peerflood") && !has("flood_wait")) return "Telegram membatasi pengiriman karena terlalu banyak pesan dalam waktu singkat (PEER_FLOOD)";
-
   if (has(
     "chat_write_forbidden",
     "chat_forbidden",
@@ -5394,7 +5612,7 @@ function privatePromoErrorCategory(error) {
     "cannot_message",
     "you_cant_write",
     "you_cannot_write"
-  )) return "Telegram tidak mengizinkan pengiriman ke user tersebut";
+  )) return "Telegram tidak mengizinkan pengiriman";
 
   return null;
 }
@@ -5811,48 +6029,6 @@ async function renderPrivatePromoFinished(userKey, accountId, groupTitles, admin
   }, 10 * 60 * 1000);
 }
 
-function privatePromoFormatKeyboard(state) {
-  const kb = new InlineKeyboard();
-  if (state.running) kb.text("🛑 Stop Promosi", "privatepromo:stop");
-  else kb.text("▶️ Mulai Promosi", "privatepromo:start");
-  kb.row();
-  kb.text("✏️ Edit Format", "privatepromo:edit");
-  kb.text("🔄 Ubah Format", "privatepromo:change").row();
-  kb.text("🗑️ Hapus Format", "privatepromo:delete").row();
-  kb.text("👥 Ubah Grup", "privatepromo:groups:0").row();
-  kb.text("🏠 Menu Utama", "menu:dashboard");
-  return kb;
-}
-
-async function renderPrivatePromoFormatMenu(ctx, state, sourceRows, adminRow, notice = "") {
-  const selectedIds = new Set(state.selectedGroupIds || []);
-  const groupTitles = (sourceRows || []).map(row => row.title || "Tanpa Nama");
-  const text = [
-    notice,
-    "📢 <b>PROMOSI CHAT PRIVAT</b>",
-    "━━━━━━━━━━━━━━━━━━",
-    `👥 Grup sumber: <b>${groupTitles.length}</b>`,
-    groupTitles.length ? groupTitles.map(t => `• ${escapeHtml(t)}`).join("\n") : "• -",
-    "",
-    "📝 <b>FORMAT PROMOSI</b>",
-    "━━━━━━━━━━━━━━━━━━",
-    escapeHtml(state.message || "-"),
-    "",
-    state.running
-      ? "🟢 Promosi sedang berjalan. Gunakan <b>🛑 Stop Promosi</b> untuk menghentikan."
-      : "⏸️ Format sudah tersimpan. Promosi <b>belum dimulai</b> sampai kamu menekan <b>▶️ Mulai Promosi</b>."
-  ].filter(Boolean).join("\n");
-  return replaceUi(ctx, text, privatePromoFormatKeyboard(state), { parse_mode: "HTML" });
-}
-
-async function privatePromoAnswer(ctx, text) {
-  try {
-    const callbackId = ctx.callbackQuery?.id;
-    if (!callbackId) return;
-    await ctx.api.answerCallbackQuery(callbackId, { text: String(text), show_alert: true });
-  } catch (_) {}
-}
-
 /* -------------------------
    PRIVATE PROMOTION MENU
 -------------------------- */
@@ -5941,7 +6117,6 @@ bot.callbackQuery(/^privatepromo:account:(\d+)$/, async ctx => {
     accountId,
     adminId: adminRow.id,
     selectedGroupIds: new Set(),
-    groupsInitialized: false,
     running: false,
     stopRequested: false,
     stats: { total: 0, success: 0, failed: 0, skipped: 0 },
@@ -5949,28 +6124,6 @@ bot.callbackQuery(/^privatepromo:account:(\d+)$/, async ctx => {
   });
 
   return renderPrivatePromoGroups(ctx, 0);
-});
-
-bot.callbackQuery(/^privatepromo:searchgroup:(\d+):([a-f0-9]+):(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
-  const userKey = String(ctx.from.id);
-  const state = privatePromotionRuns.get(userKey);
-  if (!state || state.running) return privatePromoAnswer(ctx, "Sesi pemilihan grup tidak aktif.");
-  const groupId = String(ctx.match[1]);
-  const token = String(ctx.match[2]);
-  const page = Math.max(0, Number(ctx.match[3] || 0));
-  const search = privatePromoSearches.get(token);
-  if (!search || search.userKey !== userKey) return privatePromoAnswer(ctx, "Pencarian grup sudah kedaluwarsa.");
-  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
-  const { data: group, error } = await sb.from("account_groups").select("*").eq("id", groupId).eq("account_id", state.accountId).maybeSingle();
-  if (error || !group) return privatePromoAnswer(ctx, "Grup tidak ditemukan.");
-  if (!state.selectedGroupIds) state.selectedGroupIds = new Set();
-  if (state.selectedGroupIds.has(groupId)) state.selectedGroupIds.delete(groupId);
-  else state.selectedGroupIds.add(groupId);
-  await ctx.answerCallbackQuery().catch(() => {});
-  return renderPrivatePromoSearch(ctx, token, page);
 });
 
 bot.callbackQuery(/^privatepromo:group:(\d+):(\d+)$/, async ctx => {
@@ -5998,7 +6151,7 @@ bot.callbackQuery(/^privatepromo:group:(\d+):(\d+)$/, async ctx => {
     .maybeSingle();
 
   if (error || !group) {
-    return privatePromoAnswer(ctx, "Grup tidak ditemukan.");
+    return ctx.answerCallbackQuery("Grup tidak ditemukan.", { show_alert: true });
   }
 
   if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
@@ -6019,54 +6172,12 @@ bot.callbackQuery(/^privatepromo:groups:(\d+)$/, async ctx => {
 
   const state = privatePromotionRuns.get(String(ctx.from.id));
   if (!state || state.running) {
-    return privatePromoAnswer(ctx, "Sesi promosi tidak aktif.");
+    return ctx.answerCallbackQuery("Sesi promosi tidak aktif.", { show_alert: true });
   }
 
   if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
   await ctx.answerCallbackQuery().catch(() => {});
   return renderPrivatePromoGroups(ctx, Math.max(0, Number(ctx.match[1] || 0)));
-});
-
-bot.callbackQuery("privatepromo:groups:all", async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
-  const userKey = String(ctx.from.id);
-  const state = privatePromotionRuns.get(userKey);
-  if (!state || state.running) return privatePromoAnswer(ctx, "Sesi pemilihan grup tidak aktif.");
-  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
-
-  const rows = await getPrivatePromoSourceGroups(state.accountId);
-  const allIds = new Set(rows.map(row => String(row.id)));
-  const allSelected = allIds.size > 0 && state.selectedGroupIds.size >= allIds.size;
-  state.selectedGroupIds = allSelected ? new Set() : allIds;
-  state.groupsInitialized = true;
-  await ctx.answerCallbackQuery().catch(() => {});
-  return renderPrivatePromoGroups(ctx, 0, allSelected ? "❌ Semua pilihan dibatalkan." : "☑️ Semua grup berhasil dipilih.");
-});
-
-bot.callbackQuery("privatepromo:search", async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
-  const state = privatePromotionRuns.get(String(ctx.from.id));
-  if (!state || state.running) return privatePromoAnswer(ctx, "Sesi pemilihan grup tidak aktif.");
-  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
-  flows.set(String(ctx.from.id), { t: "private_promo_search", accountId: state.accountId, adminId: adminRow.id });
-  await ctx.answerCallbackQuery().catch(() => {});
-  return replaceUi(ctx, "🔎 <b>CARI NAMA GRUP</b>\n\nKetik nama atau sebagian nama grup yang ingin dicari.\n\nContoh: <code>lpm</code>", cancelKeyboard(false), { parse_mode: "HTML" });
-});
-
-bot.callbackQuery(/^privatepromo:searchpage:([a-f0-9]+):(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
-  const token = String(ctx.match[1]);
-  const search = privatePromoSearches.get(token);
-  if (!search || search.userKey !== String(ctx.from.id)) return privatePromoAnswer(ctx, "Pencarian grup sudah kedaluwarsa.");
-  if (!await requireAccountAccess(ctx, adminRow, privatePromotionRuns.get(String(ctx.from.id))?.accountId)) return;
-  await ctx.answerCallbackQuery().catch(() => {});
-  return renderPrivatePromoSearch(ctx, token, Number(ctx.match[2] || 0));
 });
 
 bot.callbackQuery("privatepromo:groups:continue", async ctx => {
@@ -6078,14 +6189,14 @@ bot.callbackQuery("privatepromo:groups:continue", async ctx => {
   const userKey = String(ctx.from.id);
   const state = privatePromotionRuns.get(userKey);
   if (!state || state.running) {
-    return privatePromoAnswer(ctx, "Sesi promosi tidak aktif.");
+    return ctx.answerCallbackQuery("Sesi promosi tidak aktif.", { show_alert: true });
   }
 
   if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
 
   const selectedIds = Array.from(state.selectedGroupIds || []);
   if (!selectedIds.length) {
-    return privatePromoAnswer(ctx, "Pilih minimal satu grup terlebih dahulu.");
+    return ctx.answerCallbackQuery("Pilih minimal satu grup sumber.", { show_alert: true });
   }
 
   state.stage = "message";
@@ -6104,9 +6215,11 @@ bot.callbackQuery("privatepromo:groups:continue", async ctx => {
       "",
       `☑️ Grup sumber dipilih: <b>${selectedIds.length}</b>`,
       "",
-      "Kirim <b>teks/format promosi</b> yang ingin digunakan.",
+      "Kirim <b>pesan promosi</b> yang akan dikirim ke target.",
       "",
-      "⚠️ Setelah format diterima, promosi <b>tidak akan langsung dimulai</b>. Kamu akan masuk ke menu pengaturan untuk memilih Mulai, Stop, Edit/Ubah Format, atau Hapus Format."
+      "Setelah pesan diterima, sistem akan mengambil member dari grup yang dipilih, deduplicate berdasarkan Telegram user ID, lalu memproses target satu per satu.",
+      "",
+      "⚠️ Pengiriman tetap mengikuti pembatasan dan rate limit Telegram."
     ].join("\n"),
     new InlineKeyboard().text("❌ Batal", "privatepromo:cancel"),
     { parse_mode: "HTML" }
@@ -6121,7 +6234,7 @@ bot.callbackQuery("privatepromo:groups:refresh", async ctx => {
 
   const state = privatePromotionRuns.get(String(ctx.from.id));
   if (!state || state.running) {
-    return privatePromoAnswer(ctx, "Sesi promosi tidak aktif.");
+    return ctx.answerCallbackQuery("Sesi promosi tidak aktif.", { show_alert: true });
   }
 
   if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
@@ -6139,76 +6252,6 @@ bot.callbackQuery("privatepromo:groups:refresh", async ctx => {
   }
 });
 
-bot.callbackQuery("privatepromo:start", async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
-  const userKey = String(ctx.from.id);
-  const state = privatePromotionRuns.get(userKey);
-  if (!state) return privatePromoAnswer(ctx, "Sesi Promosi Chat Privat tidak tersedia.");
-  if (state.running) return privatePromoAnswer(ctx, "Promosi sedang berjalan.");
-  if (!state.message) return privatePromoAnswer(ctx, "Masukkan format promosi terlebih dahulu.");
-  if (!state.selectedGroupIds?.size) return privatePromoAnswer(ctx, "Pilih minimal satu grup terlebih dahulu.");
-  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
-
-  const selectedIds = Array.from(state.selectedGroupIds);
-  const { data: groupRows, error } = await sb.from("account_groups").select("*").eq("account_id", state.accountId).in("id", selectedIds);
-  if (error) return privatePromoAnswer(ctx, `Gagal memuat grup: ${safeErrorMessage(error, 180)}`);
-  if (!groupRows?.length) return privatePromoAnswer(ctx, "Grup yang dipilih sudah tidak tersedia.");
-
-  await ctx.answerCallbackQuery().catch(() => {});
-  state.stage = "running";
-  void runPrivatePromotion(userKey, state.accountId, groupRows, state.message, adminRow).catch(async error => {
-    console.error("PRIVATE PROMOTION:", safeErrorMessage(error, 800));
-    const current = privatePromotionRuns.get(userKey);
-    if (!current) return;
-    current.running = false;
-    current.sourceFailures = [...(current.sourceFailures || []), { title: "Promosi Chat Privat", reason: safeErrorMessage(error, 300) }];
-    await renderPrivatePromoFormatMenu(ctx, current, groupRows, adminRow, `❌ Promosi gagal dijalankan: ${escapeHtml(safeErrorMessage(error, 300))}`).catch(() => {});
-  });
-  return;
-});
-
-bot.callbackQuery("privatepromo:edit", async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
-  const userKey = String(ctx.from.id);
-  const state = privatePromotionRuns.get(userKey);
-  if (!state || state.running) return privatePromoAnswer(ctx, "Promosi sedang berjalan. Hentikan dulu sebelum mengubah format.");
-  flows.set(userKey, { t: "private_promo_message", accountId: state.accountId, adminId: adminRow.id });
-  await ctx.answerCallbackQuery().catch(() => {});
-  return replaceUi(ctx, "✏️ <b>EDIT FORMAT PROMOSI</b>\n\nKirim format/teks promosi yang baru. Format lama akan diganti setelah pesan baru diterima.", cancelKeyboard(false), { parse_mode: "HTML" });
-});
-
-bot.callbackQuery("privatepromo:change", async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
-  const userKey = String(ctx.from.id);
-  const state = privatePromotionRuns.get(userKey);
-  if (!state || state.running) return privatePromoAnswer(ctx, "Promosi sedang berjalan. Hentikan dulu sebelum mengubah format.");
-  flows.set(userKey, { t: "private_promo_message", accountId: state.accountId, adminId: adminRow.id });
-  await ctx.answerCallbackQuery().catch(() => {});
-  return replaceUi(ctx, "🔄 <b>UBAH FORMAT PROMOSI</b>\n\nKirim teks/format promosi yang baru.", cancelKeyboard(false), { parse_mode: "HTML" });
-});
-
-bot.callbackQuery("privatepromo:delete", async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
-  const userKey = String(ctx.from.id);
-  const state = privatePromotionRuns.get(userKey);
-  if (!state || state.running) return privatePromoAnswer(ctx, "Promosi sedang berjalan. Hentikan dulu sebelum menghapus format.");
-  state.message = "";
-  state.stage = "groups";
-  state.groupsInitialized = false;
-  state.selectedGroupIds = new Set();
-  flows.delete(userKey);
-  await ctx.answerCallbackQuery().catch(() => {});
-  return renderPrivatePromoGroups(ctx, 0, "🗑️ Format promosi sudah dihapus. Pilih grup kembali jika diperlukan.");
-});
-
 bot.callbackQuery("privatepromo:stop", async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
@@ -6218,10 +6261,10 @@ bot.callbackQuery("privatepromo:stop", async ctx => {
   const userKey = String(ctx.from.id);
   const state = privatePromotionRuns.get(userKey);
   if (!state) {
-    return privatePromoAnswer(ctx, "Tidak ada promosi yang sedang berjalan.");
+    return ctx.answerCallbackQuery("Tidak ada promosi yang sedang berjalan.", { show_alert: true });
   }
 
-  await privatePromoAnswer(ctx, "Permintaan stop diterima. Target yang sedang diproses akan diselesaikan jika memungkinkan.").catch(() => {});
+  await ctx.answerCallbackQuery("Permintaan stop diterima. Target yang sedang diproses akan diselesaikan jika memungkinkan.").catch(() => {});
   state.stopRequested = true;
 
   if (!state.running) {
@@ -6266,7 +6309,7 @@ bot.callbackQuery("privatepromo:cancel", async ctx => {
 
   privatePromotionRuns.delete(userKey);
   flows.delete(userKey);
-  await privatePromoAnswer(ctx, "Dibatalkan").catch(() => {});
+  await ctx.answerCallbackQuery("Dibatalkan").catch(() => {});
 
   return replaceUi(
     ctx,
@@ -6410,6 +6453,96 @@ bot.callbackQuery("admin:add:basic", async ctx => {
     cancelKeyboard(true),
     { parse_mode: "HTML" }
   );
+});
+
+async function activateAdminFromDuration(ctx, days) {
+  const owner = await requireAdmin(ctx);
+  if (!owner) return;
+  const userKey = String(ctx.from.id);
+  const flow = flows.get(userKey);
+  if (!flow || flow.t !== "admin_add_duration") {
+    return ctx.answerCallbackQuery("Sesi tambah admin sudah tidak aktif.", { show_alert: true });
+  }
+
+  const role = flow.adminRole;
+  const targetId = Number(flow.targetId);
+  if (!targetId || !["ADMIN_ANAK", "ADMIN_VIP", "ADMIN_PREMIUM"].includes(role)) {
+    flows.delete(userKey);
+    return ctx.answerCallbackQuery("Data admin tidak valid.", { show_alert: true });
+  }
+  if (owner.role !== "OWNER" && role !== "ADMIN_ANAK") {
+    flows.delete(userKey);
+    return ctx.answerCallbackQuery("Admin VIP/Premium hanya dapat menambah Admin Biasa.", { show_alert: true });
+  }
+  if (owner.role === "ADMIN_VIP") {
+    const countResult = await sb.from("admins").select("id", { count: "exact", head: true }).eq("parent_admin_id", owner.id).eq("active", true);
+    if (countResult.error) throw countResult.error;
+    const existing = await sb.from("admins").select("id,role,active").eq("telegram_user_id", targetId).maybeSingle();
+    if (existing.error) throw existing.error;
+    const alreadyChild = existing.data?.active && String(existing.data.parent_admin_id || "") === String(owner.id);
+    if (!alreadyChild && Number(countResult.count || 0) >= 20) {
+      flows.delete(userKey);
+      return replaceUi(ctx, "⚠️ <b>Batas Admin VIP tercapai.</b>\n\nAdmin VIP maksimal memiliki 20 Admin aktif.", new InlineKeyboard().text("⬅️ Admin", "admin:list:0"), { parse_mode: "HTML" });
+    }
+  }
+
+  const existing = await sb.from("admins").select("*").eq("telegram_user_id", targetId).maybeSingle();
+  if (existing.error) throw existing.error;
+  const expiresAt = new Date(Date.now() + Number(days) * 24 * 60 * 60 * 1000).toISOString();
+  const parentId = role === "ADMIN_ANAK" && ["ADMIN_VIP", "ADMIN_PREMIUM"].includes(owner.role) ? owner.id : null;
+
+  let adminData;
+  if (existing.data) {
+    const updated = await sb.from("admins").update({ role, active: true, parent_admin_id: parentId, updated_at: new Date().toISOString() }).eq("id", existing.data.id).select("*").single();
+    if (updated.error) throw updated.error;
+    adminData = updated.data;
+  } else {
+    const inserted = await sb.from("admins").insert({ telegram_user_id: targetId, role, active: true, parent_admin_id: parentId }).select("*").single();
+    if (inserted.error) throw inserted.error;
+    adminData = inserted.data;
+  }
+
+  try {
+    await saveUserSubscription({
+      telegram_user_id: targetId,
+      role,
+      active: true,
+      expires_at: expiresAt,
+      parent_admin_id: parentId,
+      activated_by: owner.telegram_user_id
+    });
+  } catch (error) {
+    // Roll back the admin activation if the subscription table is unavailable so
+    // an account never receives a role that cannot be expiry-checked.
+    try { await sb.from("admins").update({ active: false, updated_at: new Date().toISOString() }).eq("id", adminData.id); } catch (_) {}
+    throw new Error("Tabel masa aktif belum tersedia. Jalankan SQL bot_subscriptions.sql terlebih dahulu.");
+  }
+
+  flows.delete(userKey);
+  if (ctx.callbackQuery) await ctx.answerCallbackQuery("Masa aktif berhasil disimpan.").catch(() => {});
+  return replaceUi(
+    ctx,
+    `✅ <b>${escapeHtml(displayAdminRole(role))} AKTIF</b>\n\nTelegram ID: <code>${targetId}</code>\nMasa aktif: <b>${days} hari</b>\nBerakhir: <b>${escapeHtml(formatDate(expiresAt))}</b>\n\nAkses otomatis ditolak setelah masa aktif habis.`,
+    new InlineKeyboard().text("👥 Daftar Admin", "admin:list:0").row().text("🏠 Dashboard", "menu:dashboard"),
+    { parse_mode: "HTML" }
+  );
+}
+
+bot.callbackQuery(/^admin:duration:(7|30|90|180|365)$/, async ctx => {
+  try { return await activateAdminFromDuration(ctx, Number(ctx.match[1])); }
+  catch (error) {
+    return replaceUi(ctx, `❌ Gagal mengatur masa aktif.\n\n${escapeHtml(safeErrorMessage(error, 500))}`, new InlineKeyboard().text("👥 Admin", "admin:list:0"), { parse_mode: "HTML" });
+  }
+});
+
+bot.callbackQuery("admin:duration:custom", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  const flow = flows.get(String(ctx.from.id));
+  if (!flow || flow.t !== "admin_add_duration") return ctx.answerCallbackQuery("Sesi sudah tidak aktif.", { show_alert: true });
+  await ctx.answerCallbackQuery().catch(() => {});
+  flows.set(String(ctx.from.id), { ...flow, t: "admin_duration_custom" });
+  return replaceUi(ctx, "✏️ <b>ATUR MASA AKTIF</b>\n\nKirim jumlah hari berupa angka.\nContoh: <code>30</code> = 30 hari, <code>60</code> = 60 hari.", cancelKeyboard(adminRow.role === "OWNER"), { parse_mode: "HTML" });
 });
 
 bot.callbackQuery("admin:delete", async ctx => {
@@ -6695,22 +6828,6 @@ bot.on("message", async (ctx, next) => {
     }
 
     /* -------------------------
-       PRIVATE PROMOTION: GROUP SEARCH
-    -------------------------- */
-    if (flow.t === "private_promo_search") {
-      const query = String(ctx.message.text || "").trim().replace(/\s+/g, " ");
-      if (!query) return replaceUi(ctx, "❌ Nama grup tidak boleh kosong. Silakan ketik nama atau sebagian nama grup.", cancelKeyboard(false), { parse_mode: "HTML" });
-      if (query.length > 80) return replaceUi(ctx, "❌ Kata pencarian terlalu panjang. Maksimal 80 karakter.", cancelKeyboard(false), { parse_mode: "HTML" });
-      try {
-        const token = rememberPrivatePromoSearch(userKey, query, 0);
-        flows.delete(userKey);
-        return renderPrivatePromoSearch(ctx, token, 0);
-      } catch (e) {
-        return replaceUi(ctx, `❌ Pencarian grup gagal.\n\n${escapeHtml(safeErrorMessage(e))}`, new InlineKeyboard().text("⬅️ Kembali Pilih Grup", "privatepromo:groups:0"), { parse_mode: "HTML" });
-      }
-    }
-
-    /* -------------------------
        PRIVATE PROMOTION: MESSAGE
     -------------------------- */
     if (flow.t === "private_promo_message") {
@@ -6792,12 +6909,53 @@ bot.on("message", async (ctx, next) => {
 
       flows.delete(userKey);
 
-      // Only save the format here. The user must explicitly press Mulai.
+      // The worker owns the same runtime state and can be stopped by the
+      // callback handler while it is collecting/sending targets.
       state.message = message;
-      state.stage = "ready";
-      state.running = false;
-      state.stopRequested = false;
-      return renderPrivatePromoFormatMenu(ctx, state, sourceRows, adminRow);
+      state.stage = "running";
+
+      void runPrivatePromotion(
+        userKey,
+        state.accountId,
+        sourceRows,
+        message,
+        adminRow
+      ).catch(async error => {
+        console.error("PRIVATE PROMOTION:", safeErrorMessage(error, 800));
+
+        const current = privatePromotionRuns.get(userKey);
+        if (current) {
+          current.running = false;
+          current.sourceFailures = [
+            ...(current.sourceFailures || []),
+            {
+              title: "Promosi Chat Privat",
+              reason: safeErrorMessage(error, 300)
+            }
+          ];
+
+          await renderUi(
+            userKey,
+            [
+              "❌ <b>PROMOSI CHAT PRIVAT BERHENTI KARENA ERROR</b>",
+              "",
+              `👥 Total Target: <b>${current.stats?.total || 0}</b>`,
+              `✅ Berhasil: <b>${current.stats?.success || 0}</b>`,
+              `❌ Gagal: <b>${current.stats?.failed || 0}</b>`,
+              `⏭️ Skip: <b>${current.stats?.skipped || 0}</b>`,
+              "",
+              `⚠️ ${escapeHtml(safeErrorMessage(error, 500))}`
+            ].join("\n"),
+            new InlineKeyboard()
+              .text("📢 Promosi Lagi", "privatepromo:accounts:0")
+              .row()
+              .text("🏠 Menu Utama", "menu:dashboard"),
+            { parse_mode: "HTML" }
+          ).catch(() => {});
+        }
+      });
+
+      return;
     }
 
     /* -------------------------
@@ -6914,6 +7072,24 @@ bot.on("message", async (ctx, next) => {
     }
 
     /* -------------------------
+       ADMIN DURATION CUSTOM
+    -------------------------- */
+    if (flow.t === "admin_duration_custom") {
+      const days = Number(String(ctx.message.text || "").trim());
+      if (!Number.isInteger(days) || days < 1 || days > 3650) {
+        return renderUi(telegramUserId, "❌ Jumlah hari tidak valid. Masukkan angka 1 sampai 3650.", cancelKeyboard(adminRow.role === "OWNER"), { parse_mode: "HTML" });
+      }
+      flows.set(userKey, { ...flow, t: "admin_add_duration" });
+      // Reuse the same activation path as the preset buttons.
+      const fakeCtx = ctx;
+      try {
+        return await activateAdminFromDuration(fakeCtx, days);
+      } catch (error) {
+        return renderUi(telegramUserId, `❌ Gagal mengatur masa aktif.\n\n${escapeHtml(safeErrorMessage(error, 500))}`, new InlineKeyboard().text("👥 Admin", "admin:list:0"), { parse_mode: "HTML" });
+      }
+    }
+
+    /* -------------------------
        ADMIN ADD / APPROVE
     -------------------------- */
     if (flow.t === "admin_add") {
@@ -6948,6 +7124,31 @@ bot.on("message", async (ctx, next) => {
         }
       }
 
+      flows.set(userKey, {
+        t: "admin_add_duration",
+        adminId: adminRow.id,
+        adminRole: role,
+        targetId
+      });
+      return replaceUi(
+        ctx,
+        `⏳ <b>ATUR MASA AKTIF</b>\n\nRole: <b>${escapeHtml(displayAdminRole(role))}</b>\nTelegram ID: <code>${targetId}</code>\n\nPilih masa aktif akses admin ini. Setelah habis, akses bot otomatis dinonaktifkan dan user harus memperpanjang.`,
+        new InlineKeyboard()
+          .text("7 Hari", "admin:duration:7")
+          .text("30 Hari", "admin:duration:30")
+          .row()
+          .text("3 Bulan", "admin:duration:90")
+          .text("6 Bulan", "admin:duration:180")
+          .row()
+          .text("12 Bulan", "admin:duration:365")
+          .row()
+          .text("✏️ Atur Hari Sendiri", "admin:duration:custom")
+          .row()
+          .text("❌ Batal", adminRow.role === "OWNER" ? "admin:cancel" : "flow:cancel"),
+        { parse_mode: "HTML" }
+      );
+
+      /* Legacy activation block below is intentionally unreachable; duration callbacks perform activation. */
       const existing = await sb.from("admins").select("*").eq("telegram_user_id", targetId).maybeSingle();
       if (existing.error) throw existing.error;
 
