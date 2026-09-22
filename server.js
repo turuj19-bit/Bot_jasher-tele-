@@ -600,6 +600,19 @@ function displayAdminRole(role) {
   }[role] || role || "ADMIN");
 }
 
+function canUsePrivatePromotion(role) {
+  return role === "OWNER" || role === "ADMIN_PREMIUM";
+}
+
+async function requirePrivatePromotionAccess(ctx, adminRow) {
+  if (canUsePrivatePromotion(adminRow?.role)) return true;
+  await ctx.answerCallbackQuery(
+    "Promosi Chat Privat hanya tersedia untuk Admin Premium dan OWNER.",
+    { show_alert: true }
+  ).catch(() => {});
+  return false;
+}
+
 function dashboardText(ctx, stats, extra = "", role = "") {
   const first = String(ctx.from?.first_name || "").trim();
   const last = String(ctx.from?.last_name || "").trim();
@@ -721,7 +734,9 @@ function adminDashboardMenu(adminRow = null) {
   }
 
   kb.text("➕ Tambah Akun", "account:add").row();
-  kb.text("📢 Promosi Chat Privat", "privatepromo:accounts:0");
+  if (adminRow?.role === "ADMIN_PREMIUM") {
+    kb.text("📢 Promosi Chat Privat", "privatepromo:accounts:0");
+  }
   return kb;
 }
 
@@ -5725,6 +5740,8 @@ async function renderPrivatePromoFinished(userKey, accountId, groupTitles, admin
 bot.callbackQuery(/^privatepromo:accounts:(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+
 
   await ctx.answerCallbackQuery().catch(() => {});
   const page = Math.max(0, Number(ctx.match[1] || 0));
@@ -5763,6 +5780,8 @@ bot.callbackQuery(/^privatepromo:accounts:(\d+)$/, async ctx => {
 bot.callbackQuery(/^privatepromo:account:(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+
 
   await ctx.answerCallbackQuery().catch(() => {});
   const accountId = String(ctx.match[1]);
@@ -5814,6 +5833,8 @@ bot.callbackQuery(/^privatepromo:account:(\d+)$/, async ctx => {
 bot.callbackQuery(/^privatepromo:group:(\d+):(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+
 
   const userKey = String(ctx.from.id);
   const state = privatePromotionRuns.get(userKey);
@@ -5850,6 +5871,8 @@ bot.callbackQuery(/^privatepromo:group:(\d+):(\d+)$/, async ctx => {
 bot.callbackQuery(/^privatepromo:groups:(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+
 
   const state = privatePromotionRuns.get(String(ctx.from.id));
   if (!state || state.running) {
@@ -5864,6 +5887,8 @@ bot.callbackQuery(/^privatepromo:groups:(\d+)$/, async ctx => {
 bot.callbackQuery("privatepromo:groups:continue", async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+
 
   const userKey = String(ctx.from.id);
   const state = privatePromotionRuns.get(userKey);
@@ -5908,6 +5933,8 @@ bot.callbackQuery("privatepromo:groups:continue", async ctx => {
 bot.callbackQuery("privatepromo:groups:refresh", async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+
 
   const state = privatePromotionRuns.get(String(ctx.from.id));
   if (!state || state.running) {
@@ -5932,6 +5959,8 @@ bot.callbackQuery("privatepromo:groups:refresh", async ctx => {
 bot.callbackQuery("privatepromo:stop", async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+
 
   const userKey = String(ctx.from.id);
   const state = privatePromotionRuns.get(userKey);
@@ -5968,6 +5997,8 @@ bot.callbackQuery("privatepromo:stop", async ctx => {
 bot.callbackQuery("privatepromo:cancel", async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+
 
   const userKey = String(ctx.from.id);
   const state = privatePromotionRuns.get(userKey);
@@ -6047,7 +6078,7 @@ bot.callbackQuery(/^admin:list:(\d+)$/, async ctx => {
         : "<i>Belum ada admin yang dapat dilihat.</i>",
       "",
       adminRow.role === "OWNER"
-        ? "OWNER dapat mengelola Admin VIP dan Admin Premium."
+        ? "OWNER dapat menambah Admin Biasa, Admin VIP, atau Admin Premium."
         : adminRow.role === "ADMIN_VIP"
           ? "Admin VIP dapat mengelola maksimal 20 Admin miliknya sendiri."
           : "Admin Premium dapat mengelola Admin miliknya sendiri tanpa batas."
@@ -6070,7 +6101,9 @@ bot.callbackQuery("admin:add", async ctx => {
       ctx,
       "➕ <b>TAMBAH ADMIN</b>\n\nPilih jenis admin yang akan disetujui:",
       new InlineKeyboard()
+        .text("👤 Admin Biasa", "admin:add:basic")
         .text("⭐ Admin VIP", "admin:add:vip")
+        .row()
         .text("💎 Admin Premium", "admin:add:premium")
         .row()
         .text("⬅️ Admin", "admin:list:0"),
@@ -6112,9 +6145,17 @@ bot.callbackQuery("admin:add:premium", async ctx => {
 bot.callbackQuery("admin:add:basic", async ctx => {
   const owner = await requireAdmin(ctx, { ownerOnly: true });
   if (!owner) return;
-  return ctx.answerCallbackQuery(
-    "OWNER hanya dapat menambah Admin VIP atau Admin Premium.",
-    { show_alert: true }
+  await ctx.answerCallbackQuery().catch(() => {});
+  flows.set(String(ctx.from.id), {
+    t: "admin_add",
+    adminId: owner.id,
+    adminRole: "ADMIN_ANAK"
+  });
+  return replaceUi(
+    ctx,
+    "👤 <b>TAMBAH ADMIN BIASA</b>\n\nKirim Telegram user ID Admin Biasa yang ingin kamu setujui.\n\nAdmin Biasa hanya dapat menggunakan promosi biasa dan tidak memiliki akses ke menu Admin atau Promosi Chat Privat.",
+    cancelKeyboard(true),
+    { parse_mode: "HTML" }
   );
 });
 
@@ -6404,6 +6445,17 @@ bot.on("message", async (ctx, next) => {
        PRIVATE PROMOTION: MESSAGE
     -------------------------- */
     if (flow.t === "private_promo_message") {
+      if (!canUsePrivatePromotion(adminRow.role)) {
+        flows.delete(userKey);
+        privatePromotionRuns.delete(userKey);
+        return renderUi(
+          telegramUserId,
+          "⛔ <b>AKSES DITOLAK</b>\n\nPromosi Chat Privat hanya tersedia untuk Admin Premium dan OWNER.",
+          backDashboardKeyboard(),
+          { parse_mode: "HTML" }
+        );
+      }
+
       const state = privatePromotionRuns.get(userKey);
 
       if (!state || state.running) {
@@ -6652,8 +6704,8 @@ bot.on("message", async (ctx, next) => {
       }
 
       const role = flow.adminRole || (adminRow.role === "OWNER" ? "ADMIN_VIP" : "ADMIN_ANAK");
-      if (adminRow.role === "OWNER" && !["ADMIN_VIP", "ADMIN_PREMIUM"].includes(role)) {
-        return renderUi(telegramUserId, "❌ OWNER hanya dapat menambah Admin VIP atau Admin Premium.", cancelKeyboard(true), { parse_mode: "HTML" });
+      if (adminRow.role === "OWNER" && !["ADMIN_ANAK", "ADMIN_VIP", "ADMIN_PREMIUM"].includes(role)) {
+        return renderUi(telegramUserId, "❌ Role admin tidak valid. Pilih Admin Biasa, Admin VIP, atau Admin Premium.", cancelKeyboard(true), { parse_mode: "HTML" });
       }
       if (adminRow.role !== "OWNER" && role !== "ADMIN_ANAK") {
         return renderUi(telegramUserId, "⛔ Admin VIP/Premium hanya dapat menambah Admin biasa.", cancelKeyboard(false), { parse_mode: "HTML" });
