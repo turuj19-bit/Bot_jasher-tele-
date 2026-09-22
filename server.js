@@ -118,6 +118,8 @@ const MAX_GROUP_SEARCHES = 100;
 // so it does not require any database/schema change and never touches the
 // existing scheduler/session state.
 const privatePromotionRuns = new Map();
+const privatePromoSearches = new Map();
+const MAX_PRIVATE_PROMO_SEARCHES = 100;
 const PRIVATE_PROMO_PAGE_SIZE = 8;
 const PRIVATE_PROMO_DELAY_MS = 5000;
 const PRIVATE_PROMO_MAX_FLOOD_WAIT_MS = 15 * 60 * 1000;
@@ -606,10 +608,15 @@ function canUsePrivatePromotion(role) {
 
 async function requirePrivatePromotionAccess(ctx, adminRow) {
   if (canUsePrivatePromotion(adminRow?.role)) return true;
-  await ctx.answerCallbackQuery(
-    "Promosi Chat Privat hanya tersedia untuk Admin Premium dan OWNER.",
-    { show_alert: true }
-  ).catch(() => {});
+  try {
+    const callbackId = ctx.callbackQuery?.id;
+    if (callbackId) {
+      await ctx.api.answerCallbackQuery(callbackId, {
+        text: "Promosi Chat Privat hanya tersedia untuk Admin Premium dan OWNER.",
+        show_alert: true
+      });
+    }
+  } catch (_) {}
   return false;
 }
 
@@ -5115,31 +5122,51 @@ async function getPrivatePromoSourceGroups(accountId) {
   return data || [];
 }
 
-function privatePromoGroupsKeyboard(rows, selectedIds, page = 0) {
+function rememberPrivatePromoSearch(userKey, query, page = 0) {
+  const token = crypto.randomBytes(5).toString("hex");
+  privatePromoSearches.set(token, {
+    userKey: String(userKey),
+    query: String(query || "").trim(),
+    page: Math.max(0, Number(page) || 0),
+    createdAt: Date.now()
+  });
+
+  while (privatePromoSearches.size > MAX_PRIVATE_PROMO_SEARCHES) {
+    const first = privatePromoSearches.keys().next().value;
+    if (!first) break;
+    privatePromoSearches.delete(first);
+  }
+  return token;
+}
+
+function privatePromoGroupsKeyboard(rows, selectedIds, page = 0, total = 0, searchToken = null) {
   const kb = new InlineKeyboard();
   const selected = selectedIds instanceof Set ? selectedIds : new Set(selectedIds || []);
 
   for (const row of rows) {
     const id = String(row.id);
-    const icon = selected.has(id) ? "☑️" : "⬜";
+    // X means not selected. Keep the checked state as a checkbox.
+    const icon = selected.has(id) ? "☑️" : "❌";
     kb
       .text(
         `${icon} ${safeButtonText(row.title, 30)}`,
-        `privatepromo:group:${id}:${page}`
+        searchToken ? `privatepromo:searchgroup:${id}:${searchToken}:${page}` : `privatepromo:group:${id}:${page}`
       )
       .row();
   }
 
   const hasPrev = page > 0;
-  const hasNext = (page + 1) * PRIVATE_PROMO_PAGE_SIZE < rows._privatePromoTotal;
-
-  if (hasPrev) kb.text("◀️", `privatepromo:groups:${page - 1}`);
+  const hasNext = (page + 1) * PRIVATE_PROMO_PAGE_SIZE < total;
+  if (hasPrev) kb.text("◀️", searchToken ? `privatepromo:searchpage:${searchToken}:${page - 1}` : `privatepromo:groups:${page - 1}`);
   kb.text("🏠", "menu:dashboard");
-  if (hasNext) kb.text("▶️", `privatepromo:groups:${page + 1}`);
+  if (hasNext) kb.text("▶️", searchToken ? `privatepromo:searchpage:${searchToken}:${page + 1}` : `privatepromo:groups:${page + 1}`);
   kb.row();
 
-  kb.text("✅ Lanjut", "privatepromo:groups:continue").row();
+  const allSelected = total > 0 && selected.size >= total;
+  kb.text(allSelected ? "❌ Batalkan Semua Pilihan" : "☑️ Pilih Semua Grup", "privatepromo:groups:all").row();
+  kb.text("🔎 Cari Nama Grup", "privatepromo:search").row();
   kb.text("🔄 Deteksi Grup", "privatepromo:groups:refresh").row();
+  kb.text("✅ Lanjut", "privatepromo:groups:continue").row();
   kb.text("❌ Batal", "privatepromo:cancel");
 
   return kb;
@@ -5152,7 +5179,7 @@ async function renderPrivatePromoGroups(ctx, page = 0, notice = "") {
   if (!state?.accountId) {
     return replaceUi(
       ctx,
-      "⚠️ <b>Sesi Promosi Chat Privat tidak tersedia.</b>",
+      "⚠️ <b>Sesi Promosi Chat Privat tidak tersedia.</b>\n\nSilakan buka menu Promosi Chat Privat kembali.",
       new InlineKeyboard().text("📢 Promosi Chat Privat", "privatepromo:accounts:0").row()
         .text("🏠 Menu Utama", "menu:dashboard"),
       { parse_mode: "HTML" }
@@ -5177,8 +5204,11 @@ async function renderPrivatePromoGroups(ctx, page = 0, notice = "") {
   const start = safePage * PRIVATE_PROMO_PAGE_SIZE;
   const visible = rows.slice(start, start + PRIVATE_PROMO_PAGE_SIZE);
 
-  // Keep total attached only to this local array instance for keyboard pagination.
-  visible._privatePromoTotal = total;
+  // New session: automatically select every detected group.
+  if (!state.groupsInitialized) {
+    state.selectedGroupIds = new Set(rows.map(row => String(row.id)));
+    state.groupsInitialized = true;
+  }
 
   const selectedCount = state.selectedGroupIds?.size || 0;
   const text = [
@@ -5191,18 +5221,64 @@ async function renderPrivatePromoGroups(ctx, page = 0, notice = "") {
     "",
     visible.length
       ? visible.map(row => {
-          const icon = state.selectedGroupIds.has(String(row.id)) ? "☑️" : "⬜";
+          const icon = state.selectedGroupIds.has(String(row.id)) ? "☑️" : "❌";
           return `${icon} <b>${escapeHtml(row.title || "Tanpa Nama")}</b>`;
-        }).join("\n")
+        }).join("\n\n")
       : "<i>Belum ada grup yang terdeteksi untuk akun ini.</i>",
     "",
-    "Pilih satu atau beberapa grup sumber member, lalu tekan <b>✅ Lanjut</b>."
+    "Semua grup otomatis dipilih. Kamu bisa membatalkan pilihan tertentu, mencari grup berdasarkan nama, lalu tekan <b>✅ Lanjut</b>."
   ].filter(Boolean).join("\n");
 
   return replaceUi(
     ctx,
     text,
-    privatePromoGroupsKeyboard(visible, state.selectedGroupIds, safePage),
+    privatePromoGroupsKeyboard(visible, state.selectedGroupIds, safePage, total),
+    { parse_mode: "HTML" }
+  );
+}
+
+async function renderPrivatePromoSearch(ctx, token, page = 0) {
+  const userKey = String(ctx.from.id);
+  const search = privatePromoSearches.get(String(token));
+  const state = privatePromotionRuns.get(userKey);
+  if (!search || search.userKey !== userKey || !state || state.running) {
+    return replaceUi(
+      ctx,
+      "⚠️ <b>Pencarian grup sudah tidak tersedia.</b>\n\nSilakan buka pencarian grup kembali.",
+      new InlineKeyboard().text("⬅️ Kembali Pilih Grup", "privatepromo:groups:0"),
+      { parse_mode: "HTML" }
+    );
+  }
+
+  const query = String(search.query || "").trim();
+  const allRows = await getPrivatePromoSourceGroups(state.accountId);
+  const filtered = allRows.filter(row => String(row.title || "").toLowerCase().includes(query.toLowerCase()));
+  const total = filtered.length;
+  const maxPage = Math.max(0, Math.ceil(total / PRIVATE_PROMO_PAGE_SIZE) - 1);
+  const safePage = Math.min(Math.max(0, Number(page) || 0), maxPage);
+  const start = safePage * PRIVATE_PROMO_PAGE_SIZE;
+  const visible = filtered.slice(start, start + PRIVATE_PROMO_PAGE_SIZE);
+  search.page = safePage;
+
+  const text = [
+    "🔎 <b>CARI NAMA GRUP</b>",
+    `Kata kunci: <code>${escapeHtml(query)}</code>`,
+    `Ditemukan: <b>${total}</b>`,
+    "",
+    visible.length
+      ? visible.map(row => {
+          const icon = state.selectedGroupIds.has(String(row.id)) ? "☑️" : "❌";
+          return `${icon} <b>${escapeHtml(row.title || "Tanpa Nama")}</b>`;
+        }).join("\n\n")
+      : "<i>Grup dengan nama tersebut tidak ditemukan.</i>",
+    "",
+    "Tekan nama grup untuk memilih atau membatalkan pilihan."
+  ].join("\n");
+
+  return replaceUi(
+    ctx,
+    text,
+    privatePromoGroupsKeyboard(visible, state.selectedGroupIds, safePage, total, token),
     { parse_mode: "HTML" }
   );
 }
@@ -5308,6 +5384,8 @@ function privatePromoErrorCategory(error) {
     "user_deleted"
   )) return "Akun user sudah dihapus/nonaktif";
 
+  if (has("peer_flood", "peerflood") && !has("flood_wait")) return "Telegram membatasi pengiriman karena terlalu banyak pesan dalam waktu singkat (PEER_FLOOD)";
+
   if (has(
     "chat_write_forbidden",
     "chat_forbidden",
@@ -5316,7 +5394,7 @@ function privatePromoErrorCategory(error) {
     "cannot_message",
     "you_cant_write",
     "you_cannot_write"
-  )) return "Telegram tidak mengizinkan pengiriman";
+  )) return "Telegram tidak mengizinkan pengiriman ke user tersebut";
 
   return null;
 }
@@ -5733,6 +5811,48 @@ async function renderPrivatePromoFinished(userKey, accountId, groupTitles, admin
   }, 10 * 60 * 1000);
 }
 
+function privatePromoFormatKeyboard(state) {
+  const kb = new InlineKeyboard();
+  if (state.running) kb.text("🛑 Stop Promosi", "privatepromo:stop");
+  else kb.text("▶️ Mulai Promosi", "privatepromo:start");
+  kb.row();
+  kb.text("✏️ Edit Format", "privatepromo:edit");
+  kb.text("🔄 Ubah Format", "privatepromo:change").row();
+  kb.text("🗑️ Hapus Format", "privatepromo:delete").row();
+  kb.text("👥 Ubah Grup", "privatepromo:groups:0").row();
+  kb.text("🏠 Menu Utama", "menu:dashboard");
+  return kb;
+}
+
+async function renderPrivatePromoFormatMenu(ctx, state, sourceRows, adminRow, notice = "") {
+  const selectedIds = new Set(state.selectedGroupIds || []);
+  const groupTitles = (sourceRows || []).map(row => row.title || "Tanpa Nama");
+  const text = [
+    notice,
+    "📢 <b>PROMOSI CHAT PRIVAT</b>",
+    "━━━━━━━━━━━━━━━━━━",
+    `👥 Grup sumber: <b>${groupTitles.length}</b>`,
+    groupTitles.length ? groupTitles.map(t => `• ${escapeHtml(t)}`).join("\n") : "• -",
+    "",
+    "📝 <b>FORMAT PROMOSI</b>",
+    "━━━━━━━━━━━━━━━━━━",
+    escapeHtml(state.message || "-"),
+    "",
+    state.running
+      ? "🟢 Promosi sedang berjalan. Gunakan <b>🛑 Stop Promosi</b> untuk menghentikan."
+      : "⏸️ Format sudah tersimpan. Promosi <b>belum dimulai</b> sampai kamu menekan <b>▶️ Mulai Promosi</b>."
+  ].filter(Boolean).join("\n");
+  return replaceUi(ctx, text, privatePromoFormatKeyboard(state), { parse_mode: "HTML" });
+}
+
+async function privatePromoAnswer(ctx, text) {
+  try {
+    const callbackId = ctx.callbackQuery?.id;
+    if (!callbackId) return;
+    await ctx.api.answerCallbackQuery(callbackId, { text: String(text), show_alert: true });
+  } catch (_) {}
+}
+
 /* -------------------------
    PRIVATE PROMOTION MENU
 -------------------------- */
@@ -5821,6 +5941,7 @@ bot.callbackQuery(/^privatepromo:account:(\d+)$/, async ctx => {
     accountId,
     adminId: adminRow.id,
     selectedGroupIds: new Set(),
+    groupsInitialized: false,
     running: false,
     stopRequested: false,
     stats: { total: 0, success: 0, failed: 0, skipped: 0 },
@@ -5828,6 +5949,28 @@ bot.callbackQuery(/^privatepromo:account:(\d+)$/, async ctx => {
   });
 
   return renderPrivatePromoGroups(ctx, 0);
+});
+
+bot.callbackQuery(/^privatepromo:searchgroup:(\d+):([a-f0-9]+):(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+  if (!state || state.running) return privatePromoAnswer(ctx, "Sesi pemilihan grup tidak aktif.");
+  const groupId = String(ctx.match[1]);
+  const token = String(ctx.match[2]);
+  const page = Math.max(0, Number(ctx.match[3] || 0));
+  const search = privatePromoSearches.get(token);
+  if (!search || search.userKey !== userKey) return privatePromoAnswer(ctx, "Pencarian grup sudah kedaluwarsa.");
+  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
+  const { data: group, error } = await sb.from("account_groups").select("*").eq("id", groupId).eq("account_id", state.accountId).maybeSingle();
+  if (error || !group) return privatePromoAnswer(ctx, "Grup tidak ditemukan.");
+  if (!state.selectedGroupIds) state.selectedGroupIds = new Set();
+  if (state.selectedGroupIds.has(groupId)) state.selectedGroupIds.delete(groupId);
+  else state.selectedGroupIds.add(groupId);
+  await ctx.answerCallbackQuery().catch(() => {});
+  return renderPrivatePromoSearch(ctx, token, page);
 });
 
 bot.callbackQuery(/^privatepromo:group:(\d+):(\d+)$/, async ctx => {
@@ -5855,7 +5998,7 @@ bot.callbackQuery(/^privatepromo:group:(\d+):(\d+)$/, async ctx => {
     .maybeSingle();
 
   if (error || !group) {
-    return ctx.answerCallbackQuery("Grup tidak ditemukan.", { show_alert: true });
+    return privatePromoAnswer(ctx, "Grup tidak ditemukan.");
   }
 
   if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
@@ -5876,12 +6019,54 @@ bot.callbackQuery(/^privatepromo:groups:(\d+)$/, async ctx => {
 
   const state = privatePromotionRuns.get(String(ctx.from.id));
   if (!state || state.running) {
-    return ctx.answerCallbackQuery("Sesi promosi tidak aktif.", { show_alert: true });
+    return privatePromoAnswer(ctx, "Sesi promosi tidak aktif.");
   }
 
   if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
   await ctx.answerCallbackQuery().catch(() => {});
   return renderPrivatePromoGroups(ctx, Math.max(0, Number(ctx.match[1] || 0)));
+});
+
+bot.callbackQuery("privatepromo:groups:all", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+  if (!state || state.running) return privatePromoAnswer(ctx, "Sesi pemilihan grup tidak aktif.");
+  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
+
+  const rows = await getPrivatePromoSourceGroups(state.accountId);
+  const allIds = new Set(rows.map(row => String(row.id)));
+  const allSelected = allIds.size > 0 && state.selectedGroupIds.size >= allIds.size;
+  state.selectedGroupIds = allSelected ? new Set() : allIds;
+  state.groupsInitialized = true;
+  await ctx.answerCallbackQuery().catch(() => {});
+  return renderPrivatePromoGroups(ctx, 0, allSelected ? "❌ Semua pilihan dibatalkan." : "☑️ Semua grup berhasil dipilih.");
+});
+
+bot.callbackQuery("privatepromo:search", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+  const state = privatePromotionRuns.get(String(ctx.from.id));
+  if (!state || state.running) return privatePromoAnswer(ctx, "Sesi pemilihan grup tidak aktif.");
+  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
+  flows.set(String(ctx.from.id), { t: "private_promo_search", accountId: state.accountId, adminId: adminRow.id });
+  await ctx.answerCallbackQuery().catch(() => {});
+  return replaceUi(ctx, "🔎 <b>CARI NAMA GRUP</b>\n\nKetik nama atau sebagian nama grup yang ingin dicari.\n\nContoh: <code>lpm</code>", cancelKeyboard(false), { parse_mode: "HTML" });
+});
+
+bot.callbackQuery(/^privatepromo:searchpage:([a-f0-9]+):(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+  const token = String(ctx.match[1]);
+  const search = privatePromoSearches.get(token);
+  if (!search || search.userKey !== String(ctx.from.id)) return privatePromoAnswer(ctx, "Pencarian grup sudah kedaluwarsa.");
+  if (!await requireAccountAccess(ctx, adminRow, privatePromotionRuns.get(String(ctx.from.id))?.accountId)) return;
+  await ctx.answerCallbackQuery().catch(() => {});
+  return renderPrivatePromoSearch(ctx, token, Number(ctx.match[2] || 0));
 });
 
 bot.callbackQuery("privatepromo:groups:continue", async ctx => {
@@ -5893,14 +6078,14 @@ bot.callbackQuery("privatepromo:groups:continue", async ctx => {
   const userKey = String(ctx.from.id);
   const state = privatePromotionRuns.get(userKey);
   if (!state || state.running) {
-    return ctx.answerCallbackQuery("Sesi promosi tidak aktif.", { show_alert: true });
+    return privatePromoAnswer(ctx, "Sesi promosi tidak aktif.");
   }
 
   if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
 
   const selectedIds = Array.from(state.selectedGroupIds || []);
   if (!selectedIds.length) {
-    return ctx.answerCallbackQuery("Pilih minimal satu grup sumber.", { show_alert: true });
+    return privatePromoAnswer(ctx, "Pilih minimal satu grup terlebih dahulu.");
   }
 
   state.stage = "message";
@@ -5919,11 +6104,9 @@ bot.callbackQuery("privatepromo:groups:continue", async ctx => {
       "",
       `☑️ Grup sumber dipilih: <b>${selectedIds.length}</b>`,
       "",
-      "Kirim <b>pesan promosi</b> yang akan dikirim ke target.",
+      "Kirim <b>teks/format promosi</b> yang ingin digunakan.",
       "",
-      "Setelah pesan diterima, sistem akan mengambil member dari grup yang dipilih, deduplicate berdasarkan Telegram user ID, lalu memproses target satu per satu.",
-      "",
-      "⚠️ Pengiriman tetap mengikuti pembatasan dan rate limit Telegram."
+      "⚠️ Setelah format diterima, promosi <b>tidak akan langsung dimulai</b>. Kamu akan masuk ke menu pengaturan untuk memilih Mulai, Stop, Edit/Ubah Format, atau Hapus Format."
     ].join("\n"),
     new InlineKeyboard().text("❌ Batal", "privatepromo:cancel"),
     { parse_mode: "HTML" }
@@ -5938,7 +6121,7 @@ bot.callbackQuery("privatepromo:groups:refresh", async ctx => {
 
   const state = privatePromotionRuns.get(String(ctx.from.id));
   if (!state || state.running) {
-    return ctx.answerCallbackQuery("Sesi promosi tidak aktif.", { show_alert: true });
+    return privatePromoAnswer(ctx, "Sesi promosi tidak aktif.");
   }
 
   if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
@@ -5956,6 +6139,76 @@ bot.callbackQuery("privatepromo:groups:refresh", async ctx => {
   }
 });
 
+bot.callbackQuery("privatepromo:start", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+  if (!state) return privatePromoAnswer(ctx, "Sesi Promosi Chat Privat tidak tersedia.");
+  if (state.running) return privatePromoAnswer(ctx, "Promosi sedang berjalan.");
+  if (!state.message) return privatePromoAnswer(ctx, "Masukkan format promosi terlebih dahulu.");
+  if (!state.selectedGroupIds?.size) return privatePromoAnswer(ctx, "Pilih minimal satu grup terlebih dahulu.");
+  if (!await requireAccountAccess(ctx, adminRow, state.accountId)) return;
+
+  const selectedIds = Array.from(state.selectedGroupIds);
+  const { data: groupRows, error } = await sb.from("account_groups").select("*").eq("account_id", state.accountId).in("id", selectedIds);
+  if (error) return privatePromoAnswer(ctx, `Gagal memuat grup: ${safeErrorMessage(error, 180)}`);
+  if (!groupRows?.length) return privatePromoAnswer(ctx, "Grup yang dipilih sudah tidak tersedia.");
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  state.stage = "running";
+  void runPrivatePromotion(userKey, state.accountId, groupRows, state.message, adminRow).catch(async error => {
+    console.error("PRIVATE PROMOTION:", safeErrorMessage(error, 800));
+    const current = privatePromotionRuns.get(userKey);
+    if (!current) return;
+    current.running = false;
+    current.sourceFailures = [...(current.sourceFailures || []), { title: "Promosi Chat Privat", reason: safeErrorMessage(error, 300) }];
+    await renderPrivatePromoFormatMenu(ctx, current, groupRows, adminRow, `❌ Promosi gagal dijalankan: ${escapeHtml(safeErrorMessage(error, 300))}`).catch(() => {});
+  });
+  return;
+});
+
+bot.callbackQuery("privatepromo:edit", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+  if (!state || state.running) return privatePromoAnswer(ctx, "Promosi sedang berjalan. Hentikan dulu sebelum mengubah format.");
+  flows.set(userKey, { t: "private_promo_message", accountId: state.accountId, adminId: adminRow.id });
+  await ctx.answerCallbackQuery().catch(() => {});
+  return replaceUi(ctx, "✏️ <b>EDIT FORMAT PROMOSI</b>\n\nKirim format/teks promosi yang baru. Format lama akan diganti setelah pesan baru diterima.", cancelKeyboard(false), { parse_mode: "HTML" });
+});
+
+bot.callbackQuery("privatepromo:change", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+  if (!state || state.running) return privatePromoAnswer(ctx, "Promosi sedang berjalan. Hentikan dulu sebelum mengubah format.");
+  flows.set(userKey, { t: "private_promo_message", accountId: state.accountId, adminId: adminRow.id });
+  await ctx.answerCallbackQuery().catch(() => {});
+  return replaceUi(ctx, "🔄 <b>UBAH FORMAT PROMOSI</b>\n\nKirim teks/format promosi yang baru.", cancelKeyboard(false), { parse_mode: "HTML" });
+});
+
+bot.callbackQuery("privatepromo:delete", async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  if (!await requirePrivatePromotionAccess(ctx, adminRow)) return;
+  const userKey = String(ctx.from.id);
+  const state = privatePromotionRuns.get(userKey);
+  if (!state || state.running) return privatePromoAnswer(ctx, "Promosi sedang berjalan. Hentikan dulu sebelum menghapus format.");
+  state.message = "";
+  state.stage = "groups";
+  state.groupsInitialized = false;
+  state.selectedGroupIds = new Set();
+  flows.delete(userKey);
+  await ctx.answerCallbackQuery().catch(() => {});
+  return renderPrivatePromoGroups(ctx, 0, "🗑️ Format promosi sudah dihapus. Pilih grup kembali jika diperlukan.");
+});
+
 bot.callbackQuery("privatepromo:stop", async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
@@ -5965,10 +6218,10 @@ bot.callbackQuery("privatepromo:stop", async ctx => {
   const userKey = String(ctx.from.id);
   const state = privatePromotionRuns.get(userKey);
   if (!state) {
-    return ctx.answerCallbackQuery("Tidak ada promosi yang sedang berjalan.", { show_alert: true });
+    return privatePromoAnswer(ctx, "Tidak ada promosi yang sedang berjalan.");
   }
 
-  await ctx.answerCallbackQuery("Permintaan stop diterima. Target yang sedang diproses akan diselesaikan jika memungkinkan.").catch(() => {});
+  await privatePromoAnswer(ctx, "Permintaan stop diterima. Target yang sedang diproses akan diselesaikan jika memungkinkan.").catch(() => {});
   state.stopRequested = true;
 
   if (!state.running) {
@@ -6013,7 +6266,7 @@ bot.callbackQuery("privatepromo:cancel", async ctx => {
 
   privatePromotionRuns.delete(userKey);
   flows.delete(userKey);
-  await ctx.answerCallbackQuery("Dibatalkan").catch(() => {});
+  await privatePromoAnswer(ctx, "Dibatalkan").catch(() => {});
 
   return replaceUi(
     ctx,
@@ -6442,6 +6695,22 @@ bot.on("message", async (ctx, next) => {
     }
 
     /* -------------------------
+       PRIVATE PROMOTION: GROUP SEARCH
+    -------------------------- */
+    if (flow.t === "private_promo_search") {
+      const query = String(ctx.message.text || "").trim().replace(/\s+/g, " ");
+      if (!query) return replaceUi(ctx, "❌ Nama grup tidak boleh kosong. Silakan ketik nama atau sebagian nama grup.", cancelKeyboard(false), { parse_mode: "HTML" });
+      if (query.length > 80) return replaceUi(ctx, "❌ Kata pencarian terlalu panjang. Maksimal 80 karakter.", cancelKeyboard(false), { parse_mode: "HTML" });
+      try {
+        const token = rememberPrivatePromoSearch(userKey, query, 0);
+        flows.delete(userKey);
+        return renderPrivatePromoSearch(ctx, token, 0);
+      } catch (e) {
+        return replaceUi(ctx, `❌ Pencarian grup gagal.\n\n${escapeHtml(safeErrorMessage(e))}`, new InlineKeyboard().text("⬅️ Kembali Pilih Grup", "privatepromo:groups:0"), { parse_mode: "HTML" });
+      }
+    }
+
+    /* -------------------------
        PRIVATE PROMOTION: MESSAGE
     -------------------------- */
     if (flow.t === "private_promo_message") {
@@ -6523,53 +6792,12 @@ bot.on("message", async (ctx, next) => {
 
       flows.delete(userKey);
 
-      // The worker owns the same runtime state and can be stopped by the
-      // callback handler while it is collecting/sending targets.
+      // Only save the format here. The user must explicitly press Mulai.
       state.message = message;
-      state.stage = "running";
-
-      void runPrivatePromotion(
-        userKey,
-        state.accountId,
-        sourceRows,
-        message,
-        adminRow
-      ).catch(async error => {
-        console.error("PRIVATE PROMOTION:", safeErrorMessage(error, 800));
-
-        const current = privatePromotionRuns.get(userKey);
-        if (current) {
-          current.running = false;
-          current.sourceFailures = [
-            ...(current.sourceFailures || []),
-            {
-              title: "Promosi Chat Privat",
-              reason: safeErrorMessage(error, 300)
-            }
-          ];
-
-          await renderUi(
-            userKey,
-            [
-              "❌ <b>PROMOSI CHAT PRIVAT BERHENTI KARENA ERROR</b>",
-              "",
-              `👥 Total Target: <b>${current.stats?.total || 0}</b>`,
-              `✅ Berhasil: <b>${current.stats?.success || 0}</b>`,
-              `❌ Gagal: <b>${current.stats?.failed || 0}</b>`,
-              `⏭️ Skip: <b>${current.stats?.skipped || 0}</b>`,
-              "",
-              `⚠️ ${escapeHtml(safeErrorMessage(error, 500))}`
-            ].join("\n"),
-            new InlineKeyboard()
-              .text("📢 Promosi Lagi", "privatepromo:accounts:0")
-              .row()
-              .text("🏠 Menu Utama", "menu:dashboard"),
-            { parse_mode: "HTML" }
-          ).catch(() => {});
-        }
-      });
-
-      return;
+      state.stage = "ready";
+      state.running = false;
+      state.stopRequested = false;
+      return renderPrivatePromoFormatMenu(ctx, state, sourceRows, adminRow);
     }
 
     /* -------------------------
