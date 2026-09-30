@@ -57,7 +57,7 @@ const START_BANNER_FILE_ID = String(
 
 const START_BANNER_URL = String(
   process.env.START_BANNER_URL ||
-    "https://cdn.phototourl.com/free/2026-09-17-491f8197-8c02-4344-8754-8314826f54f4.jpg"
+    "https://cdn.phototourl.com/member/2026-09-30-6eb98f51-f13e-436d-bf18-629dca1158f0.png"
 ).trim();
 
 const supabaseOptions = ws
