@@ -907,11 +907,10 @@ async function getDashboardStats(adminRow = null) {
 function ownerDashboardMenu() {
   return new InlineKeyboard()
     .text("📱 Akun Telegram", "accounts:list:0")
-    .row()
     .text("👥 Admin", "admin:list:0")
-    .text("📊 Refresh", "menu:dashboard")
     .row()
     .text("➕ Tambah Akun", "account:add")
+    .text("📊 Refresh", "menu:dashboard")
     .row()
     .text("📢 Promosi Chat Privat", "privatepromo:accounts:0")
     .row()
@@ -919,22 +918,21 @@ function ownerDashboardMenu() {
 }
 
 function adminDashboardMenu(adminRow = null) {
-  const kb = new InlineKeyboard()
-    .text("📱 Akun Telegram", "accounts:list:0")
+  const kb = new InlineKeyboard();
+  const canSeeAdmin = ["ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow?.role);
+
+  kb.text("📱 Akun Telegram", "accounts:list:0");
+  if (canSeeAdmin) kb.text("👥 Admin", "admin:list:0");
+  kb.row();
+
+  kb.text("➕ Tambah Akun", "account:add")
+    .text("📊 Refresh", "menu:dashboard")
     .row();
 
-  if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow?.role)) {
-    kb.text("👥 Admin", "admin:list:0")
-      .text("📊 Refresh", "menu:dashboard")
-      .row();
-  } else {
-    kb.text("📊 Refresh", "menu:dashboard").row();
-  }
-
-  kb.text("➕ Tambah Akun", "account:add").row();
   if (adminRow?.role === "ADMIN_PREMIUM") {
     kb.text("📢 Promosi Chat Privat", "privatepromo:accounts:0").row();
   }
+
   kb.url("📣 Channel Official", "https://t.me/jasebvortex");
   return kb;
 }
@@ -1686,10 +1684,6 @@ async function batchedByIds(table, column, value, apply, batchSize = 50) {
     if (!data || !data.length) return;
     const ids = data.map(r => r.id);
     await dbRetry(() => apply(sb.from(table), ids));
-    if (data.length < batchSize) {
-      // one more pass confirms nothing is left
-      continue;
-    }
   }
 }
 
@@ -7453,6 +7447,14 @@ async function gracefulShutdown(signal) {
 
   process.exit(0);
 }
+
+process.on("unhandledRejection", reason => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
+
+process.on("uncaughtException", error => {
+  console.error("UNCAUGHT EXCEPTION:", error);
+});
 
 process.once("SIGINT", () => {
   void gracefulShutdown("SIGINT");
