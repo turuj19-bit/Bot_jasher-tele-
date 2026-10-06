@@ -817,27 +817,23 @@ function dashboardText(ctx, stats, extra = "", role = "") {
   const roleLabel = role ? displayAdminRole(role) : "";
   const rule = "━━━━━━━━━━━━━━━━━━";
 
-  const intro =
-    extra ||
-    "Pilih menu di bawah untuk mengatur akun, format promosi, dan target grup.";
-
   // Every value that may be copied sits in its own <code> element, so a single
   // tap copies just that value (never one big block).
   return [
     "🎛️ <b>PANEL KONTROL</b>",
     rule,
     `👤 <b>${escapeHtml(name)}</b>`,
-    `🆔 <code>${escapeHtml(ctx.from.id)}</code> · 🔗 <code>${escapeHtml(username)}</code>`,
-    roleLabel
-      ? `🎖️ <code>${roleLabel}</code> · 🤖 <code>v${escapeHtml(BOT_VERSION)}</code>`
-      : `🤖 <code>v${escapeHtml(BOT_VERSION)}</code>`,
+    `🆔 <code>${escapeHtml(ctx.from.id)}</code>`,
+    `🔗 <code>${escapeHtml(username)}</code>`,
+    roleLabel ? `🎖️ <code>${roleLabel}</code>  ·  <code>v${escapeHtml(BOT_VERSION)}</code>` : `🤖 <code>v${escapeHtml(BOT_VERSION)}</code>`,
+    extra ? `\n<blockquote>${escapeHtml(extra)}</blockquote>` : null,
     rule,
-    `<blockquote>✨ ${escapeHtml(intro)}</blockquote>`,
     "📊 <b>STATUS SISTEM</b>",
-    `👥 Admin <b>${stats.admins}</b> · 📱 Akun <b>${stats.accounts}</b> · 🟢 Terhubung <b>${stats.connected}</b>`,
-    `▶️ Promosi berjalan <b>${stats.running}</b> · 🎯 Target grup <b>${stats.groups}</b>`,
-    rule,
-    "⬇️ <b>MENU UTAMA</b>"
+    `┣ 👥 Admin aktif  <b>${stats.admins}</b>`,
+    `┣ 📱 Akun Telegram  <b>${stats.accounts}</b>`,
+    `┣ 🟢 Terhubung  <b>${stats.connected}</b>`,
+    `┣ ▶️ Promosi berjalan  <b>${stats.running}</b>`,
+    `┗ 🎯 Target grup  <b>${stats.groups}</b>`
   ].filter(line => line !== null).join("\n");
 }
 
@@ -900,43 +896,45 @@ async function getDashboardStats(adminRow = null) {
   };
 }
 
-// Susun tombol 2 kolom; kalau jumlahnya ganjil, tombol terakhir memenuhi baris.
-function buildDashboardKeyboard(buttons) {
+// Susunan tombol: [[...], [...]] -> satu array per baris.
+function buildDashboardKeyboard(rows) {
   const kb = new InlineKeyboard();
-  for (let i = 0; i < buttons.length; i += 2) {
-    const pair = buttons.slice(i, i + 2);
-    for (const b of pair) {
-      if (b.url) kb.url(b.label, b.url);
-      else kb.text(b.label, b.data);
-    }
+  for (const row of rows) {
+    for (const b of row) kb.text(b.label, b.data);
     kb.row();
   }
   return kb;
 }
 
+const DASH_BTN = {
+  accounts: { label: "📱 Akun Telegram", data: "accounts:list:0" },
+  add: { label: "➕ Tambah Akun", data: "account:add" },
+  admin: { label: "👥 Admin", data: "admin:list:0" },
+  privatePromo: { label: "📢 Promosi Chat Privat", data: "privatepromo:accounts:0" },
+  refresh: { label: "🔄 Refresh", data: "menu:dashboard" }
+};
+
 function ownerDashboardMenu() {
   return buildDashboardKeyboard([
-    { label: "📱 Akun Telegram", data: "accounts:list:0" },
-    { label: "➕ Tambah Akun", data: "account:add" },
-    { label: "👥 Admin", data: "admin:list:0" },
-    { label: "📊 Refresh", data: "menu:dashboard" },
-    { label: "📢 Promosi Chat Privat", data: "privatepromo:accounts:0" }
+    [DASH_BTN.accounts],
+    [DASH_BTN.add, DASH_BTN.admin],
+    [DASH_BTN.privatePromo],
+    [DASH_BTN.refresh]
   ]);
 }
 
 function adminDashboardMenu(adminRow = null) {
-  const buttons = [
-    { label: "📱 Akun Telegram", data: "accounts:list:0" },
-    { label: "➕ Tambah Akun", data: "account:add" }
-  ];
-  if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow?.role)) {
-    buttons.push({ label: "👥 Admin", data: "admin:list:0" });
+  const role = adminRow?.role;
+  const rows = [[DASH_BTN.accounts]];
+
+  if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(role)) {
+    rows.push([DASH_BTN.add, DASH_BTN.admin]);
+    if (role === "ADMIN_PREMIUM") rows.push([DASH_BTN.privatePromo]);
+    rows.push([DASH_BTN.refresh]);
+  } else {
+    rows.push([DASH_BTN.add, DASH_BTN.refresh]);
   }
-  buttons.push({ label: "📊 Refresh", data: "menu:dashboard" });
-  if (adminRow?.role === "ADMIN_PREMIUM") {
-    buttons.push({ label: "📢 Promosi Chat Privat", data: "privatepromo:accounts:0" });
-  }
-  return buildDashboardKeyboard(buttons);
+  return buildDashboardKeyboard(rows);
 }
 
 function backDashboardKeyboard() {
