@@ -819,27 +819,23 @@ function dashboardText(ctx, stats, extra = "", role = "") {
 
   const intro =
     extra ||
-    "Silakan pilih menu di bawah untuk mengatur akun Telegram, format promosi, target grup, dan pengaturan lainnya.";
+    "Pilih menu di bawah untuk mengatur akun, format promosi, dan target grup.";
 
   // Every value that may be copied sits in its own <code> element, so a single
   // tap copies just that value (never one big block).
   return [
     "🎛️ <b>PANEL KONTROL</b>",
     rule,
-    `👤 <b>Nama: ${escapeHtml(name)}</b>`,
-    `🆔 ID Telegram · <code>${escapeHtml(ctx.from.id)}</code>`,
-    `🔗 Username · <code>${escapeHtml(username)}</code>`,
-    roleLabel ? `🎖️ Role · <code>${roleLabel}</code>` : null,
-    `🤖 Versi bot · <code>v${escapeHtml(BOT_VERSION)}</code>`,
+    `👤 <b>${escapeHtml(name)}</b>`,
+    `🆔 <code>${escapeHtml(ctx.from.id)}</code> · 🔗 <code>${escapeHtml(username)}</code>`,
+    roleLabel
+      ? `🎖️ <code>${roleLabel}</code> · 🤖 <code>v${escapeHtml(BOT_VERSION)}</code>`
+      : `🤖 <code>v${escapeHtml(BOT_VERSION)}</code>`,
     rule,
-    `<blockquote>✨ <b>Panel sesuai akun Telegram yang digunakan.</b>\n${escapeHtml(intro)}</blockquote>`,
-    "",
+    `<blockquote>✨ ${escapeHtml(intro)}</blockquote>`,
     "📊 <b>STATUS SISTEM</b>",
-    `👥 Admin aktif · <b>${stats.admins}</b>`,
-    `📱 Akun Telegram · <b>${stats.accounts}</b>`,
-    `🟢 Terhubung · <b>${stats.connected}</b>`,
-    `▶️ Promosi berjalan · <b>${stats.running}</b>`,
-    `🎯 Target grup aktif · <b>${stats.groups}</b>`,
+    `👥 Admin <b>${stats.admins}</b> · 📱 Akun <b>${stats.accounts}</b> · 🟢 Terhubung <b>${stats.connected}</b>`,
+    `▶️ Promosi berjalan <b>${stats.running}</b> · 🎯 Target grup <b>${stats.groups}</b>`,
     rule,
     "⬇️ <b>MENU UTAMA</b>"
   ].filter(line => line !== null).join("\n");
@@ -904,40 +900,43 @@ async function getDashboardStats(adminRow = null) {
   };
 }
 
-const OFFICIAL_CHANNEL_URL = "https://t.me/jasebvortex";
+// Susun tombol 2 kolom; kalau jumlahnya ganjil, tombol terakhir memenuhi baris.
+function buildDashboardKeyboard(buttons) {
+  const kb = new InlineKeyboard();
+  for (let i = 0; i < buttons.length; i += 2) {
+    const pair = buttons.slice(i, i + 2);
+    for (const b of pair) {
+      if (b.url) kb.url(b.label, b.url);
+      else kb.text(b.label, b.data);
+    }
+    kb.row();
+  }
+  return kb;
+}
 
 function ownerDashboardMenu() {
-  return new InlineKeyboard()
-    .text("📱 Akun Telegram", "accounts:list:0")
-    .text("➕ Tambah Akun", "account:add")
-    .row()
-    .text("👥 Admin", "admin:list:0")
-    .text("📊 Refresh", "menu:dashboard")
-    .row()
-    .text("📢 Promosi Chat Privat", "privatepromo:accounts:0")
-    .row()
-    .url("📣 Channel Official", OFFICIAL_CHANNEL_URL);
+  return buildDashboardKeyboard([
+    { label: "📱 Akun Telegram", data: "accounts:list:0" },
+    { label: "➕ Tambah Akun", data: "account:add" },
+    { label: "👥 Admin", data: "admin:list:0" },
+    { label: "📊 Refresh", data: "menu:dashboard" },
+    { label: "📢 Promosi Chat Privat", data: "privatepromo:accounts:0" }
+  ]);
 }
 
 function adminDashboardMenu(adminRow = null) {
-  const kb = new InlineKeyboard()
-    .text("📱 Akun Telegram", "accounts:list:0")
-    .text("➕ Tambah Akun", "account:add")
-    .row();
-
+  const buttons = [
+    { label: "📱 Akun Telegram", data: "accounts:list:0" },
+    { label: "➕ Tambah Akun", data: "account:add" }
+  ];
   if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow?.role)) {
-    kb.text("👥 Admin", "admin:list:0")
-      .text("📊 Refresh", "menu:dashboard")
-      .row();
-  } else {
-    kb.text("📊 Refresh", "menu:dashboard").row();
+    buttons.push({ label: "👥 Admin", data: "admin:list:0" });
   }
-
+  buttons.push({ label: "📊 Refresh", data: "menu:dashboard" });
   if (adminRow?.role === "ADMIN_PREMIUM") {
-    kb.text("📢 Promosi Chat Privat", "privatepromo:accounts:0").row();
+    buttons.push({ label: "📢 Promosi Chat Privat", data: "privatepromo:accounts:0" });
   }
-  kb.url("📣 Channel Official", OFFICIAL_CHANNEL_URL);
-  return kb;
+  return buildDashboardKeyboard(buttons);
 }
 
 function backDashboardKeyboard() {
@@ -967,29 +966,33 @@ function accountListKeyboard(accounts, page, hasNext) {
 
 function accountMenu(account, settings) {
   const kb = new InlineKeyboard();
-  kb.text("📊 Status", `account:status:${account.id}`).row();
-  kb.text("⚙️ Pengaturan", `account:settings:${account.id}`).row();
+  kb.text("📊 Status", `account:status:${account.id}`)
+    .text("⚙️ Pengaturan", `account:settings:${account.id}`)
+    .row();
   if (account.status === "connected") kb.text("🔌 Putus", `account:disconnect:${account.id}`);
   else kb.text("🔗 Hubungkan", `account:connect:${account.id}`);
-  kb.row();
   kb.text("👥 Grup", `group:list:${account.id}:0`).row();
-  kb.text("➕ Tambah Grup", `group:add:${account.id}`).row();
-  kb.text("📝 Format", `promo:list:${account.id}:0`).row();
-  kb.text("➕ Format Baru", `promo:add:${account.id}`).row();
-  kb.text("▶️ Format Aktif", `promo:active:${account.id}:0`).row();
-  kb.text("⏹ Stop Promosi", `promo:stopall:${account.id}`).row();
-  kb.text("📋 Riwayat", `history:list:${account.id}:0`).row();
-  kb.text("🏷️ Nama", `account:label:${account.id}`).row();
-  kb.text("🗑️ Hapus", `account:remove:${account.id}`).row();
+  kb.text("➕ Tambah Grup", `group:add:${account.id}`)
+    .text("📝 Format", `promo:list:${account.id}:0`)
+    .row();
+  kb.text("➕ Format Baru", `promo:add:${account.id}`)
+    .text("▶️ Format Aktif", `promo:active:${account.id}:0`)
+    .row();
+  kb.text("⏹ Stop Promosi", `promo:stopall:${account.id}`)
+    .text("📋 Riwayat", `history:list:${account.id}:0`)
+    .row();
+  kb.text("🏷️ Nama", `account:label:${account.id}`)
+    .text("🗑️ Hapus", `account:remove:${account.id}`)
+    .row();
   kb.text("⬅️ Kembali", "accounts:list:0");
   return kb;
 }
 
 function settingsMenu(accountId) {
   return new InlineKeyboard()
-    .text("🏷️ Label", `account:label:${accountId}`).row()
+    .text("🏷️ Label", `account:label:${accountId}`)
     .text("📝 Format", `promo:list:${accountId}:0`).row()
-    .text("➕ Tambah Format", `promo:add:${accountId}`).row()
+    .text("➕ Tambah Format", `promo:add:${accountId}`)
     .text("⬅️ Kembali", `account:open:${accountId}`);
 }
 
@@ -4177,12 +4180,10 @@ async function showAccount(ctx, accountId, prefixMessage = "") {
     prefixMessage,
     `📱 <b>AKUN TELEGRAM</b>`,
     `👤 Nama: <b>${escapeHtml(name)}</b>`,
-    `🔗 Username: <code>${escapeHtml(account.username ? `@${account.username}` : "-")}</code>`,
-    `🆔 ID: <code>${escapeHtml(account.telegram_user_id || "-")}</code>`,
+    `🔗 <code>${escapeHtml(account.username ? `@${account.username}` : "-")}</code> · 🆔 <code>${escapeHtml(account.telegram_user_id || "-")}</code>`,
     `🟢 Koneksi: <b>${escapeHtml(account.status || "-")}</b>`,
-    `📝 Format: <b>${formats.length}</b>`,
-    `▶️ Format aktif: <b>${activeCount}</b>`,
-    `🎯 Target aktif: <b>${formats.length >= 0 ? "dibagi bersama akun ini" : "-"}</b>`
+    `📝 Format: <b>${formats.length}</b> · ▶️ Aktif: <b>${activeCount}</b>`,
+    `🎯 Target aktif: <b>dibagi bersama akun ini</b>`
   ].filter(Boolean).join("\n");
   return replaceUi(ctx, message, accountMenu(account, settings), { parse_mode: "HTML" });
 }
