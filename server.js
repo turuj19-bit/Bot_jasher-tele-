@@ -913,7 +913,9 @@ function ownerDashboardMenu() {
     .row()
     .text("➕ Tambah Akun", "account:add")
     .row()
-    .text("📢 Promosi Chat Privat", "privatepromo:accounts:0");
+    .text("📢 Promosi Chat Privat", "privatepromo:accounts:0")
+    .row()
+    .url("📣 Channel Official", "https://t.me/jasebvortex");
 }
 
 function adminDashboardMenu(adminRow = null) {
@@ -931,8 +933,9 @@ function adminDashboardMenu(adminRow = null) {
 
   kb.text("➕ Tambah Akun", "account:add").row();
   if (adminRow?.role === "ADMIN_PREMIUM") {
-    kb.text("📢 Promosi Chat Privat", "privatepromo:accounts:0");
+    kb.text("📢 Promosi Chat Privat", "privatepromo:accounts:0").row();
   }
+  kb.url("📣 Channel Official", "https://t.me/jasebvortex");
   return kb;
 }
 
@@ -963,20 +966,19 @@ function accountListKeyboard(accounts, page, hasNext) {
 
 function accountMenu(account, settings) {
   const kb = new InlineKeyboard();
-  kb.text("📊 Status", `account:status:${account.id}`).row();
-  kb.text("⚙️ Pengaturan", `account:settings:${account.id}`).row();
+  kb.text("📊 Status", `account:status:${account.id}`)
+    .text("⚙️ Pengaturan", `account:settings:${account.id}`).row();
   if (account.status === "connected") kb.text("🔌 Putus", `account:disconnect:${account.id}`);
   else kb.text("🔗 Hubungkan", `account:connect:${account.id}`);
-  kb.row();
   kb.text("👥 Grup", `group:list:${account.id}:0`).row();
-  kb.text("➕ Tambah Grup", `group:add:${account.id}`).row();
-  kb.text("📝 Format", `promo:list:${account.id}:0`).row();
-  kb.text("➕ Format Baru", `promo:add:${account.id}`).row();
-  kb.text("▶️ Format Aktif", `promo:active:${account.id}:0`).row();
-  kb.text("⏹ Stop Promosi", `promo:stopall:${account.id}`).row();
-  kb.text("📋 Riwayat", `history:list:${account.id}:0`).row();
-  kb.text("🏷️ Nama", `account:label:${account.id}`).row();
-  kb.text("🗑️ Hapus", `account:remove:${account.id}`).row();
+  kb.text("➕ Tambah Grup", `group:add:${account.id}`)
+    .text("📝 Format", `promo:list:${account.id}:0`).row();
+  kb.text("➕ Format Baru", `promo:add:${account.id}`)
+    .text("▶️ Format Aktif", `promo:active:${account.id}:0`).row();
+  kb.text("⏹ Stop Promosi", `promo:stopall:${account.id}`)
+    .text("📋 Riwayat", `history:list:${account.id}:0`).row();
+  kb.text("🏷️ Nama", `account:label:${account.id}`)
+    .text("🗑️ Hapus", `account:remove:${account.id}`).row();
   kb.text("⬅️ Kembali", "accounts:list:0");
   return kb;
 }
@@ -1653,6 +1655,57 @@ async function closeClient(accountId) {
   } catch (_) {}
 
   clients.delete(key);
+}
+
+
+/* ---------- Safe batched account removal (avoids statement timeout) ---------- */
+function isTransientDbError(error) {
+  const m = String(error?.message || error || "").toLowerCase();
+  return m.includes("statement timeout") || m.includes("canceling statement") ||
+    m.includes("fetch failed") || m.includes("timeout") || m.includes("deadlock");
+}
+
+async function dbRetry(fn, tries = 4) {
+  let lastError;
+  for (let i = 0; i < tries; i++) {
+    const result = await fn();
+    if (!result?.error) return result;
+    lastError = result.error;
+    if (!isTransientDbError(lastError)) break;
+    await new Promise(r => setTimeout(r, 700 * (i + 1)));
+  }
+  throw lastError;
+}
+
+// Runs a delete/update in small id-batches so no single statement runs too long.
+async function batchedByIds(table, column, value, apply, batchSize = 50) {
+  for (let guard = 0; guard < 5000; guard++) {
+    const { data } = await dbRetry(() =>
+      sb.from(table).select("id").eq(column, value).limit(batchSize)
+    );
+    if (!data || !data.length) return;
+    const ids = data.map(r => r.id);
+    await dbRetry(() => apply(sb.from(table), ids));
+    if (data.length < batchSize) {
+      // one more pass confirms nothing is left
+      continue;
+    }
+  }
+}
+
+async function removeAccountData(accountId) {
+  const key = String(accountId);
+
+  // Keep audit log: detach history rows in small batches.
+  await batchedByIds("promotion_history", "account_id", key,
+    (q, ids) => q.update({ account_id: null, group_id: null }).in("id", ids), 200);
+
+  // Groups (can be hundreds of rows) deleted in batches.
+  await batchedByIds("account_groups", "account_id", key,
+    (q, ids) => q.delete().in("id", ids), 50);
+
+  await dbRetry(() => sb.from("account_settings").delete().eq("account_id", key));
+  await dbRetry(() => sb.from("telegram_accounts").delete().eq("id", key));
 }
 
 async function deleteAccountAfterLoginFailure(accountId) {
@@ -4688,36 +4741,7 @@ bot.callbackQuery(/^account:remove:confirm:(\d+)$/, async ctx => {
     await withAccountLock(accountId, async () => {
       await stopScheduler(accountId);
       await closeClient(accountId);
-
-      // Detach history from the account/group rows first so the audit log can
-      // survive the account deletion even when the FK uses RESTRICT.
-      const detach = await sb
-        .from("promotion_history")
-        .update({ account_id: null, group_id: null })
-        .eq("account_id", accountId);
-
-      if (detach.error) throw detach.error;
-
-      const { error: settingsError } = await sb
-        .from("account_settings")
-        .delete()
-        .eq("account_id", accountId);
-
-      if (settingsError) throw settingsError;
-
-      const { error: groupsError } = await sb
-        .from("account_groups")
-        .delete()
-        .eq("account_id", accountId);
-
-      if (groupsError) throw groupsError;
-
-      const { error: accountError } = await sb
-        .from("telegram_accounts")
-        .delete()
-        .eq("id", accountId);
-
-      if (accountError) throw accountError;
+      await removeAccountData(accountId);
     });
 
     await recordHistory(null, adminRow.id, {
@@ -4729,14 +4753,14 @@ bot.callbackQuery(/^account:remove:confirm:(\d+)$/, async ctx => {
 
     return replaceUi(
       ctx,
-      `✅ <b>Account dihapus.</b>\\n\\n${escapeHtml(account.label)} sudah tidak lagi berada di sistem. Riwayat audit tetap disimpan.`,
+      `✅ <b>Account dihapus.</b>\n\n${escapeHtml(account.label)} sudah tidak lagi berada di sistem. Riwayat audit tetap disimpan.`,
       new InlineKeyboard().text("📱 Daftar Akun", "accounts:list:0"),
       { parse_mode: "HTML" }
     );
   } catch (e) {
     return replaceUi(
       ctx,
-      `❌ Gagal menghapus account.\\n\\n${escapeHtml(safeErrorMessage(e))}`,
+      `❌ Gagal menghapus account.\n\n${escapeHtml(safeErrorMessage(e))}`,
       new InlineKeyboard()
         .text("◀️ Account", `account:open:${accountId}`)
         .row()
