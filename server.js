@@ -904,36 +904,39 @@ async function getDashboardStats(adminRow = null) {
   };
 }
 
+const OFFICIAL_CHANNEL_URL = "https://t.me/jasebvortex";
+
 function ownerDashboardMenu() {
   return new InlineKeyboard()
     .text("📱 Akun Telegram", "accounts:list:0")
-    .text("👥 Admin", "admin:list:0")
-    .row()
     .text("➕ Tambah Akun", "account:add")
+    .row()
+    .text("👥 Admin", "admin:list:0")
     .text("📊 Refresh", "menu:dashboard")
     .row()
     .text("📢 Promosi Chat Privat", "privatepromo:accounts:0")
     .row()
-    .url("📣 Channel Official", "https://t.me/jasebvortex");
+    .url("📣 Channel Official", OFFICIAL_CHANNEL_URL);
 }
 
 function adminDashboardMenu(adminRow = null) {
-  const kb = new InlineKeyboard();
-  const canSeeAdmin = ["ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow?.role);
-
-  kb.text("📱 Akun Telegram", "accounts:list:0");
-  if (canSeeAdmin) kb.text("👥 Admin", "admin:list:0");
-  kb.row();
-
-  kb.text("➕ Tambah Akun", "account:add")
-    .text("📊 Refresh", "menu:dashboard")
+  const kb = new InlineKeyboard()
+    .text("📱 Akun Telegram", "accounts:list:0")
+    .text("➕ Tambah Akun", "account:add")
     .row();
+
+  if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(adminRow?.role)) {
+    kb.text("👥 Admin", "admin:list:0")
+      .text("📊 Refresh", "menu:dashboard")
+      .row();
+  } else {
+    kb.text("📊 Refresh", "menu:dashboard").row();
+  }
 
   if (adminRow?.role === "ADMIN_PREMIUM") {
     kb.text("📢 Promosi Chat Privat", "privatepromo:accounts:0").row();
   }
-
-  kb.url("📣 Channel Official", "https://t.me/jasebvortex");
+  kb.url("📣 Channel Official", OFFICIAL_CHANNEL_URL);
   return kb;
 }
 
@@ -964,19 +967,20 @@ function accountListKeyboard(accounts, page, hasNext) {
 
 function accountMenu(account, settings) {
   const kb = new InlineKeyboard();
-  kb.text("📊 Status", `account:status:${account.id}`)
-    .text("⚙️ Pengaturan", `account:settings:${account.id}`).row();
+  kb.text("📊 Status", `account:status:${account.id}`).row();
+  kb.text("⚙️ Pengaturan", `account:settings:${account.id}`).row();
   if (account.status === "connected") kb.text("🔌 Putus", `account:disconnect:${account.id}`);
   else kb.text("🔗 Hubungkan", `account:connect:${account.id}`);
+  kb.row();
   kb.text("👥 Grup", `group:list:${account.id}:0`).row();
-  kb.text("➕ Tambah Grup", `group:add:${account.id}`)
-    .text("📝 Format", `promo:list:${account.id}:0`).row();
-  kb.text("➕ Format Baru", `promo:add:${account.id}`)
-    .text("▶️ Format Aktif", `promo:active:${account.id}:0`).row();
-  kb.text("⏹ Stop Promosi", `promo:stopall:${account.id}`)
-    .text("📋 Riwayat", `history:list:${account.id}:0`).row();
-  kb.text("🏷️ Nama", `account:label:${account.id}`)
-    .text("🗑️ Hapus", `account:remove:${account.id}`).row();
+  kb.text("➕ Tambah Grup", `group:add:${account.id}`).row();
+  kb.text("📝 Format", `promo:list:${account.id}:0`).row();
+  kb.text("➕ Format Baru", `promo:add:${account.id}`).row();
+  kb.text("▶️ Format Aktif", `promo:active:${account.id}:0`).row();
+  kb.text("⏹ Stop Promosi", `promo:stopall:${account.id}`).row();
+  kb.text("📋 Riwayat", `history:list:${account.id}:0`).row();
+  kb.text("🏷️ Nama", `account:label:${account.id}`).row();
+  kb.text("🗑️ Hapus", `account:remove:${account.id}`).row();
   kb.text("⬅️ Kembali", "accounts:list:0");
   return kb;
 }
@@ -1653,53 +1657,6 @@ async function closeClient(accountId) {
   } catch (_) {}
 
   clients.delete(key);
-}
-
-
-/* ---------- Safe batched account removal (avoids statement timeout) ---------- */
-function isTransientDbError(error) {
-  const m = String(error?.message || error || "").toLowerCase();
-  return m.includes("statement timeout") || m.includes("canceling statement") ||
-    m.includes("fetch failed") || m.includes("timeout") || m.includes("deadlock");
-}
-
-async function dbRetry(fn, tries = 4) {
-  let lastError;
-  for (let i = 0; i < tries; i++) {
-    const result = await fn();
-    if (!result?.error) return result;
-    lastError = result.error;
-    if (!isTransientDbError(lastError)) break;
-    await new Promise(r => setTimeout(r, 700 * (i + 1)));
-  }
-  throw lastError;
-}
-
-// Runs a delete/update in small id-batches so no single statement runs too long.
-async function batchedByIds(table, column, value, apply, batchSize = 50) {
-  for (let guard = 0; guard < 5000; guard++) {
-    const { data } = await dbRetry(() =>
-      sb.from(table).select("id").eq(column, value).limit(batchSize)
-    );
-    if (!data || !data.length) return;
-    const ids = data.map(r => r.id);
-    await dbRetry(() => apply(sb.from(table), ids));
-  }
-}
-
-async function removeAccountData(accountId) {
-  const key = String(accountId);
-
-  // Keep audit log: detach history rows in small batches.
-  await batchedByIds("promotion_history", "account_id", key,
-    (q, ids) => q.update({ account_id: null, group_id: null }).in("id", ids), 200);
-
-  // Groups (can be hundreds of rows) deleted in batches.
-  await batchedByIds("account_groups", "account_id", key,
-    (q, ids) => q.delete().in("id", ids), 50);
-
-  await dbRetry(() => sb.from("account_settings").delete().eq("account_id", key));
-  await dbRetry(() => sb.from("telegram_accounts").delete().eq("id", key));
 }
 
 async function deleteAccountAfterLoginFailure(accountId) {
@@ -4735,7 +4692,64 @@ bot.callbackQuery(/^account:remove:confirm:(\d+)$/, async ctx => {
     await withAccountLock(accountId, async () => {
       await stopScheduler(accountId);
       await closeClient(accountId);
-      await removeAccountData(accountId);
+
+      // Tabel besar bisa kena "statement timeout" kalau diproses sekaligus,
+      // jadi setiap langkah dipecah per batch kecil dan dicoba ulang bila timeout.
+      const isTimeout = err => /timeout|canceling statement/i.test(String(err?.message || err || ""));
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      const withRetry = async fn => {
+        let last;
+        for (let i = 0; i < 4; i++) {
+          try { return await fn(); }
+          catch (err) {
+            last = err;
+            if (!isTimeout(err) || i === 3) throw err;
+            await sleep(1200 * (i + 1));
+          }
+        }
+        throw last;
+      };
+      const run = async q => { const r = await q; if (r.error) throw r.error; return r; };
+
+      // 1) Lepas riwayat dari akun/grup per batch supaya audit log tetap ada.
+      for (let guard = 0; guard < 2000; guard++) {
+        const ids = await withRetry(async () => {
+          const r = await run(
+            sb.from("promotion_history").select("id").eq("account_id", accountId).limit(200)
+          );
+          return (r.data || []).map(x => x.id);
+        });
+        if (!ids.length) break;
+        await withRetry(() => run(
+          sb.from("promotion_history").update({ account_id: null, group_id: null }).in("id", ids)
+        ));
+      }
+
+      // 2) Hapus target grup per batch.
+      for (let guard = 0; guard < 2000; guard++) {
+        const ids = await withRetry(async () => {
+          const r = await run(
+            sb.from("account_groups").select("id").eq("account_id", accountId).limit(100)
+          );
+          return (r.data || []).map(x => x.id);
+        });
+        if (!ids.length) break;
+        // Pastikan sisa riwayat yang menunjuk ke grup ini juga dilepas.
+        await withRetry(() => run(
+          sb.from("promotion_history").update({ group_id: null }).in("group_id", ids)
+        ));
+        await withRetry(() => run(
+          sb.from("account_groups").delete().in("id", ids)
+        ));
+      }
+
+      // 3) Hapus setting, lalu akun.
+      await withRetry(() => run(
+        sb.from("account_settings").delete().eq("account_id", accountId)
+      ));
+      await withRetry(() => run(
+        sb.from("telegram_accounts").delete().eq("id", accountId)
+      ));
     });
 
     await recordHistory(null, adminRow.id, {
@@ -7447,14 +7461,6 @@ async function gracefulShutdown(signal) {
 
   process.exit(0);
 }
-
-process.on("unhandledRejection", reason => {
-  console.error("UNHANDLED REJECTION:", reason);
-});
-
-process.on("uncaughtException", error => {
-  console.error("UNCAUGHT EXCEPTION:", error);
-});
 
 process.once("SIGINT", () => {
   void gracefulShutdown("SIGINT");
