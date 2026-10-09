@@ -1229,7 +1229,51 @@ function normalizeFormat(row = {}) {
   };
 }
 
+// Snapshot tiap hasil getPromotionFormats(): dipakai savePromotionFormats untuk
+// menyimpan HANYA field yang benar-benar diubah (anti lost-update antar format).
+const formatsBaseline = new WeakMap();
+const formatStoreLocks = new Map();
+
+function withFormatStoreLock(accountId, fn) {
+  const key = String(accountId);
+  const prev = formatStoreLocks.get(key) || Promise.resolve();
+  const run = prev.catch(() => {}).then(fn);
+  const tail = run.catch(() => {});
+  formatStoreLocks.set(key, tail);
+  tail.then(() => { if (formatStoreLocks.get(key) === tail) formatStoreLocks.delete(key); });
+  return run;
+}
+
 async function getPromotionFormats(accountId) {
+  const formats = await loadPromotionFormatsRaw(accountId);
+  formatsBaseline.set(formats, JSON.parse(JSON.stringify(formats)));
+  return formats;
+}
+
+function mergeFormatChanges(base, mine, latest) {
+  const baseMap = new Map(base.map(f => [String(f.id), f]));
+  const mineMap = new Map(mine.map(f => [String(f.id), f]));
+  let result = latest.map(f => ({ ...f }));
+
+  for (const [id, m] of mineMap) {
+    const b = baseMap.get(id);
+    if (!b) {
+      if (!result.some(f => String(f.id) === id)) result.push({ ...m });
+      continue;
+    }
+    const target = result.find(f => String(f.id) === id);
+    if (!target) continue; // sudah dihapus dari tempat lain
+    for (const key of Object.keys(m)) {
+      if (JSON.stringify(m[key]) !== JSON.stringify(b[key])) target[key] = m[key];
+    }
+  }
+  for (const id of baseMap.keys()) {
+    if (!mineMap.has(id)) result = result.filter(f => String(f.id) !== id);
+  }
+  return result;
+}
+
+async function loadPromotionFormatsRaw(accountId) {
   const settings = await ensureAccountSettings(accountId);
   let formats = Array.isArray(settings.formats) ? settings.formats.map(normalizeFormat) : [];
 
@@ -1260,6 +1304,18 @@ async function getPromotionFormats(accountId) {
 }
 
 async function savePromotionFormats(accountId, formats) {
+  return withFormatStoreLock(accountId, async () => {
+    const base = formatsBaseline.get(formats);
+    let toWrite = formats;
+    if (base) {
+      const latest = await loadPromotionFormatsRaw(accountId);
+      toWrite = mergeFormatChanges(base, formats, latest);
+    }
+    return savePromotionFormatsRaw(accountId, toWrite);
+  });
+}
+
+async function savePromotionFormatsRaw(accountId, formats) {
   // Keep the existing Supabase client path used by the rest of the bot.
   // The previous direct REST PATCH was the source of PGRST102
   // ("Empty or invalid json") on the format-save step.
@@ -2515,7 +2571,7 @@ async function fireFormat(accountId, formatId) {
   if (error) throw error;
 
   if (!groups?.length) {
-    return { shouldContinue: true, delayMs: Number(format.interval_minutes || 10) * 60000 };
+    return { shouldContinue: true, delayMs: Number(format.interval_minutes || 10) * 60000, intervalBased: true };
   }
 
   const dialogs = await client.getDialogs({ limit: 500 });
@@ -2631,28 +2687,98 @@ async function fireFormat(accountId, formatId) {
     }
   }
 
-  await sendPromotionReport(account, format, groups.length, success, fail, failures);
+  // Laporan tidak ditunggu: jangan menunda jadwal format berikutnya.
+  sendPromotionReport(account, format, groups.length, success, fail, failures)
+    .catch(e => console.warn("PROMOTION REPORT:", safeErrorMessage(e, 220)));
 
   return {
     shouldContinue: true,
     delayMs: Math.max(Number(format.interval_minutes || 10) * 60000, floodWaitMs),
+    floodWaitMs,
+    intervalBased: floodWaitMs <= 0,
     success,
     fail
   };
 }
 
-function scheduleFormat(accountId,formatId,delayMs=0){
-  const key=schedulerKey(accountId,formatId); const old=schedulerTasks.get(key); if(old?.timeout)clearTimeout(old.timeout);
-  const task={running:true,timeout:null}; schedulerTasks.set(key,task);
-  task.timeout=setTimeout(async()=>{
-    if(schedulerTasks.get(key)!==task||!task.running)return;
-    let nextDelay=60000,cont=true;
-    try{const r=await fireFormat(accountId,formatId);nextDelay=Number(r?.delayMs||60000);cont=r?.shouldContinue!==false;}catch(e){console.error(`PROMOTION ${key}:`,safeErrorMessage(e));nextDelay=60000;}
-    if(schedulerTasks.get(key)!==task||!task.running)return;
-    const f=await getPromotionFormat(accountId,formatId).catch(()=>null);
-    if(!f?.active||!cont){schedulerTasks.delete(key);return;}
-    task.timeout=setTimeout(()=>{if(schedulerTasks.get(key)!==task||!task.running)return;task.timeout=null;scheduleFormat(accountId,formatId,0);},Math.max(1000,nextDelay));
-  },Math.max(0,delayMs));
+// Antrian kirim per akun: format yang jatuh tempo bersamaan dikirim bergantian
+// (1 koneksi Telegram per akun), tapi jadwal tiap format tetap dihitung sendiri-sendiri.
+const promoSendQueues = new Map();
+function runInPromoQueue(accountId, fn) {
+  const key = String(accountId);
+  const prev = promoSendQueues.get(key) || Promise.resolve();
+  const run = prev.catch(() => {}).then(fn);
+  const tail = run.catch(() => {});
+  promoSendQueues.set(key, tail);
+  tail.then(() => { if (promoSendQueues.get(key) === tail) promoSendQueues.delete(key); });
+  return run;
+}
+
+function scheduleFormat(accountId, formatId, delayMs = 0) {
+  const key = schedulerKey(accountId, formatId);
+  const old = schedulerTasks.get(key);
+  if (old) { old.running = false; if (old.timeout) clearTimeout(old.timeout); }
+
+  const task = { running: true, timeout: null, firing: false, lastStartAt: null, nextKind: "start", nextRunAt: 0 };
+  schedulerTasks.set(key, task);
+
+  const arm = (ms, kind) => {
+    if (task.timeout) clearTimeout(task.timeout);
+    const wait = Math.max(0, ms);
+    task.nextKind = kind;
+    task.nextRunAt = Date.now() + wait;
+    task.timeout = setTimeout(tick, wait);
+  };
+  task.arm = arm;
+
+  const tick = async () => {
+    task.timeout = null;
+    if (schedulerTasks.get(key) !== task || !task.running) return;
+
+    // Jeda dihitung dari MULAI kirim (bukan selesai), termasuk waktu antre.
+    const startedAt = Date.now();
+    task.firing = true;
+    task.lastStartAt = startedAt;
+
+    let r = null, failed = false;
+    try {
+      r = await runInPromoQueue(accountId, () => fireFormat(accountId, formatId));
+    } catch (e) {
+      failed = true;
+      console.error(`PROMOTION ${key}:`, safeErrorMessage(e));
+      r = { shouldContinue: true, delayMs: Math.max(60000, extractFloodWaitMs(e) || 0) };
+    }
+    task.firing = false;
+    if (schedulerTasks.get(key) !== task || !task.running) return;
+
+    const f = await getPromotionFormat(accountId, formatId).catch(() => null);
+    if (!f?.active || r?.shouldContinue === false) {
+      if (schedulerTasks.get(key) === task) schedulerTasks.delete(key);
+      return;
+    }
+
+    const elapsed = Date.now() - startedAt;
+    if (r?.intervalBased && !failed) {
+      // Pakai jeda TERBARU (bisa saja diubah saat proses kirim berjalan).
+      arm(Math.max(1000, Number(f.interval_minutes || 10) * 60000 - elapsed), "interval");
+    } else {
+      arm(Math.max(1000, Number(r?.delayMs || 60000)), "other");
+    }
+  };
+
+  arm(delayMs, "start");
+}
+
+// Dipanggil setelah jeda diubah: timer yang sedang menunggu ikut diperbarui,
+// tidak perlu menunggu siklus lama (mis. 10 menit) habis dulu.
+async function rescheduleFormat(accountId, formatId) {
+  const task = schedulerTasks.get(schedulerKey(accountId, formatId));
+  if (!task || !task.running || task.firing || !task.timeout) return;
+  if (task.nextKind !== "interval" || !task.lastStartAt) return;
+  const f = await getPromotionFormat(accountId, formatId).catch(() => null);
+  if (!f?.active) return;
+  const target = task.lastStartAt + Number(f.interval_minutes || 10) * 60000;
+  task.arm(Math.max(1000, target - Date.now()), "interval");
 }
 
 async function startFormat(accountId,formatId,adminId){
@@ -4922,6 +5048,7 @@ bot.callbackQuery(/^promo:delayset:(\d+):([^:]+):(\d+)$/, async ctx => {
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   f.interval_minutes=minutes; f.updated_at=new Date().toISOString();
   await savePromotionFormats(accountId,formats);
+  await rescheduleFormat(accountId,formatId).catch(()=>{});
   flows.delete(String(ctx.from.id));
   return renderFormatDetail(ctx,accountId,formatId,`✅ Jeda disimpan: <b>${escapeHtml(formatInterval(minutes))}</b>`);
 });
@@ -7096,6 +7223,7 @@ bot.on("message", async (ctx, next) => {
       const formats=await getPromotionFormats(flow.accountId); const f=formats.find(x=>x.id===String(flow.formatId));
       if(!f)return renderFormatList(ctx,flow.accountId,"❌ Format tidak ditemukan.");
       f.interval_minutes=minutes; f.updated_at=new Date().toISOString(); await savePromotionFormats(flow.accountId,formats);
+      await rescheduleFormat(flow.accountId,f.id).catch(()=>{});
       flows.delete(userKey); return renderFormatDetail(ctx,flow.accountId,f.id,`✅ Jeda disimpan: <b>${escapeHtml(formatInterval(minutes))}</b>`);
     }
 
