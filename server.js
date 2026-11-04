@@ -72,6 +72,21 @@ const sb = createClient(
 
 const bot = new Bot(process.env.BOT_TOKEN);
 
+// Modul Promosi WhatsApp (file terpisah: whatsapp.js). Didaftarkan di sini agar
+// handler teks/foto WhatsApp dicek lebih dulu. Dependensi diambil saat dipakai.
+const waPromo = require("./whatsapp").register(bot, () => ({
+  sb,
+  InlineKeyboard,
+  requireAdmin,
+  replaceUi,
+  renderUi,
+  escapeHtml,
+  safeErrorMessage,
+  parseMinutes,
+  parseHours,
+  isOwnerId
+}));
+
 /* =========================================================
    RUNTIME STATE
 ========================================================= */
@@ -911,6 +926,7 @@ const DASH_BTN = {
   add: { label: "➕ Tambah Akun", data: "account:add" },
   admin: { label: "👥 Admin", data: "admin:list:0" },
   privatePromo: { label: "📢 Promosi Chat Privat", data: "privatepromo:accounts:0" },
+  whatsapp: { label: "💬 Promosi WhatsApp", data: "whatsapp:menu" },
   refresh: { label: "🔄 Refresh", data: "menu:dashboard" }
 };
 
@@ -918,7 +934,7 @@ function ownerDashboardMenu() {
   return buildDashboardKeyboard([
     [DASH_BTN.accounts],
     [DASH_BTN.add, DASH_BTN.admin],
-    [DASH_BTN.privatePromo],
+    [DASH_BTN.privatePromo, DASH_BTN.whatsapp],
     [DASH_BTN.refresh]
   ]);
 }
@@ -929,9 +945,11 @@ function adminDashboardMenu(adminRow = null) {
 
   if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(role)) {
     rows.push([DASH_BTN.add, DASH_BTN.admin]);
-    if (role === "ADMIN_PREMIUM") rows.push([DASH_BTN.privatePromo]);
+    if (role === "ADMIN_PREMIUM") rows.push([DASH_BTN.privatePromo, DASH_BTN.whatsapp]);
+    else rows.push([DASH_BTN.whatsapp]);
     rows.push([DASH_BTN.refresh]);
   } else {
+    rows.push([DASH_BTN.whatsapp]);
     rows.push([DASH_BTN.add, DASH_BTN.refresh]);
   }
   return buildDashboardKeyboard(rows);
@@ -7614,6 +7632,10 @@ process.once("SIGTERM", () => {
 
     void restoreRunningPromotions().catch(e => {
       console.error("RESTORE PROMOTIONS:", safeErrorMessage(e, 800));
+    });
+
+    void waPromo.restore().catch(e => {
+      console.error("WA RESTORE:", safeErrorMessage(e, 800));
     });
 
     console.log("STARTUP: starting Telegram admin bot...");
