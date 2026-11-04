@@ -212,6 +212,7 @@ function register(bot, getDeps) {
       setTimeout(async () => {
         try {
           const code = await sock.requestPairingCode(pairing.phone);
+          console.log("WA PAIRING: kode diminta untuk", pairing.phone, "->", code);
           const shown = code.match(/.{1,4}/g)?.join("-") || code;
           await bot.api.sendMessage(pairing.tgId,
             `🔑 <b>KODE PAIRING WHATSAPP</b>\n${RULE}\nNomor: <code>${esc(pairing.phone)}</code>\nKode: <code>${esc(shown)}</code>\n\nDi HP: WhatsApp → Perangkat tertaut → Tautkan perangkat → Tautkan dengan nomor telepon, lalu masukkan kode ini.`,
@@ -225,6 +226,11 @@ function register(bot, getDeps) {
     }
 
     sock.ev.on("connection.update", async ({ connection, lastDisconnect }) => {
+      console.log(
+        "WA UPDATE:", connection || "-",
+        "| code:", lastDisconnect?.error?.output?.statusCode || "-",
+        "| msg:", lastDisconnect?.error?.message || "-"
+      );
       try {
         if (connection === "open") {
           entry.open = true;
