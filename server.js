@@ -76,6 +76,13 @@ const sb = createClient(
 
 const bot = new Bot(process.env.BOT_TOKEN);
 
+// Emoji premium (animasi) untuk semua pesan & tombol bot (file terpisah: custom-emoji.js).
+const customEmoji = require("./custom-emoji").register(bot, () => ({
+  sb,
+  escapeHtml,
+  isOwnerId
+}));
+
 // Modul Promosi WhatsApp (file terpisah: whatsapp.js). Didaftarkan di sini agar
 // handler teks/foto WhatsApp dicek lebih dulu. Dependensi diambil saat dipakai.
 const waPromo = require("./whatsapp").register(bot, () => ({
@@ -7898,6 +7905,10 @@ process.once("SIGTERM", () => {
 
     void restoreRunningPromotions().catch(e => {
       console.error("RESTORE PROMOTIONS:", safeErrorMessage(e, 800));
+    });
+
+    void customEmoji.load().catch(e => {
+      console.error("CUSTOM EMOJI LOAD:", safeErrorMessage(e, 400));
     });
 
     void waPromo.restore().catch(e => {
