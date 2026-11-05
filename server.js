@@ -806,17 +806,17 @@ function dashboardText(ctx, stats, extra = "", role = "") {
   return [
     "🎛️ <b>PANEL KONTROL</b>",
     rule,
-    `👤 <b>${escapeHtml(name)}</b>`,
-    `🆔 <code>${escapeHtml(ctx.from.id)}</code>`,
-    `🔗 <code>${escapeHtml(username)}</code>`,
-    roleLabel ? `🎖️ <code>${roleLabel}</code>` : null,
-    `🤖 <code>v${escapeHtml(BOT_VERSION)}</code>`,
+    `👤 Nama : <b>${escapeHtml(name)}</b>`,
+    `🔗 Username : <code>${escapeHtml(username)}</code>`,
+    `🆔 Id : <code>${escapeHtml(ctx.from.id)}</code>`,
+    roleLabel ? `🎖️ Role : <code>${roleLabel}</code>` : null,
+    `🤖 Versi : <code>v${escapeHtml(BOT_VERSION)}</code>`,
     extra ? `\n<blockquote>${escapeHtml(extra)}</blockquote>` : null,
     rule,
     "📊 <b>STATUS SISTEM</b>",
-    `👥 Admin: <b>${stats.admins}</b>`,
-    `📱 Akun: <b>${stats.accounts}</b>`,
-    `🟢 Terhubung: <b>${stats.connected}</b>`
+    `👥 Admin : <b>${stats.admins}</b>`,
+    `📱 Akun : <b>${stats.accounts}</b>`,
+    `🟢 Terhubung : <b>${stats.connected}</b>`
   ].filter(line => line !== null).join("\n");
 }
 
@@ -895,6 +895,7 @@ const DASH_BTN = {
   admin: { label: "👥 Admin", data: "admin:list:0" },
   privatePromo: { label: "📢 Chat Privat", data: "privatepromo:accounts:0" },
   whatsapp: { label: "💬 WhatsApp", data: "whatsapp:menu" },
+  totalUser: { label: "👥 Total User", data: "users:total:0" },
   refresh: { label: "🔄 Refresh", data: "menu:dashboard" }
 };
 
@@ -904,7 +905,7 @@ function ownerDashboardMenu() {
     [DASH_BTN.accounts],
     [DASH_BTN.add, DASH_BTN.admin],
     [DASH_BTN.privatePromo, DASH_BTN.whatsapp],
-    [DASH_BTN.refresh]
+    [DASH_BTN.totalUser, DASH_BTN.refresh]
   ]);
 }
 
@@ -1046,10 +1047,9 @@ function formatDetailKeyboard(accountId, format) {
 function groupListKeyboard(rows, accountId, page, hasNext) {
   const kb = new InlineKeyboard();
 
-  // Only groups/channels Telegram reports as writable are shown as targets.
-  // Tapping the group name itself toggles the target state.
+  // Hanya grup yang bisa dikirimi pesan tampil sebagai target. Tekan nama grup untuk pilih / batal.
   for (const group of rows.filter(g => g.can_send)) {
-    const icon = group.enabled ? "✅" : "❌";
+    const icon = group.enabled ? "✅" : "⬜";
     kb.text(`${icon} ${safeButtonText(group.title, 34)}`, `group:toggle:${group.id}:${page}`).row();
   }
 
@@ -1057,11 +1057,8 @@ function groupListKeyboard(rows, accountId, page, hasNext) {
   kb.text("🏠", "menu:dashboard");
   if (hasNext) kb.text("▶️", `group:list:${accountId}:${page + 1}`);
   kb.row();
-  kb.text("🔎 Cari Grup", `group:search:${accountId}`).row();
-  kb.text("➕ Tambah Semua Grup", `group:all:${accountId}`).row();
-  kb.text("🔄 Deteksi Grup", `group:refresh:${accountId}`).row();
-  kb.text("⬅️ Akun", `account:open:${accountId}`);
-
+  kb.text("🔎 Cari Grup", `group:search:${accountId}`).text("➕ Tambah Semua", `group:all:${accountId}`).row();
+  kb.text("🔄 Deteksi Grup", `group:refresh:${accountId}`).text("⬅️ Akun", `account:open:${accountId}`);
   return kb;
 }
 
@@ -2067,7 +2064,7 @@ function settingsSummary(account, settings) {
     `▶️ Promosi: <b>${settings?.active ? "RUNNING" : "STOPPED"}</b>`,
     `📝 Format: <b>${escapeHtml(settingsFormatText(settings))}</b>`,
     `⏱ Jeda: <b>${escapeHtml(formatInterval(settings?.interval_minutes))}</b>`,
-    `📅 Durasi: <b>${escapeHtml(formatDuration(settings?.duration_hours))}</b>`,
+    `📅 Durasi : <b>${escapeHtml(formatDuration(settings?.duration_hours))}</b>`,
     settings?.expires_at
       ? `⌛ Berakhir: <b>${escapeHtml(formatDate(settings.expires_at))}</b>`
       : null,
@@ -4309,8 +4306,8 @@ async function renderFormatList(ctx, accountId, prefixMessage = "") {
     prefixMessage,
     "📝 <b>FORMAT PROMOSI</b>",
     "━━━━━━━━━━━━━━━━━━━━━━━━",
-    `👤 Akun: <b>${escapeHtml(account.label || "Akun Telegram")}</b>`,
-    `📦 Total format: <b>${formats.length}</b>`,
+    `👤 Akun : <b>${escapeHtml(account.label || "Akun Telegram")}</b>`,
+    `📦 Total format : <b>${formats.length}</b>`,
     formats.length ? "" : "Belum ada format. Tekan ➕ Tambah Format untuk membuat."
   ].filter(Boolean);
   return replaceUi(ctx, lines.join("\n"), formatListKeyboard(formats, accountId), { parse_mode: "HTML" });
@@ -4331,17 +4328,17 @@ async function renderFormatDetail(ctx, accountId, formatId, prefixMessage = "") 
   const message = [
     prefixMessage,
     "📝 <b>FORMAT PROMOSI</b>",
-    `🏷️ Nama: <b>${escapeHtml(truncateText(format.name, 100))}</b>`,
+    `🏷️ Nama : <b>${escapeHtml(truncateText(format.name, 100))}</b>`,
     rule,
     "📄 <b>ISI FORMAT</b>",
-    `Media: <b>${isPhoto ? "🖼️ Foto" : "📝 Teks"}</b>`,
+    `Media : <b>${isPhoto ? "🖼️ Foto" : "📝 Teks"}</b>`,
     `<blockquote>${escapeHtml(truncateText(body, 2500))}</blockquote>`,
     rule,
     "⚙️ <b>PENGATURAN</b>",
-    `⏱️ Jeda: <b>${escapeHtml(formatInterval(format.interval_minutes))}</b>`,
-    `📅 Durasi: <b>${escapeHtml(formatDuration(format.duration_hours))}</b>`,
-    `🕐 Waktu: <b>${escapeHtml(formatWindowLabel(format))}</b>`,
-    `📌 Status: <b>${format.active ? "🟢 AKTIF" : "🔴 NONAKTIF"}</b>`
+    `⏱️ Jeda : <b>${escapeHtml(formatInterval(format.interval_minutes))}</b>`,
+    `📅 Durasi : <b>${escapeHtml(formatDuration(format.duration_hours))}</b>`,
+    `🕐 Waktu : <b>${escapeHtml(formatWindowLabel(format))}</b>`,
+    `📌 Status : <b>${format.active ? "🟢 AKTIF" : "🔴 NONAKTIF"}</b>`
   ].filter(Boolean).join("\n");
 
   return replaceUi(ctx, message, formatDetailKeyboard(accountId, format), { parse_mode: "HTML" });
@@ -5020,7 +5017,7 @@ bot.callbackQuery(/^promo:active:(\d+):\d+$/, async ctx => {
   const formats=await getPromotionFormats(accountId);
   const active=formats.filter(x=>x.active);
   const activeText = active.length
-    ? active.map(x => `🟢 <b>${escapeHtml(x.name)}</b>\n⏱️ Jeda: ${escapeHtml(formatInterval(x.interval_minutes))}\n📅 Durasi: ${escapeHtml(formatDuration(x.duration_hours))}\n🕐 Waktu: ${escapeHtml(formatWindowLabel(x))}`).join("\n\n")
+    ? active.map(x => `🟢 <b>${escapeHtml(x.name)}</b>\n⏱️ Jeda : ${escapeHtml(formatInterval(x.interval_minutes))}\n📅 Durasi : ${escapeHtml(formatDuration(x.duration_hours))}\n🕐 Waktu : ${escapeHtml(formatWindowLabel(x))}`).join("\n\n")
     : "⚪ Tidak ada format yang sedang berjalan.";
   return replaceUi(ctx, `▶️ <b>FORMAT AKTIF</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n${activeText}`, activeFormatKeyboard(active, accountId), { parse_mode: "HTML" });
 });
@@ -5256,18 +5253,17 @@ bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
     if (activeCountResult.error) throw activeCountResult.error;
 
     const lines = [
-      `👥 <b>GRUP • ${escapeHtml(account.label)}</b>`,
-      `Total: <b>${result.total}</b> • Target aktif: <b>${activeCountResult.count || 0}</b>`,
-      `Halaman: <b>${page + 1}</b>`,
+      "🎯 <b>GRUP TARGET</b>",
+      "━━━━━━━━━━━━━━━━━━━━━━━━",
+      `Akun : <b>${escapeHtml(account.label)}</b>`,
+      `Total grup : <b>${result.total}</b>`,
+      `Dipilih : <b>${activeCountResult.count || 0}</b>`,
+      `Halaman : <b>${page + 1}</b>`,
       "",
-      result.rows.length
-        ? result.rows.map((g, i) =>
-            `${g.enabled ? "✅" : "❌"} <b>${escapeHtml(g.title)}</b>`
-          ).join("\n\n")
-        : "<i>Belum ada grup yang terdeteksi. Tekan Tambah Target / Deteksi Ulang.</i>",
-      "",
-      "Tekan nama grup untuk memilih / membatalkan target."
-    ].join("\n");
+      "✅ = jadi target promosi",
+      "⬜ = belum dipilih",
+      result.rows.length ? "" : "<i>Belum ada grup. Tekan Deteksi Grup untuk memuat grup.</i>"
+    ].filter(Boolean).join("\n");
 
     return replaceUi(
       ctx,
@@ -5370,14 +5366,16 @@ async function renderGroupPageDirect(ctx, accountId, page, prefix = "") {
 
   const text = [
     prefix,
-    `👥 <b>GRUP • ${escapeHtml(account.label)}</b>`,
-    `Total: <b>${result.total}</b> • Target aktif: <b>${activeCountResult.count || 0}</b>`,
+    "🎯 <b>GRUP TARGET</b>",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
+    `Akun : <b>${escapeHtml(account.label)}</b>`,
+    `Total grup : <b>${result.total}</b>`,
+    `Dipilih : <b>${activeCountResult.count || 0}</b>`,
+    `Halaman : <b>${page + 1}</b>`,
     "",
-    result.rows.length
-      ? result.rows.map((g, i) =>
-          `${g.enabled ? "✅" : "❌"} <b>${escapeHtml(g.title)}</b>`
-        ).join("\n\n")
-      : "<i>Belum ada grup.</i>"
+    "✅ = jadi target promosi",
+    "⬜ = belum dipilih",
+    result.rows.length ? "" : "<i>Belum ada grup.</i>"
   ].filter(Boolean).join("\n");
 
   return replaceUi(
@@ -6536,6 +6534,58 @@ bot.callbackQuery(/^history:list:(\d+):(\d+)$/, async ctx => {
 /* =========================================================
    ADMIN MANAGEMENT - OWNER ONLY
 ========================================================= */
+
+const USER_PAGE_SIZE = 5;
+
+bot.callbackQuery(/^users:total:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+  if (adminRow.role !== "OWNER") {
+    return ctx.answerCallbackQuery("Hanya OWNER yang bisa membuka menu ini.", { show_alert: true });
+  }
+  await ctx.answerCallbackQuery().catch(() => {});
+
+  const { data, error } = await sb.from("admins").select("*").order("created_at", { ascending: true });
+  if (error) {
+    return replaceUi(ctx, `❌ Gagal mengambil data user.\n${escapeHtml(safeErrorMessage(error))}`, backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  const all = data || [];
+  const byRole = new Map();
+  for (const a of all) byRole.set(a.role, (byRole.get(a.role) || 0) + 1);
+  const roleLines = [...byRole.entries()].map(([r, n]) => `${displayAdminRole(r)} : <b>${n}</b>`);
+
+  const pages = Math.max(1, Math.ceil(all.length / USER_PAGE_SIZE));
+  const p = Math.min(Math.max(0, Number(ctx.match[1])), pages - 1);
+  const rows = all.slice(p * USER_PAGE_SIZE, p * USER_PAGE_SIZE + USER_PAGE_SIZE);
+
+  const list = rows.map((a, i) => [
+    `${p * USER_PAGE_SIZE + i + 1}. ${a.active ? "🟢" : "🔴"} <b>${escapeHtml(displayAdminRole(a.role))}</b>`,
+    `   👤 Nama : ${escapeHtml(a.first_name || "-")}`,
+    `   🔗 Username : ${a.username ? "@" + escapeHtml(a.username) : "-"}`,
+    `   🆔 Id : <code>${escapeHtml(a.telegram_user_id)}</code>`
+  ].join("\n")).join("\n\n");
+
+  const text = [
+    "👥 <b>TOTAL USER</b>",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
+    `Total : <b>${all.length}</b>`,
+    `Aktif : <b>${all.filter(a => a.active).length}</b>`,
+    ...roleLines,
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
+    all.length ? list : "<i>Belum ada user terdaftar.</i>",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
+    `Halaman : <b>${p + 1}</b> / ${pages}`
+  ].join("\n");
+
+  const kb = new InlineKeyboard();
+  if (p > 0) kb.text("◀️", `users:total:${p - 1}`);
+  kb.text("🏠 Menu Utama", "menu:dashboard");
+  if (p < pages - 1) kb.text("▶️", `users:total:${p + 1}`);
+  kb.row().text("🔄 Refresh", `users:total:${p}`);
+
+  return replaceUi(ctx, text, kb, { parse_mode: "HTML" });
+});
 
 bot.callbackQuery(/^admin:list:(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);

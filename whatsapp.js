@@ -220,7 +220,7 @@ function register(bot, getDeps) {
           console.log("WA PAIRING: kode diminta untuk", pairing.phone, "->", code);
           const shown = code.match(/.{1,4}/g)?.join("-") || code;
           await bot.api.sendMessage(pairing.tgId,
-            `🔑 <b>KODE PAIRING WHATSAPP</b>\n${RULE}\nNomor: <code>${esc(pairing.phone)}</code>\nKode: <code>${esc(shown)}</code>\n\nDi HP: WhatsApp → Perangkat tertaut → Tautkan perangkat → Tautkan dengan nomor telepon, lalu masukkan kode ini.`,
+            `🔑 <b>KODE PAIRING WHATSAPP</b>\n${RULE}\nNomor : <code>${esc(pairing.phone)}</code>\nKode : <code>${esc(shown)}</code>\n\nDi HP: WhatsApp → Perangkat tertaut → Tautkan perangkat → Tautkan dengan nomor telepon, lalu masukkan kode ini.`,
             { parse_mode: "HTML" });
         } catch (e) {
           await bot.api.sendMessage(pairing.tgId,
@@ -342,7 +342,7 @@ function register(bot, getDeps) {
     const lines = [
       "📊 <b>HASIL PROMOSI</b>",
       RULE,
-      `📝 Format: <b>${esc(trunc(fmt.name, 100))}</b>`,
+      `📝 Format: <b>${esc(await fmtLabel(acc.id, fmt))}</b>`,
       `👤 Nama: <b>${esc((acc && acc.label) || "-")}</b>`,
       `📞 Nomor: <code>${esc((acc && acc.phone) || "-")}</code>`,
       RULE,
@@ -484,7 +484,7 @@ function register(bot, getDeps) {
     if ((page + 1) * PAGE < total) nav.push(["▶️", `wa:acc:list:${page + 1}`]);
 
     return {
-      text: ["📱 <b>AKUN WHATSAPP</b>", RULE, `Total akun: <b>${total}</b>`, total ? "" : "<i>Belum ada akun WhatsApp.</i>"].join("\n"),
+      text: ["📱 <b>AKUN WHATSAPP</b>", RULE, `Total akun : <b>${total}</b>`, total ? "" : "<i>Belum ada akun WhatsApp.</i>"].join("\n"),
       kb: buildKb([
         ...rows,
         nav,
@@ -524,11 +524,11 @@ function register(bot, getDeps) {
       text: [
         "📱 <b>AKUN WHATSAPP</b>",
         RULE,
-        `👤 Nama: <b>${esc(acc.label)}</b>`,
-        `📞 Nomor: <code>${esc(acc.phone || "-")}</code>`,
-        `Status: ${statusLabel(acc)}`,
-        `☑️ Grup dipilih: <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`,
-        `📝 Format: <b>${formats.length}</b> (berjalan ${formats.filter(f => f.active).length})`
+        `👤 Nama : <b>${esc(acc.label)}</b>`,
+        `📞 Nomor : <code>${esc(acc.phone || "-")}</code>`,
+        `Status : ${statusLabel(acc)}`,
+        `☑️ Grup dipilih : <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`,
+        `📝 Format : <b>${formats.length}</b> (berjalan ${formats.filter(f => f.active).length})`
       ].join("\n"),
       kb: accountKb(acc)
     };
@@ -542,13 +542,13 @@ function register(bot, getDeps) {
       text: [
         "📊 <b>STATUS WHATSAPP</b>",
         RULE,
-        `👤 Nama: <b>${esc(acc.label)}</b>`,
-        `📞 Nomor: <code>${esc(acc.phone || "-")}</code>`,
-        `Koneksi: ${statusLabel(acc)}`,
-        `Socket: <b>${entry?.open ? "aktif" : "tidak aktif"}</b>`,
-        `▶️ Promosi berjalan: <b>${formats.filter(f => f.active).length}</b>`,
-        `☑️ Grup dipilih: <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`,
-        `🕒 Diperbarui: ${esc(dateText(acc.updated_at))}`
+        `👤 Nama : <b>${esc(acc.label)}</b>`,
+        `📞 Nomor : <code>${esc(acc.phone || "-")}</code>`,
+        `Koneksi : ${statusLabel(acc)}`,
+        `Socket : <b>${entry?.open ? "aktif" : "tidak aktif"}</b>`,
+        `▶️ Promosi berjalan : <b>${formats.filter(f => f.active).length}</b>`,
+        `☑️ Grup dipilih : <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`,
+        `🕒 Diperbarui : ${esc(dateText(acc.updated_at))}`
       ].join("\n"),
       kb: buildKb([
         [["🔄 Refresh", `wa:acc:status:${acc.id}`]],
@@ -565,11 +565,11 @@ function register(bot, getDeps) {
         "⚙️ <b>SETTING ACCOUNT</b>",
         "",
         "📱 <b>AKUN TERKAIT</b>",
-        `👤 Nama: <b>${esc(acc.label)}</b>`,
-        `📞 Nomor: <code>${esc(acc.phone || "belum ada nomor")}</code>`,
-        `📌 Koneksi: <b>${esc(statusLabel(acc))}</b>`,
-        `▶️ Promosi: <b>${running ? "RUNNING" : "STOPPED"}</b>`,
-        `📝 Format: <b>${formats.length}</b>`
+        `👤 Nama : <b>${esc(acc.label)}</b>`,
+        `📞 Nomor : <code>${esc(acc.phone || "belum ada nomor")}</code>`,
+        `📌 Koneksi : <b>${esc(statusLabel(acc))}</b>`,
+        `▶️ Promosi : <b>${running ? "RUNNING" : "STOPPED"}</b>`,
+        `📝 Format : <b>${formats.length}</b>`
       ].join("\n"),
       kb: buildKb([
         [["🏷️ Nama", `wa:acc:label:${acc.id}`], ["📝 Format", `wa:fmt:list:${acc.id}:0`]],
@@ -599,23 +599,23 @@ function register(bot, getDeps) {
     nav.push(["🏠", "menu:dashboard"]);
     if (p < pages - 1) nav.push(["▶️", navBase(p + 1)]);
     kb.push(nav);
-    if (opts.token) kb.push([["⬅️ Semua Grup", `wa:grp:list:${acc.id}:0`]]);
-    else kb.push([["🔎 Cari Grup", `wa:grp:search:${acc.id}`]]);
-    kb.push([["➕ Tambah Semua Grup", `wa:grp:all:${acc.id}:${backOf(p)}`]]);
-    kb.push([["🔄 Deteksi Grup", `wa:grp:refresh:${acc.id}`]]);
-    kb.push([["⬅️ Akun", `wa:acc:view:${acc.id}`]]);
+    kb.push(opts.token
+      ? [["⬅️ Semua Grup", `wa:grp:list:${acc.id}:0`], ["➕ Tambah Semua", `wa:grp:all:${acc.id}:${backOf(p)}`]]
+      : [["🔎 Cari Grup", `wa:grp:search:${acc.id}`], ["➕ Tambah Semua", `wa:grp:all:${acc.id}:${backOf(p)}`]]);
+    kb.push([["🔄 Deteksi Grup", `wa:grp:refresh:${acc.id}`], ["⬅️ Akun", `wa:acc:view:${acc.id}`]]);
 
     const lines = [
       "🎯 <b>GRUP TARGET</b>",
       RULE,
-      `Akun: <b>${esc(acc.label)}</b>`,
-      `Total grup: <b>${all.length}</b>`,
-      `☑️ Grup dipilih: <b>${picked}</b>`,
-      `🔒 Hanya admin bisa kirim: <b>${locked}</b>`
+      `Akun  : <b>${esc(acc.label)}</b>`,
+      `Total grup  : <b>${all.length}</b>`,
+      `Dipilih  : <b>${picked}</b>`,
+      `Terkunci (hanya admin)  : <b>${locked}</b>`
     ];
-    if (term) lines.push(`🔎 Pencarian: <b>${esc(opts.rawTerm || term)}</b> (${scope.length} hasil)`);
+    if (term) lines.push(`Pencarian  : <b>${esc(opts.rawTerm || term)}</b> (${scope.length} hasil)`);
+    lines.push(`Halaman  : <b>${p + 1}</b> / ${pages}`);
     if (opts.prefix) lines.push("", opts.prefix);
-    lines.push("", `Halaman: <b>${p + 1}</b> dari ${pages}`, "", "✅ = jadi target promosi", "⬜ = belum dipilih");
+    lines.push("", "✅ = jadi target promosi", "⬜ = belum dipilih");
     if (!all.length) lines.push("", "<i>Belum ada grup. Tekan Deteksi Grup setelah akun terhubung.</i>");
     return { text: lines.join("\n"), kb: buildKb(kb) };
   }
@@ -638,29 +638,45 @@ function register(bot, getDeps) {
       const n = await refreshGroups(acc.id, entry.sock);
       return { n };
     } catch (e) {
-      return { error: `❌ Deteksi grup gagal: ${esc(errText(e))}` };
+      return { error: `❌ Deteksi grup gagal : ${esc(errText(e))}` };
     }
   }
 
+  async function fmtLabel(accountId, fmt) {
+    const all = await loadFormats(accountId);
+    const i = all.findIndex(x => x.id === fmt.id);
+    return `Format ${i >= 0 ? i + 1 : all.length + 1}`;
+  }
+
   async function screenFormatList(acc, page, mode = "all") {
-    const formats = (await loadFormats(acc.id)).filter(f => mode === "all" || f.active);
-    const pages = Math.max(1, Math.ceil(formats.length / PAGE));
+    const all = await loadFormats(acc.id);
+    const list = all.filter(f => mode === "all" || f.active);
+    const pages = Math.max(1, Math.ceil(list.length / PAGE));
     const p = Math.min(Math.max(0, page), pages - 1);
-    const kb = formats.slice(p * PAGE, p * PAGE + PAGE).map(f => [[
-      `${f.active ? "▶️" : "⏹"} ${trunc(f.name, 28)}`,
+    const kb = list.slice(p * PAGE, p * PAGE + PAGE).map(f => [[
+      `${f.active ? "▶️" : "⏹"} Format ${all.findIndex(x => x.id === f.id) + 1}`,
       `wa:fmt:view:${acc.id}:${f.id}`
     ]]);
     const nav = [];
     if (p > 0) nav.push(["◀️", `wa:fmt:${mode}:${acc.id}:${p - 1}`]);
     if (p < pages - 1) nav.push(["▶️", `wa:fmt:${mode}:${acc.id}:${p + 1}`]);
     if (nav.length) kb.push(nav);
-    if (mode === "all") kb.push([["➕ Format Baru", `wa:fmt:add:${acc.id}`]]);
-    kb.push([["⬅️ Akun", `wa:acc:view:${acc.id}`]]);
+    kb.push(mode === "all"
+      ? [["➕ Format Baru", `wa:fmt:add:${acc.id}`], ["⬅️ Akun", `wa:acc:view:${acc.id}`]]
+      : [["⬅️ Akun", `wa:acc:view:${acc.id}`]]);
 
     const title = mode === "active" ? "▶️ <b>FORMAT AKTIF</b>" : "📝 <b>FORMAT PROMOSI</b>";
-    const empty = mode === "active" ? "<i>Tidak ada format yang sedang berjalan.</i>" : "<i>Belum ada format.</i>";
+    const empty = mode === "active" ? "<i>Tidak ada format yang sedang berjalan.</i>" : "<i>Belum ada format. Tekan Format Baru untuk membuat.</i>";
     return {
-      text: [title, RULE, `Akun: <b>${esc(acc.label)}</b>`, `Total: <b>${formats.length}</b>`, formats.length ? "" : empty].join("\n"),
+      text: [
+        title,
+        RULE,
+        `Akun  : <b>${esc(acc.label)}</b>`,
+        `Total format  : <b>${all.length}</b>`,
+        `Berjalan  : <b>${all.filter(f => f.active).length}</b>`,
+        "",
+        list.length ? "" : empty
+      ].filter(x => x !== false).join("\n").replace(/\n+$/, ""),
       kb: buildKb(kb)
     };
   }
@@ -668,22 +684,23 @@ function register(bot, getDeps) {
   async function screenFormat(acc, fmt) {
     const id = acc.id;
     const f = fmt.id;
+    const label = await fmtLabel(acc.id, fmt);
     const body = fmt.message ? esc(trunc(fmt.message, 400)) : "<i>Belum diisi</i>";
     const lines = [
       "📝 <b>FORMAT PROMOSI</b>",
-      `🏷️ Nama: <b>${esc(trunc(fmt.name, 100))}</b>`,
+      `Nama  : <b>${esc(label)}</b>`,
       RULE,
       "📄 <b>ISI FORMAT</b>",
-      `Media: <b>${fmt.media ? (isVideoMedia(fmt) ? "🎬 Video" : "🖼️ Foto") : "📝 Teks"}</b>`,
+      `Media  : <b>${fmt.media ? (isVideoMedia(fmt) ? "🎬 Video" : "🖼️ Foto") : "📝 Teks"}</b>`,
       `<blockquote>${body}</blockquote>`,
       RULE,
       "⚙️ <b>PENGATURAN</b>",
-      `⏱️ Jeda: <b>${mins(fmt.interval_minutes)}</b>`,
-      `📅 Durasi: <b>${hours(fmt.duration_hours)}</b>`,
-      "🕐 Waktu: <b>langsung</b>",
-      `📌 Status: <b>${fmt.active ? "🟢 AKTIF" : "🔴 NONAKTIF"}</b>`
+      `⏱️ Jeda  : <b>${mins(fmt.interval_minutes)}</b>`,
+      `📅 Durasi  : <b>${hours(fmt.duration_hours)}</b>`,
+      "🕐 Waktu  : <b>langsung</b>",
+      `📌 Status  : <b>${fmt.active ? "🟢 AKTIF" : "🔴 NONAKTIF"}</b>`
     ];
-    if (fmt.active && fmt.expires_at) lines.push(`⌛ Berakhir: ${esc(dateText(fmt.expires_at))}`);
+    if (fmt.active && fmt.expires_at) lines.push(`⌛ Berakhir  : ${esc(dateText(fmt.expires_at))}`);
     return {
       text: lines.join("\n"),
       kb: buildKb([
@@ -706,14 +723,14 @@ function register(bot, getDeps) {
     if (error) throw error;
     const lines = (data || []).map(h =>
       `• ${esc(dateText(h.created_at))}\n   ${esc(h.action)}: ${esc(h.status)}` +
-      (h.group_title ? `\n   Grup: ${esc(trunc(h.group_title, 30))}` : "") +
+      (h.group_title ? `\n   Grup : ${esc(trunc(h.group_title, 30))}` : "") +
       (h.error ? `\n   <i>${esc(trunc(h.error, 120))}</i>` : "")
     );
     return {
       text: [
         "🕒 <b>RIWAYAT TERAKHIR</b>",
         RULE,
-        `Akun: <b>${esc(acc.label)}</b>`,
+        `Akun : <b>${esc(acc.label)}</b>`,
         "",
         ...(lines.length ? lines : ["<i>Belum ada riwayat.</i>"])
       ].join("\n"),
@@ -782,7 +799,7 @@ function register(bot, getDeps) {
         "📱 <b>TAMBAH AKUN WHATSAPP</b>",
         RULE,
         "Kirim nomor WhatsApp yang akan ditautkan, dengan kode negara tanpa tanda +.",
-        "Contoh: <code>628123456789</code>",
+        "Contoh : <code>628123456789</code>",
         "",
         "Bot akan mengirim kode pairing 8 digit. Masukkan di HP: Perangkat tertaut → Tautkan dengan nomor telepon."
       ].join("\n"),
@@ -803,7 +820,7 @@ function register(bot, getDeps) {
     withAccount(ctx, admin, ctx.match[1], async acc => {
       setFlow(ctx.from.id, { t: "label", accountId: acc.id });
       await show(ctx, {
-        text: `${RULE}\n🏷️ <b>UBAH NAMA AKUN</b>\nNama saat ini: <b>${esc(acc.label)}</b>\n\nKirim nama baru.`,
+        text: `${RULE}\n🏷️ <b>UBAH NAMA AKUN</b>\nNama saat ini : <b>${esc(acc.label)}</b>\n\nKirim nama baru.`,
         kb: cancelAcc(acc.id)
       });
     })));
@@ -955,7 +972,7 @@ function register(bot, getDeps) {
       await saveFormats(acc.id, formats);
       setFlow(ctx.from.id, { t: "msg", accountId: acc.id, formatId: fmt.id });
       await show(ctx, {
-        text: `✅ <b>${esc(fmt.name)}</b> dibuat.\n${RULE}\nKirim <b>teks</b> untuk isi pesan promosi.\nAtau kirim <b>foto/video</b> dengan caption.`,
+        text: `✅ <b>Format ${formats.length}</b> dibuat.\n${RULE}\nKirim <b>teks</b> untuk isi pesan promosi.\nAtau kirim <b>foto/video</b> dengan caption.`,
         kb: cancelKb(acc.id, fmt.id)
       });
     })));
@@ -1007,7 +1024,7 @@ function register(bot, getDeps) {
 
   bot.callbackQuery(/^wa:fmt:del:(\d+):([a-f0-9]+)$/, guard((ctx, admin) =>
     withFormat(ctx, admin, ctx.match[1], ctx.match[2], async (acc, fmt) => show(ctx, confirmScreen(
-      `🗑️ <b>HAPUS FORMAT?</b>\n${RULE}\nFormat <b>${esc(trunc(fmt.name, 100))}</b> dan medianya akan dihapus.`,
+      `🗑️ <b>HAPUS FORMAT?</b>\n${RULE}\nFormat <b>${esc(await fmtLabel(acc.id, fmt))}</b> dan medianya akan dihapus.`,
       `wa:fmt:delok:${acc.id}:${fmt.id}`,
       `wa:fmt:view:${acc.id}:${fmt.id}`
     )))));
