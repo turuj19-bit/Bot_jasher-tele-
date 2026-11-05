@@ -10,10 +10,29 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const pino = require("pino");
-const baileys = require("@whiskeysockets/baileys");
 
-const makeWASocket = baileys.default;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
+// Baileys dimuat lewat import() supaya jalan untuk versi 6.x (CommonJS) maupun 7.x (ESM).
+let baileysCache = null;
+async function loadBaileys() {
+  if (baileysCache) return baileysCache;
+  const m = await import("@whiskeysockets/baileys");
+  const pick = k => m[k] ?? m.default?.[k];
+  const make = typeof m.makeWASocket === "function" ? m.makeWASocket
+    : typeof m.default === "function" ? m.default
+      : m.default?.default;
+  if (typeof make !== "function") throw new Error("Baileys tidak bisa dimuat (makeWASocket tidak ditemukan)");
+  baileysCache = {
+    make,
+    useMultiFileAuthState: pick("useMultiFileAuthState"),
+    fetchLatestWaWebVersion: pick("fetchLatestWaWebVersion"),
+    fetchLatestBaileysVersion: pick("fetchLatestBaileysVersion")
+  };
+  try {
+    const pj = JSON.parse(fs.readFileSync(path.join(__dirname, "node_modules", "@whiskeysockets", "baileys", "package.json"), "utf8"));
+    console.log("WA LIB: baileys", pj.version);
+  } catch (_) { /* hanya untuk log */ }
+  return baileysCache;
+}
 
 const SESSION_ROOT = process.env.WA_SESSION_DIR || path.join(__dirname, "wa_sessions");
 const MEDIA_ROOT = process.env.WA_MEDIA_DIR || path.join(__dirname, "wa_media");
@@ -84,7 +103,8 @@ const sessionDir = id => path.join(SESSION_ROOT, String(id));
 let waVersionCache = { at: 0, v: undefined };
 async function resolveWaVersion() {
   if (waVersionCache.v && Date.now() - waVersionCache.at < 10 * 60 * 1000) return waVersionCache.v;
-  for (const fn of [baileys.fetchLatestWaWebVersion, baileys.fetchLatestBaileysVersion]) {
+  const B = await loadBaileys();
+  for (const fn of [B.fetchLatestWaWebVersion, B.fetchLatestBaileysVersion]) {
     if (typeof fn !== "function") continue;
     try {
       const r = await fn();
@@ -330,10 +350,11 @@ function register(bot, getDeps) {
 
   async function startSocket(acc, pairing) {
     fs.mkdirSync(sessionDir(acc.id), { recursive: true });
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir(acc.id));
+    const B = await loadBaileys();
+    const { state, saveCreds } = await B.useMultiFileAuthState(sessionDir(acc.id));
     const version = await resolveWaVersion();
 
-    const sock = makeWASocket({
+    const sock = B.make({
       auth: state,
       ...(version ? { version } : {}),
       logger: pino({ level: "silent" }),
@@ -433,6 +454,18 @@ function register(bot, getDeps) {
 
           // Pairing berhasil: WhatsApp memang menutup koneksi sekali (515), sambung ulang dengan sesi baru.
           if (p && isPaired()) {
+            p.restarts = (p.restarts || 0) + 1;
+            // 515 = WhatsApp minta restart sekali setelah pairing. 401 atau restart berulang = login ditolak WhatsApp.
+            if (code === 401 || p.restarts > 3) {
+              console.log("WA PAIRING DITOLAK: akun", acc.id, "kode", code, "restart ke-", p.restarts);
+              await abortPairing(acc, "❌ <b>PAIRING DITOLAK WHATSAPP</b>", [
+                `HP sempat menerima kode, tapi WhatsApp menolak login perangkat (kode ${esc(code || "-")}).`,
+                "Sesi dihapus supaya bot tidak mencoba sambung terus-menerus. Nomor ini tidak disimpan.",
+                "",
+                "<i>Ini penolakan dari sisi WhatsApp/library Baileys, bukan karena telat atau salah ketik.</i>"
+              ]);
+              return;
+            }
             p.paired = true;
             clearTimeout(p.timer);
             await setAccountStatus(acc.id, "connecting").catch(() => {});
@@ -441,8 +474,11 @@ function register(bot, getDeps) {
             return;
           }
 
-          if (code === DisconnectReason.loggedOut) {
+          if (code === 401) {
+            // Sesi ditolak/dikeluarkan WhatsApp: berhenti sambung ulang, hapus sesi.
+            console.log("WA LOGOUT: akun", acc.id, "sesi ditolak (401), sesi dihapus");
             await setAccountStatus(acc.id, "disconnected", null);
+            retries.delete(String(acc.id));
             wipeSession(acc.id);
             return;
           }

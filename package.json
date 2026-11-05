@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",
-    "@whiskeysockets/baileys": "^6.7.28",
+    "@whiskeysockets/baileys": "7.0.0-rc13",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
     "grammy": "^1.38.3",
