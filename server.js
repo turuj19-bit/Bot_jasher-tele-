@@ -898,7 +898,6 @@ const DASH_BTN = {
   admin: { label: "👥 Admin", data: "admin:list:0" },
   privatePromo: { label: "📢 Chat Privat", data: "privatepromo:accounts:0" },
   whatsapp: { label: "💬 WhatsApp", data: "whatsapp:menu" },
-  totalUser: { label: "👥 Total User", data: "users:total:0" },
   refresh: { label: "🔄 Refresh", data: "menu:dashboard" }
 };
 
@@ -908,7 +907,6 @@ function ownerDashboardMenu() {
     [DASH_BTN.accounts],
     [DASH_BTN.add, DASH_BTN.admin],
     [DASH_BTN.privatePromo, DASH_BTN.whatsapp],
-    [DASH_BTN.totalUser],
     [DASH_BTN.refresh]
   ]);
 }
@@ -952,6 +950,16 @@ function accountListKeyboard(accounts, page, hasNext) {
   kb.text("➕ Tambah Akun", "account:add");
 
   return kb;
+}
+
+function statusLabelId(status) {
+  const map = {
+    connected: "🟢 Terhubung",
+    connecting: "🟡 Menghubungkan",
+    disconnected: "⚪ Terputus",
+    error: "🟠 Error"
+  };
+  return map[status] || (status ? String(status) : "-");
 }
 
 function accountMenu(account, settings) {
@@ -2064,8 +2072,8 @@ function settingsSummary(account, settings) {
     `👤 Nama: <b>${escapeHtml(telegramName)}</b>`,
     `🔗 Username: <code>${escapeHtml(username)}</code>`,
     `🆔 Telegram ID: <code>${escapeHtml(account.telegram_user_id || "belum login")}</code>`,
-    `📌 Koneksi: <b>${escapeHtml(account.status || "-")}</b>`,
-    `▶️ Promosi: <b>${settings?.active ? "RUNNING" : "STOPPED"}</b>`,
+    `📌 Status : <b>${escapeHtml(statusLabelId(account.status))}</b>`,
+    `▶️ Promosi: <b>${settings?.active ? "BERJALAN" : "BERHENTI"}</b>`,
     `📝 Format: <b>${escapeHtml(settingsFormatText(settings))}</b>`,
     `⏱ Jeda: <b>${escapeHtml(formatInterval(settings?.interval_minutes))}</b>`,
     `📅 Durasi : <b>${escapeHtml(formatDuration(settings?.duration_hours))}</b>`,
@@ -3796,7 +3804,7 @@ async function startLogin(ctx, accountId, phone, options = {}) {
       `📱 Nomor <code>${escapeHtml(identity.phone || phone)}</code>`,
       `👤 Akun <code>${escapeHtml(derivedLabel)}</code>`,
       "🔒 Session tersimpan (terenkripsi).",
-      "🟢 Status: connected",
+      "🟢 Status : Terhubung",
       ""
     ].join("\n");
 
@@ -4295,7 +4303,7 @@ async function showAccount(ctx, accountId, prefixMessage = "") {
     `👤 Nama : <b>${escapeHtml(name)}</b>`,
     `🔗 Username : <code>${escapeHtml(account.username ? "@" + account.username : "-")}</code>`,
     `🆔 Id : <code>${escapeHtml(account.telegram_user_id || "-")}</code>`,
-    `📌 Koneksi : <b>${escapeHtml(account.status || "-")}</b>`,
+    `📌 Status : <b>${escapeHtml(statusLabelId(account.status))}</b>`,
     `📝 Format : <b>${formats.length}</b>`,
     `▶️ Aktif : <b>${activeCount}</b>`,
     `🎯 Target aktif : <b>dibagi bersama akun ini</b>`
@@ -5265,9 +5273,9 @@ bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
       `☑️ Dipilih : <b>${activeCountResult.count || 0}</b>`,
       `📄 Halaman : <b>${page + 1}</b>`,
       "",
-      "✅ = jadi target promosi",
-      "⬜ = belum dipilih",
-      result.rows.length ? "" : "<i>Belum ada grup. Tekan Deteksi Grup untuk memuat grup.</i>"
+      "<blockquote>✅ = jadi target promosi\n⬜ = belum dipilih</blockquote>",
+      result.rows.length ? "" : "<i>Belum ada grup. Tekan Deteksi Grup untuk memuat grup.</i>",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     ].filter(Boolean).join("\n");
 
     return replaceUi(
@@ -5378,9 +5386,9 @@ async function renderGroupPageDirect(ctx, accountId, page, prefix = "") {
     `☑️ Dipilih : <b>${activeCountResult.count || 0}</b>`,
     `📄 Halaman : <b>${page + 1}</b>`,
     "",
-    "✅ = jadi target promosi",
-    "⬜ = belum dipilih",
-    result.rows.length ? "" : "<i>Belum ada grup.</i>"
+    "<blockquote>✅ = jadi target promosi\n⬜ = belum dipilih</blockquote>",
+    result.rows.length ? "" : "<i>Belum ada grup.</i>",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━"
   ].filter(Boolean).join("\n");
 
   return replaceUi(
@@ -5674,18 +5682,13 @@ async function renderPrivatePromoGroups(ctx, page = 0, notice = "") {
     notice,
     "📢 <b>PROMOSI CHAT PRIVAT</b>",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    `📱 Akun pengirim: <b>${escapeHtml(account.label)}</b>`,
-    `👥 Grup tersedia: <b>${total}</b>`,
-    `☑️ Grup dipilih: <b>${selectedCount}</b>`,
-    "",
-    visible.length
-      ? visible.map(row => {
-          const icon = state.selectedGroupIds.has(String(row.id)) ? "☑️" : "⬜";
-          return `${icon} <b>${escapeHtml(row.title || "Tanpa Nama")}</b>`;
-        }).join("\n")
-      : "<i>Belum ada grup yang terdeteksi untuk akun ini.</i>",
-    "",
-    "Pilih satu atau beberapa grup sumber member, lalu tekan <b>✅ Lanjut</b>."
+    `👤 Akun pengirim : <b>${escapeHtml(account.label)}</b>`,
+    `👥 Grup tersedia : <b>${total}</b>`,
+    `☑️ Grup dipilih : <b>${selectedCount}</b>`,
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "Pilih satu atau beberapa grup sumber member.",
+    "Setelah selesai, tekan <b>✅ Lanjut</b>.",
+    visible.length ? "" : "<i>Belum ada grup yang terdeteksi untuk akun ini.</i>"
   ].filter(Boolean).join("\n");
 
   return replaceUi(

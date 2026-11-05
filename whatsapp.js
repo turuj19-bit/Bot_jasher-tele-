@@ -527,8 +527,9 @@ function register(bot, getDeps) {
         `👤 Nama : <b>${esc(acc.label)}</b>`,
         `📞 Nomor : <code>${esc(acc.phone || "-")}</code>`,
         `📌 Status : ${statusLabel(acc)}`,
-        `☑️ Grup dipilih : <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`,
-        `📝 Format : <b>${formats.length}</b> (berjalan ${formats.filter(f => f.active).length})`
+        `📝 Format : <b>${formats.length}</b>`,
+        `▶️ Aktif : <b>${formats.filter(f => f.active).length}</b>`,
+        `☑️ Grup dipilih : <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`
       ].join("\n"),
       kb: accountKb(acc)
     };
@@ -545,7 +546,7 @@ function register(bot, getDeps) {
         `👤 Nama : <b>${esc(acc.label)}</b>`,
         `📞 Nomor : <code>${esc(acc.phone || "-")}</code>`,
         `🔗 Koneksi : ${statusLabel(acc)}`,
-        `🔌 Socket : <b>${entry?.open ? "aktif" : "tidak aktif"}</b>`,
+        `🔌 Sesi aktif : <b>${entry?.open ? "aktif" : "tidak aktif"}</b>`,
         `▶️ Promosi berjalan : <b>${formats.filter(f => f.active).length}</b>`,
         `☑️ Grup dipilih : <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`,
         `🕒 Diperbarui : ${esc(dateText(acc.updated_at))}`
@@ -568,7 +569,7 @@ function register(bot, getDeps) {
         `👤 Nama : <b>${esc(acc.label)}</b>`,
         `📞 Nomor : <code>${esc(acc.phone || "belum ada nomor")}</code>`,
         `📌 Koneksi : <b>${esc(statusLabel(acc))}</b>`,
-        `▶️ Promosi : <b>${running ? "RUNNING" : "STOPPED"}</b>`,
+        `▶️ Promosi : <b>${running ? "BERJALAN" : "BERHENTI"}</b>`,
         `📝 Format : <b>${formats.length}</b>`
       ].join("\n"),
       kb: buildKb([
@@ -615,7 +616,7 @@ function register(bot, getDeps) {
     if (term) lines.push(`Pencarian  : <b>${esc(opts.rawTerm || term)}</b> (${scope.length} hasil)`);
     lines.push(`Halaman  : <b>${p + 1}</b> / ${pages}`);
     if (opts.prefix) lines.push("", opts.prefix);
-    lines.push("", "✅ = jadi target promosi", "⬜ = belum dipilih");
+    lines.push("", "<blockquote>✅ = jadi target promosi\n⬜ = belum dipilih</blockquote>");
     if (!all.length) lines.push("", "<i>Belum ada grup. Tekan Deteksi Grup setelah akun terhubung.</i>");
     return { text: lines.join("\n"), kb: buildKb(kb) };
   }
