@@ -38,8 +38,8 @@ const SESSION_ROOT = process.env.WA_SESSION_DIR || path.join(__dirname, "wa_sess
 const MEDIA_ROOT = process.env.WA_MEDIA_DIR || path.join(__dirname, "wa_media");
 const PAGE = 8;
 const DEFAULT_INTERVAL_SEC = 30 * 60;   // jeda bawaan antar putaran (detik); bebas diubah tanpa batas minimum
-const GROUP_DELAY_MIN_MS = 20 * 1000;   // jeda acak antar grup
-const GROUP_DELAY_MAX_MS = 60 * 1000;
+const GROUP_DELAY_MIN_MS = 1000;        // jeda antar grup: 1 detik
+const GROUP_DELAY_MAX_MS = 1000;
 const DAILY_CAP = 200;                  // maksimal kirim per akun per hari
 const FLOW_TTL_MS = 10 * 60 * 1000;
 // Lama kode pairing dianggap berlaku. Lewat dari ini bot kirim pemberitahuan "kedaluwarsa".
