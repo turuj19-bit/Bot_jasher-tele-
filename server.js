@@ -1032,14 +1032,14 @@ function formatDurationKeyboard(accountId, formatId) {
 
 function formatDetailKeyboard(accountId, format) {
   const kb = new InlineKeyboard();
-  kb.text("✏️ Edit Format", `promo:edit:${accountId}:${format.id}`).row();
-  kb.text("⏱️ Atur Jeda", `promo:delay:${accountId}:${format.id}`).row();
-  kb.text("📅 Atur Durasi", `promo:duration:${accountId}:${format.id}`).row();
+  kb.text("✏️ Edit Format", `promo:edit:${accountId}:${format.id}`)
+    .text("⏱️ Atur Jeda", `promo:delay:${accountId}:${format.id}`).row();
+  kb.text("📅 Atur Durasi", `promo:duration:${accountId}:${format.id}`);
   if (format.active) kb.text("⏹️ Stop", `promo:stop:${accountId}:${format.id}`);
   else kb.text("▶️ Mulai", `promo:start:${accountId}:${format.id}`);
   kb.row();
-  kb.text(format.active ? "🔴 Nonaktif" : "🟢 Aktif", `promo:toggle:${accountId}:${format.id}`).row();
-  kb.text("🗑️ Hapus Format", `promo:delete:${accountId}:${format.id}`).row();
+  kb.text(format.active ? "🔴 Nonaktif" : "🟢 Aktif", `promo:toggle:${accountId}:${format.id}`)
+    .text("🗑️ Hapus Format", `promo:delete:${accountId}:${format.id}`).row();
   kb.text("⬅️ Kembali", `promo:list:${accountId}:0`);
   return kb;
 }
@@ -4305,32 +4305,30 @@ async function renderFormatDetail(ctx, accountId, formatId, prefixMessage = "") 
   if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
   const format = await getPromotionFormat(accountId, formatId);
   if (!format) return replaceUi(ctx, "❌ Format tidak ditemukan.", new InlineKeyboard().text("⬅️ Kembali", `promo:list:${accountId}:0`), { parse_mode: "HTML" });
-  const body = format.media_type === "photo"
+
+  const isPhoto = format.media_type === "photo";
+  const body = isPhoto
     ? (format.caption || "Foto tanpa caption")
     : (format.message || "Format teks kosong");
+  const rule = "━━━━━━━━━━━━━━━━━━";
+
   const message = [
     prefixMessage,
-    `📝 <b>FORMAT: ${escapeHtml(format.name)}</b>`,
-    "━━━━━━━━━━━━━━━━━━",
+    "📝 <b>FORMAT PROMOSI</b>",
+    `🏷️ Nama: <b>${escapeHtml(truncateText(format.name, 100))}</b>`,
+    rule,
     "📄 <b>ISI FORMAT</b>",
-    format.media_type === "photo" ? "🖼️ Media: Foto" : "📝 Media: Teks",
+    `Media: <b>${isPhoto ? "🖼️ Foto" : "📝 Teks"}</b>`,
     `<blockquote>${escapeHtml(truncateText(body, 2500))}</blockquote>`,
-    "━━━━━━━━━━━━━━━━━━",
+    rule,
     "⚙️ <b>PENGATURAN</b>",
     `⏱️ Jeda: <b>${escapeHtml(formatInterval(format.interval_minutes))}</b>`,
     `📅 Durasi: <b>${escapeHtml(formatDuration(format.duration_hours))}</b>`,
     `🕐 Waktu: <b>${escapeHtml(formatWindowLabel(format))}</b>`,
-    `🟢 Status: <b>${format.active ? "AKTIF" : "NONAKTIF"}</b>`
+    `📌 Status: <b>${format.active ? "🟢 AKTIF" : "🔴 NONAKTIF"}</b>`
   ].filter(Boolean).join("\n");
-  return replaceUi(ctx, message, formatDetailKeyboard(accountId, format), { parse_mode: "HTML" });
-}
 
-async function renderFormatList(ctx, accountId, prefixMessage = "") {
-  const account = await getAccount(accountId);
-  if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
-  const formats = await getPromotionFormats(accountId);
-  const lines = [prefixMessage, `📝 <b>FORMAT PROMOSI</b>`, `👤 ${escapeHtml(account.label || "Akun Telegram")}`, "", formats.length ? `Total format: <b>${formats.length}</b>` : "Belum ada format."];
-  return replaceUi(ctx, lines.filter(Boolean).join("\n"), formatListKeyboard(formats, accountId), { parse_mode: "HTML" });
+  return replaceUi(ctx, message, formatDetailKeyboard(accountId, format), { parse_mode: "HTML" });
 }
 
 /* =========================================================

@@ -409,7 +409,7 @@ function register(bot, getDeps) {
   const searchTerms = new Map(); // token -> { accountId, term, rawTerm } untuk Cari Grup
 
   const ASK = {
-    msg: "✏️ Kirim isi pesan promosi sekarang.\nBisa memakai emoji dan format WhatsApp: *tebal*, _miring_, ~coret~.\nTidak ada batas panjang pesan.",
+    msg: "✏️ Kirim <b>teks</b> baru untuk isi pesan, atau kirim <b>foto/video</b> dengan caption untuk mengganti media sekaligus pesannya.\nBisa memakai emoji dan format WhatsApp: *tebal*, _miring_, ~coret~.\nTidak ada batas panjang pesan.",
     photo: "🖼️ Kirim <b>foto</b> atau <b>video</b> (sebagai media, bukan file). Isi pesan akan dipakai sebagai caption.\nUkuran file maksimal 20 MB.",
     interval: `⏱️ Kirim jeda antar putaran, minimal ${MIN_INTERVAL_MIN} menit.\nContoh: 30 menit, 1 jam`,
     duration: "📅 Kirim durasi promosi.\nContoh: 1 jam, 3 hari"
@@ -527,20 +527,21 @@ function register(bot, getDeps) {
 
   async function screenSettings(acc) {
     const formats = await loadFormats(acc.id);
+    const running = formats.filter(f => f.active).length;
     return {
       text: [
-        "⚙️ <b>PENGATURAN AKUN</b>",
-        RULE,
+        "⚙️ <b>SETTING ACCOUNT</b>",
+        "",
+        "📱 <b>AKUN TERKAIT</b>",
         `👤 Nama: <b>${esc(acc.label)}</b>`,
-        `📞 Nomor: <code>${esc(acc.phone || "-")}</code>`,
-        `🔗 Koneksi: ${statusLabel(acc)}`,
-        `▶️ Promosi berjalan: <b>${formats.filter(f => f.active).length}</b>`,
+        `📞 Nomor: <code>${esc(acc.phone || "belum ada nomor")}</code>`,
+        `📌 Koneksi: <b>${esc(statusLabel(acc))}</b>`,
+        `▶️ Promosi: <b>${running ? "RUNNING" : "STOPPED"}</b>`,
         `📝 Format: <b>${formats.length}</b>`
       ].join("\n"),
       kb: buildKb([
         [["🏷️ Nama", `wa:acc:label:${acc.id}`], ["📝 Format", `wa:fmt:list:${acc.id}:0`]],
-        [["➕ Format Baru", `wa:fmt:add:${acc.id}`]],
-        [["⬅️ Akun", `wa:acc:view:${acc.id}`]]
+        [["➕ Format Baru", `wa:fmt:add:${acc.id}`], ["⬅️ Kembali", `wa:acc:view:${acc.id}`]]
       ])
     };
   }
@@ -635,28 +636,29 @@ function register(bot, getDeps) {
   async function screenFormat(acc, fmt) {
     const id = acc.id;
     const f = fmt.id;
-    const preview = fmt.message ? esc(trunc(fmt.message, 400)) : "<i>Belum diisi</i>";
+    const body = fmt.message ? esc(trunc(fmt.message, 400)) : "<i>Belum diisi</i>";
     const lines = [
-      `${fmt.active ? "▶️" : "⏹"} <b>${esc(trunc(fmt.name, 100))}</b>`,
+      "📝 <b>FORMAT PROMOSI</b>",
+      `🏷️ Nama: <b>${esc(trunc(fmt.name, 100))}</b>`,
       RULE,
-      `Status: ${fmt.active ? "Berjalan" : "Berhenti"}`,
-      `Jenis: ${fmt.media ? (isVideoMedia(fmt) ? "🎬 Video + teks" : "🖼️ Foto + teks") : "📝 Teks saja"}`,
-      `Jeda: <b>${mins(fmt.interval_minutes)}</b> · Durasi: <b>${hours(fmt.duration_hours)}</b>`
+      "📄 <b>ISI FORMAT</b>",
+      `Media: <b>${fmt.media ? (isVideoMedia(fmt) ? "🎬 Video" : "🖼️ Foto") : "📝 Teks"}</b>`,
+      `<blockquote>${body}</blockquote>`,
+      RULE,
+      "⚙️ <b>PENGATURAN</b>",
+      `⏱️ Jeda: <b>${mins(fmt.interval_minutes)}</b>`,
+      `📅 Durasi: <b>${hours(fmt.duration_hours)}</b>`,
+      "🕐 Waktu: <b>langsung</b>",
+      `📌 Status: <b>${fmt.active ? "🟢 AKTIF" : "🔴 NONAKTIF"}</b>`
     ];
-    if (fmt.active && fmt.expires_at) lines.push(`Berakhir: ${esc(dateText(fmt.expires_at))}`);
-    lines.push("", "<b>Isi pesan:</b>", preview);
-
+    if (fmt.active && fmt.expires_at) lines.push(`⌛ Berakhir: ${esc(dateText(fmt.expires_at))}`);
     return {
       text: lines.join("\n"),
       kb: buildKb([
-        [["✏️ Ubah Pesan", `wa:fmt:ask:msg:${id}:${f}`]],
-        [
-          [fmt.media ? "🔁 Ganti Media" : "🖼️ Tambah Foto/Video", `wa:fmt:ask:photo:${id}:${f}`],
-          fmt.media ? ["🗑️ Hapus Media", `wa:fmt:nophoto:${id}:${f}`] : null
-        ],
-        [["⏱️ Jeda", `wa:fmt:ask:interval:${id}:${f}`], ["📅 Durasi", `wa:fmt:ask:duration:${id}:${f}`]],
-        [fmt.active ? ["⏹ Stop", `wa:fmt:stop:${id}:${f}`] : ["▶️ Mulai", `wa:fmt:start:${id}:${f}`], ["🗑️ Hapus Format", `wa:fmt:del:${id}:${f}`]],
-        [["⬅️ Daftar Format", `wa:fmt:list:${id}:0`]]
+        [["✏️ Edit Format", `wa:fmt:ask:msg:${id}:${f}`], ["⏱️ Atur Jeda", `wa:fmt:ask:interval:${id}:${f}`]],
+        [["📅 Atur Durasi", `wa:fmt:ask:duration:${id}:${f}`], fmt.active ? ["⏹ Stop", `wa:fmt:stop:${id}:${f}`] : ["▶️ Mulai", `wa:fmt:start:${id}:${f}`]],
+        [["🗑️ Hapus Format", `wa:fmt:del:${id}:${f}`]],
+        [["⬅️ Kembali", `wa:fmt:list:${id}:0`]]
       ])
     };
   }
@@ -913,7 +915,10 @@ function register(bot, getDeps) {
       setFlow(ctx.from.id, { t: kind, accountId: acc.id, formatId: fmt.id });
       await show(ctx, {
         text: `${RULE}\n${ASK[kind]}`,
-        kb: cancelKb(acc.id, fmt.id)
+        kb: buildKb([
+          ...(kind === "msg" && fmt.media ? [[["🗑️ Hapus Media", `wa:fmt:nophoto:${acc.id}:${fmt.id}`]]] : []),
+          [["❌ Batal", `wa:fmt:view:${acc.id}:${fmt.id}`]]
+        ])
       });
     })));
 
@@ -1085,7 +1090,7 @@ function register(bot, getDeps) {
     if (!flow) return next();
     const tgId = ctx.from.id;
 
-    if (flow.t !== "photo") {
+    if (flow.t !== "photo" && flow.t !== "msg") {
       return note(tgId, "✏️ Kamu sedang mengisi sesuatu. Kirim teks, atau tekan Batal dulu.", cancelKb(flow.accountId, flow.formatId));
     }
 
@@ -1105,7 +1110,10 @@ function register(bot, getDeps) {
       clearMedia(acc.id, flow.formatId);
       const dest = mediaPath(acc.id, flow.formatId, isVideo ? "mp4" : "jpg");
       fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
-      await updateFormat(acc.id, flow.formatId, { media: dest });
+      const caption = String(ctx.message.caption || "").trim();
+      const patch = { media: dest };
+      if (caption) patch.message = caption;
+      await updateFormat(acc.id, flow.formatId, patch);
       clearFlow(tgId);
       return showFormatNote(tgId, acc, flow.formatId);
     } catch (e) {
