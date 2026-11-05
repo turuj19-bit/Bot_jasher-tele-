@@ -807,17 +807,13 @@ function dashboardText(ctx, stats, extra = "", role = "") {
     "🎛️ <b>PANEL KONTROL</b>",
     rule,
     `👤 <b>${escapeHtml(name)}</b>`,
-    `🆔 <code>${escapeHtml(ctx.from.id)}</code>`,
-    `🔗 <code>${escapeHtml(username)}</code>`,
-    roleLabel ? `🎖️ <code>${roleLabel}</code>  ·  <code>v${escapeHtml(BOT_VERSION)}</code>` : `🤖 <code>v${escapeHtml(BOT_VERSION)}</code>`,
+    `🆔 <code>${escapeHtml(ctx.from.id)}</code> · 🔗 <code>${escapeHtml(username)}</code>`,
+    roleLabel ? `🎖️ <code>${roleLabel}</code> · <code>v${escapeHtml(BOT_VERSION)}</code>` : `🤖 <code>v${escapeHtml(BOT_VERSION)}</code>`,
     extra ? `\n<blockquote>${escapeHtml(extra)}</blockquote>` : null,
     rule,
     "📊 <b>STATUS SISTEM</b>",
-    `┣ 👥 Admin aktif  <b>${stats.admins}</b>`,
-    `┣ 📱 Akun Telegram  <b>${stats.accounts}</b>`,
-    `┣ 🟢 Terhubung  <b>${stats.connected}</b>`,
-    `┣ ▶️ Promosi berjalan  <b>${stats.running}</b>`,
-    `┗ 🎯 Target grup  <b>${stats.groups}</b>`
+    `👥 Admin <b>${stats.admins}</b> · 📱 Akun <b>${stats.accounts}</b> · 🟢 Terhubung <b>${stats.connected}</b>`,
+    `▶️ Promosi berjalan <b>${stats.running}</b> · 🎯 Target grup <b>${stats.groups}</b>`
   ].filter(line => line !== null).join("\n");
 }
 
@@ -2101,7 +2097,7 @@ function formatDetailText(account, settings) {
 
   const bodyLimit = 2500;
   const safeBody = body.length > bodyLimit
-    ? `${body.slice(0, bodyLimit)}\n… <i>(format dipotong di tampilan)</i>`
+    ? `${body.slice(0, bodyLimit)}\n… <i>(dipotong)</i>`
     : body;
 
   const scheduleLines = settings?.active
@@ -4300,6 +4296,21 @@ async function showAccount(ctx, accountId, prefixMessage = "") {
   return replaceUi(ctx, message, accountMenu(account, settings), { parse_mode: "HTML" });
 }
 
+async function renderFormatList(ctx, accountId, prefixMessage = "") {
+  const account = await getAccount(accountId);
+  if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  const formats = await getPromotionFormats(accountId);
+  const lines = [
+    prefixMessage,
+    "📝 <b>FORMAT PROMOSI</b>",
+    "━━━━━━━━━━━━━━━━━━",
+    `👤 Akun: <b>${escapeHtml(account.label || "Akun Telegram")}</b>`,
+    `📦 Total format: <b>${formats.length}</b>`,
+    formats.length ? "" : "Belum ada format. Tekan ➕ Tambah Format untuk membuat."
+  ].filter(Boolean);
+  return replaceUi(ctx, lines.join("\n"), formatListKeyboard(formats, accountId), { parse_mode: "HTML" });
+}
+
 async function renderFormatDetail(ctx, accountId, formatId, prefixMessage = "") {
   const account = await getAccount(accountId);
   if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
@@ -4960,7 +4971,7 @@ bot.callbackQuery(/^promo:add:(\d+)$/, async ctx => {
   const account = await getAccount(accountId);
   if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), {parse_mode:"HTML"});
   flows.set(String(ctx.from.id), { t:"format_add", accountId, adminId:adminRow.id });
-  return replaceUi(ctx, `➕ <b>TAMBAH FORMAT</b>\n\nKirim <b>isi format promosi</b> sekarang:\n• Teks (panjang/pendek bebas), atau\n• Foto (dengan/tanpa caption)`, cancelKeyboard(false), {parse_mode:"HTML"});
+  return replaceUi(ctx, `➕ <b>TAMBAH FORMAT</b>\n\nKirim <b>isi format</b> sekarang:\n📝 Teks, atau\n🖼️ Foto (dengan atau tanpa caption)`, cancelKeyboard(false), {parse_mode:"HTML"});
 });
 
 bot.callbackQuery(/^promo:view:(\d+):([^:]+)$/, async ctx => {
@@ -4979,7 +4990,7 @@ bot.callbackQuery(/^promo:edit:(\d+):([^:]+)$/, async ctx => {
   const format=await getPromotionFormat(accountId, formatId);
   if(!format) return renderFormatList(ctx, accountId, "❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id), {t:"format", accountId, formatId, adminId:adminRow.id});
-  return replaceUi(ctx, `✏️ <b>EDIT FORMAT: ${escapeHtml(format.name)}</b>\n\nKirim teks atau foto + caption baru.`, cancelKeyboard(false), {parse_mode:"HTML"});
+  return replaceUi(ctx, `✏️ <b>EDIT FORMAT: ${escapeHtml(format.name)}</b>\n\nKirim <b>teks</b> baru, atau <b>foto + caption</b> untuk mengganti media dan isi.`, cancelKeyboard(false), {parse_mode:"HTML"});
 });
 
 bot.callbackQuery(/^promo:delete:(\d+):([^:]+)$/, async ctx => {
@@ -5003,7 +5014,10 @@ bot.callbackQuery(/^promo:active:(\d+):\d+$/, async ctx => {
   if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
   const formats=await getPromotionFormats(accountId);
   const active=formats.filter(x=>x.active);
-  return replaceUi(ctx, `▶️ <b>FORMAT AKTIF</b>\n\n${active.length ? active.map(x=>`🟢 <b>${escapeHtml(x.name)}</b>\n⏱ ${escapeHtml(formatInterval(x.interval_minutes))}\n📅 ${escapeHtml(formatDuration(x.duration_hours))}\n🕐 ${escapeHtml(formatWindowLabel(x))}`).join("\n\n") : "Tidak ada format yang sedang aktif."}`, activeFormatKeyboard(active,accountId), {parse_mode:"HTML"});
+  const activeText = active.length
+    ? active.map(x => `🟢 <b>${escapeHtml(x.name)}</b>\n⏱️ ${escapeHtml(formatInterval(x.interval_minutes))} · 📅 ${escapeHtml(formatDuration(x.duration_hours))} · 🕐 ${escapeHtml(formatWindowLabel(x))}`).join("\n\n")
+    : "⚪ Tidak ada format yang sedang berjalan.";
+  return replaceUi(ctx, `▶️ <b>FORMAT AKTIF</b>\n━━━━━━━━━━━━━━━━━━\n\n${activeText}`, activeFormatKeyboard(active, accountId), { parse_mode: "HTML" });
 });
 
 bot.callbackQuery(/^promo:delay:(\d+):([^:]+)$/, async ctx => {
@@ -5012,7 +5026,7 @@ bot.callbackQuery(/^promo:delay:(\d+):([^:]+)$/, async ctx => {
   if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const f=await getPromotionFormat(accountId,formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id),{t:"delay",accountId,formatId,adminId:adminRow.id});
-  return replaceUi(ctx,`⏱️ <b>ATUR JEDA</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nPilih jeda cepat di bawah, atau tekan <b>Ketik sendiri</b> untuk menulis menit/jam.`,formatDelayKeyboard(accountId,formatId),{parse_mode:"HTML"});
+  return replaceUi(ctx, `⏱️ <b>ATUR JEDA</b>\n━━━━━━━━━━━━━━━━━━\nFormat: <b>${escapeHtml(f.name)}</b>\n\nPilih jeda cepat di bawah, atau tekan ⌨️ Ketik sendiri.`, formatDelayKeyboard(accountId, formatId), { parse_mode: "HTML" });
 });
 
 bot.callbackQuery(/^promo:duration:(\d+):([^:]+)$/, async ctx => {
@@ -5021,7 +5035,7 @@ bot.callbackQuery(/^promo:duration:(\d+):([^:]+)$/, async ctx => {
   if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const f=await getPromotionFormat(accountId,formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id),{t:"duration",accountId,formatId,adminId:adminRow.id});
-  return replaceUi(ctx,`📅 <b>ATUR DURASI</b>\n\nFormat: <b>${escapeHtml(f.name)}</b>\nPilih durasi cepat di bawah, atau tekan <b>Ketik sendiri</b> untuk menulis jam/hari.`,formatDurationKeyboard(accountId,formatId),{parse_mode:"HTML"});
+  return replaceUi(ctx, `📅 <b>ATUR DURASI</b>\n━━━━━━━━━━━━━━━━━━\nFormat: <b>${escapeHtml(f.name)}</b>\n\nPilih durasi cepat di bawah, atau tekan ⌨️ Ketik sendiri.`, formatDurationKeyboard(accountId, formatId), { parse_mode: "HTML" });
 });
 
 bot.callbackQuery(/^promo:delayset:(\d+):([^:]+):(\d+)$/, async ctx => {

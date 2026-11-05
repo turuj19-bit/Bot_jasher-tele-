@@ -333,6 +333,34 @@ function register(bot, getDeps) {
     return sock.sendMessage(jid, { text: fmt.message });
   }
 
+  async function sendRoundReport(acc, fmt, round) {
+    const to = fmt.started_by;
+    if (!to) return;
+    const total = round.ok + round.fail.length;
+    const reasons = new Map();
+    for (const f of round.fail) reasons.set(f.reason, (reasons.get(f.reason) || 0) + 1);
+    const lines = [
+      "📊 <b>HASIL PROMOSI WHATSAPP</b>",
+      RULE,
+      `📝 Format: <b>${esc(trunc(fmt.name, 100))}</b>`,
+      `👤 Nama: <b>${esc((acc && acc.label) || "-")}</b>`,
+      `📞 Nomor: <code>${esc((acc && acc.phone) || "-")}</code>`,
+      RULE,
+      "📤 <b>HASIL PENGIRIMAN</b>",
+      `Total group dipilih: <b>${total}</b>`,
+      `Berhasil terkirim: <b>${round.ok}</b>`,
+      `Gagal: <b>${round.fail.length}</b>`
+    ];
+    if (reasons.size) {
+      lines.push("", "❌ <b>Ringkasan gagal:</b>");
+      for (const [reason, n] of reasons) lines.push(`• ${n} grup — ${esc(trunc(reason, 160))}`);
+    }
+    await bot.api.sendMessage(to, lines.join("\n"), {
+      parse_mode: "HTML",
+      reply_markup: new (IK())().text("📝 Detail Format", `wa:fmt:view:${acc.id}:${fmt.id}`)
+    }).catch(() => {});
+  }
+
   function startLoop(accountId, formatId) {
     const key = `${accountId}:${formatId}`;
     const existing = tasks.get(key);
@@ -361,6 +389,7 @@ function register(bot, getDeps) {
           const { data: acc } = await db().from("wa_accounts").select("*").eq("id", accountId).maybeSingle();
           const groups = await enabledGroups(accountId);
 
+          const round = { ok: 0, fail: [] };
           for (const g of groups) {
             if (!task.running) break;
             if (overDailyCap(accountId)) {
@@ -372,13 +401,16 @@ function register(bot, getDeps) {
               if (!sock) throw new Error("Akun WhatsApp terputus");
               await sendFormat(sock, g.group_jid, fmt);
               bumpDaily(accountId);
+              round.ok++;
               await logHistory(acc, null, "promotion_send", "success", { group_title: g.title });
             } catch (e) {
+              round.fail.push({ title: g.title, reason: errText(e) });
               await logHistory(acc, null, "promotion_send", "error", { group_title: g.title, error: errText(e) });
             }
             await waitTask(task, rnd(GROUP_DELAY_MIN_MS, GROUP_DELAY_MAX_MS));
           }
 
+          if (round.ok + round.fail.length) await sendRoundReport(acc, fmt, round).catch(() => {});
           await waitTask(task, Math.max(MIN_INTERVAL_MIN, fmt.interval_minutes) * 60 * 1000);
         }
       } catch (e) {
@@ -392,7 +424,7 @@ function register(bot, getDeps) {
   async function startFormat(acc, formatId, tgId) {
     const fmt = await getFormat(acc.id, formatId);
     const expires = new Date(Date.now() + fmt.duration_hours * 3600 * 1000).toISOString();
-    await updateFormat(acc.id, formatId, { active: true, started_at: nowIso(), expires_at: expires });
+    await updateFormat(acc.id, formatId, { active: true, started_at: nowIso(), expires_at: expires, started_by: tgId });
     startLoop(acc.id, formatId);
     await logHistory(acc, tgId, "promotion_start", "info");
   }
@@ -409,10 +441,10 @@ function register(bot, getDeps) {
   const searchTerms = new Map(); // token -> { accountId, term, rawTerm } untuk Cari Grup
 
   const ASK = {
-    msg: "✏️ Kirim <b>teks</b> baru untuk isi pesan, atau kirim <b>foto/video</b> dengan caption untuk mengganti media sekaligus pesannya.\nBisa memakai emoji dan format WhatsApp: *tebal*, _miring_, ~coret~.\nTidak ada batas panjang pesan.",
-    photo: "🖼️ Kirim <b>foto</b> atau <b>video</b> (sebagai media, bukan file). Isi pesan akan dipakai sebagai caption.\nUkuran file maksimal 20 MB.",
-    interval: `⏱️ Kirim jeda antar putaran, minimal ${MIN_INTERVAL_MIN} menit.\nContoh: 30 menit, 1 jam`,
-    duration: "📅 Kirim durasi promosi.\nContoh: 1 jam, 3 hari"
+    msg: `✏️ <b>EDIT ISI FORMAT</b>\n${RULE}\nKirim <b>teks</b> untuk isi pesan.\nAtau kirim <b>foto/video</b> dengan caption untuk mengganti media sekaligus isi pesannya.\n\n<i>Tidak ada batas panjang pesan.</i>`,
+    photo: `🖼️ <b>MEDIA FORMAT</b>\n${RULE}\nKirim foto atau video.`,
+    interval: `⏱️ <b>ATUR JEDA</b>\n${RULE}\nKirim jeda antar putaran, minimal ${MIN_INTERVAL_MIN} menit.\nContoh: 30 menit, 1 jam`,
+    duration: `📅 <b>ATUR DURASI</b>\n${RULE}\nKirim lama promosi berjalan.\nContoh: 1 jam, 3 hari`
   };
 
   const cancelAcc = accId => buildKb([[["❌ Batal", `wa:acc:view:${accId}`]]]);
@@ -914,7 +946,7 @@ function register(bot, getDeps) {
       const kind = ctx.match[1];
       setFlow(ctx.from.id, { t: kind, accountId: acc.id, formatId: fmt.id });
       await show(ctx, {
-        text: `${RULE}\n${ASK[kind]}`,
+        text: ASK[kind],
         kb: buildKb([
           ...(kind === "msg" && fmt.media ? [[["🗑️ Hapus Media", `wa:fmt:nophoto:${acc.id}:${fmt.id}`]]] : []),
           [["❌ Batal", `wa:fmt:view:${acc.id}:${fmt.id}`]]
