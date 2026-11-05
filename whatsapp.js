@@ -18,7 +18,7 @@ const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = b
 const SESSION_ROOT = process.env.WA_SESSION_DIR || path.join(__dirname, "wa_sessions");
 const MEDIA_ROOT = process.env.WA_MEDIA_DIR || path.join(__dirname, "wa_media");
 const PAGE = 8;
-const MIN_INTERVAL_MIN = 30;            // jeda minimum antar putaran (menit)
+const DEFAULT_INTERVAL_SEC = 30 * 60;   // jeda bawaan antar putaran (detik); bebas diubah tanpa batas minimum
 const GROUP_DELAY_MIN_MS = 20 * 1000;   // jeda acak antar grup
 const GROUP_DELAY_MAX_MS = 60 * 1000;
 const DAILY_CAP = 200;                  // maksimal kirim per akun per hari
@@ -39,7 +39,36 @@ const rnd = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
 const newId = () => crypto.randomBytes(4).toString("hex");
 const nowIso = () => new Date().toISOString();
 const trunc = (s, n) => Array.from(String(s ?? "")).slice(0, n).join("");
-const mins = m => (m >= 60 && m % 60 === 0 ? `${m / 60} jam` : `${m} menit`);
+// Jeda disimpan dalam detik (interval_seconds). Format lama hanya punya interval_minutes.
+const intervalSec = fmt => {
+  const s = Number(fmt?.interval_seconds);
+  if (Number.isFinite(s) && s > 0) return s;
+  const m = Number(fmt?.interval_minutes);
+  return (Number.isFinite(m) && m > 0 ? m : DEFAULT_INTERVAL_SEC / 60) * 60;
+};
+const secText = sec => {
+  const s = Math.max(1, Math.round(sec));
+  if (s >= 86400 && s % 86400 === 0) return `${s / 86400} hari`;
+  if (s >= 3600 && s % 3600 === 0) return `${s / 3600} jam`;
+  if (s >= 60 && s % 60 === 0) return `${s / 60} menit`;
+  if (s < 60) return `${s} detik`;
+  const m = Math.floor(s / 60);
+  return `${m} menit ${s % 60} detik`;
+};
+// "30 detik", "5 menit", "1 jam", "2 hari", "1.5 jam". Angka tanpa satuan dianggap menit.
+const parseInterval = text => {
+  const m = String(text || "").trim().toLowerCase().replace(",", ".")
+    .match(/^(\d+(?:\.\d+)?)\s*(detik|dtk|sec|s|menit|mnt|min|m|jam|j|h|hari|d)?$/);
+  if (!m) return null;
+  const unit = {
+    detik: 1, dtk: 1, sec: 1, s: 1,
+    menit: 60, mnt: 60, min: 60, m: 60,
+    jam: 3600, j: 3600, h: 3600,
+    hari: 86400, d: 86400
+  }[m[2] || "menit"];
+  const sec = Math.round(Number(m[1]) * unit);
+  return Number.isFinite(sec) && sec >= 1 ? sec : null;
+};
 const hours = h => (h >= 24 && h % 24 === 0 ? `${h / 24} hari` : `${h} jam`);
 const dateText = v => (v ? new Date(v).toLocaleString("id-ID") : "-");
 const mediaPath = (accId, fmtId, ext = "jpg") => path.join(MEDIA_ROOT, `${accId}_${fmtId}.${ext}`);
@@ -328,10 +357,10 @@ function register(bot, getDeps) {
 
   async function sendFormat(sock, jid, fmt) {
     if (fmt.media && fs.existsSync(fmt.media)) {
-      const buffer = fs.readFileSync(fmt.media);
       const caption = fmt.message || undefined;
-      if (isVideoMedia(fmt)) return sock.sendMessage(jid, { video: buffer, caption, mimetype: "video/mp4" });
-      return sock.sendMessage(jid, { image: buffer, caption });
+      // Video dibaca streaming dari disk agar video besar tidak memenuhi memori.
+      if (isVideoMedia(fmt)) return sock.sendMessage(jid, { video: { url: fmt.media }, caption, mimetype: "video/mp4" });
+      return sock.sendMessage(jid, { image: fs.readFileSync(fmt.media), caption });
     }
     return sock.sendMessage(jid, { text: fmt.message });
   }
@@ -414,7 +443,9 @@ function register(bot, getDeps) {
           }
 
           if (round.ok + round.fail.length) await sendRoundReport(acc, fmt, round).catch(() => {});
-          await waitTask(task, Math.max(MIN_INTERVAL_MIN, fmt.interval_minutes) * 60 * 1000);
+          // Jeda bebas (detik pun bisa). Putaran tanpa grup ditunggu min. 10 detik agar tidak looping rapat.
+          const gapMs = intervalSec(fmt) * 1000;
+          await waitTask(task, round.ok + round.fail.length ? gapMs : Math.max(gapMs, 10000));
         }
       } catch (e) {
         console.error("WA LOOP:", errText(e));
@@ -446,7 +477,7 @@ function register(bot, getDeps) {
   const ASK = {
     msg: `✏️ <b>EDIT ISI FORMAT</b>\n${RULE}\nKirim <b>teks</b> untuk isi pesan.\nAtau kirim <b>foto/video</b> dengan caption untuk mengganti media sekaligus isi pesannya.\n\n<i>Tidak ada batas panjang pesan.</i>`,
     photo: `🖼️ <b>MEDIA FORMAT</b>\n${RULE}\nKirim foto atau video.`,
-    interval: `⏱️ <b>ATUR JEDA</b>\n${RULE}\nKirim jeda antar putaran, minimal ${MIN_INTERVAL_MIN} menit.\nContoh: 30 menit, 1 jam`,
+    interval: `⏱️ <b>ATUR JEDA</b>\n${RULE}\nKirim jeda antar putaran, tanpa batas minimum.\nContoh: 30 detik, 5 menit, 1 jam`,
     duration: `📅 <b>ATUR DURASI</b>\n${RULE}\nKirim lama promosi berjalan.\nContoh: 1 jam, 3 hari`
   };
 
@@ -604,8 +635,7 @@ function register(bot, getDeps) {
     const navBase = n => (opts.token ? `wa:grp:find:${acc.id}:${opts.token}:${n}` : `wa:grp:list:${acc.id}:${n}`);
     const backOf = n => (opts.token ? `f:${opts.token}:${n}` : `l:${n}`);
 
-    // Tombol memanjang di atas: pilih semua grup yang bisa dikirimi.
-    const kb = [[["➕ Tambah Semua Grup", `wa:grp:all:${acc.id}:${backOf(p)}`]]];
+    const kb = [];
     for (const g of rows.filter(x => x.can_send)) {
       kb.push([[`${g.enabled ? "✅" : "⬜"} ${trunc(g.title, 30)}`, `wa:grp:tog:${acc.id}:${g.id}:${backOf(p)}`]]);
     }
@@ -617,7 +647,8 @@ function register(bot, getDeps) {
     kb.push(opts.token
       ? [["⬅️ Semua Grup", `wa:grp:list:${acc.id}:0`], ["⬅️ Akun", `wa:acc:view:${acc.id}`]]
       : [["🔎 Cari Grup", `wa:grp:search:${acc.id}`], ["⬅️ Akun", `wa:acc:view:${acc.id}`]]);
-    // Tombol memanjang di bawah: muat ulang daftar grup dari akun.
+    // Dua tombol memanjang di bagian paling bawah.
+    kb.push([["➕ Tambah Semua Grup", `wa:grp:all:${acc.id}:${backOf(p)}`]]);
     kb.push([["🔄 Deteksi Grup", `wa:grp:refresh:${acc.id}`]]);
 
     const lines = [
@@ -711,7 +742,7 @@ function register(bot, getDeps) {
       `<blockquote>${body}</blockquote>`,
       RULE,
       "⚙️ <b>PENGATURAN</b>",
-      `⏱️ Jeda  : <b>${mins(fmt.interval_minutes)}</b>`,
+      `⏱️ Jeda  : <b>${secText(intervalSec(fmt))}</b>`,
       `📅 Durasi  : <b>${hours(fmt.duration_hours)}</b>`,
       "🕐 Waktu  : <b>langsung</b>",
       `📌 Status  : <b>${fmt.active ? "🟢 AKTIF" : "🔴 NONAKTIF"}</b>`
@@ -990,7 +1021,8 @@ function register(bot, getDeps) {
         name: nextFormatName(formats),
         message: "",
         media: null,
-        interval_minutes: MIN_INTERVAL_MIN,
+        interval_minutes: DEFAULT_INTERVAL_SEC / 60,
+        interval_seconds: DEFAULT_INTERVAL_SEC,
         duration_hours: 24,
         active: false,
         started_at: null,
@@ -1115,7 +1147,8 @@ function register(bot, getDeps) {
           name: text,
           message: "",
           media: null,
-          interval_minutes: MIN_INTERVAL_MIN,
+          interval_minutes: DEFAULT_INTERVAL_SEC / 60,
+          interval_seconds: DEFAULT_INTERVAL_SEC,
           duration_hours: 24,
           active: false,
           started_at: null,
@@ -1139,11 +1172,14 @@ function register(bot, getDeps) {
       }
 
       if (flow.t === "interval") {
-        const m = D().parseMinutes(text);
-        if (!m || m < MIN_INTERVAL_MIN) {
-          return note(tgId, `❌ Jeda minimal ${MIN_INTERVAL_MIN} menit. Contoh: 30 menit, 1 jam`, cancelKb(acc.id, flow.formatId));
+        const sec = parseInterval(text);
+        if (!sec) {
+          return note(tgId, "❌ Jeda tidak valid. Contoh: 30 detik, 5 menit, 1 jam", cancelKb(acc.id, flow.formatId));
         }
-        await updateFormat(acc.id, flow.formatId, { interval_minutes: m });
+        await updateFormat(acc.id, flow.formatId, {
+          interval_seconds: sec,
+          interval_minutes: Math.max(1, Math.round(sec / 60))
+        });
         clearFlow(tgId);
         return showFormatNote(tgId, acc, flow.formatId);
       }
@@ -1203,14 +1239,22 @@ function register(bot, getDeps) {
       if (!acc) { clearFlow(tgId); return note(tgId, denied().text, backKb); }
 
       const isVideo = !!ctx.message.video;
-      const fileId = isVideo ? ctx.message.video.file_id : ctx.message.photo[ctx.message.photo.length - 1].file_id;
-      const file = await ctx.api.getFile(fileId);
-      const res = await fetch(`https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`);
-      if (!res.ok) throw new Error("Gagal mengunduh media dari Telegram.");
+      const media = isVideo ? ctx.message.video : ctx.message.photo[ctx.message.photo.length - 1];
+      if (Number(media.file_size || 0) > 2 * 1024 * 1024 * 1024) {
+        return note(tgId, "❌ Video terlalu besar. Maksimal 2 GB.", cancelKb(flow.accountId, flow.formatId));
+      }
 
-      clearMedia(acc.id, flow.formatId);
-      const dest = mediaPath(acc.id, flow.formatId, isVideo ? "mp4" : "jpg");
-      fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
+      const tmpDest = mediaPath(acc.id, flow.formatId, isVideo ? "mp4" : "jpg");
+      await D().downloadTelegramMedia(
+        { fileId: media.file_id, messageId: ctx.message.message_id, fileSize: media.file_size },
+        tmpDest
+      );
+      // Media lama (jenis lain) dibersihkan setelah yang baru sukses tersimpan.
+      for (const ext of ["jpg", "mp4"]) {
+        const other = mediaPath(acc.id, flow.formatId, ext);
+        if (other !== tmpDest) fs.rmSync(other, { force: true });
+      }
+      const dest = tmpDest;
       const caption = String(ctx.message.caption || "").trim();
       const patch = { media: dest };
       if (caption) patch.message = caption;

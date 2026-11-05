@@ -1,6 +1,10 @@
 require("dotenv").config();
 
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const { pipeline } = require("stream/promises");
+const { Readable } = require("stream");
 const express = require("express");
 const { Bot, InlineKeyboard, InputFile } = require("grammy");
 const { createClient } = require("@supabase/supabase-js");
@@ -85,7 +89,8 @@ const waPromo = require("./whatsapp").register(bot, () => ({
   safeErrorMessage,
   parseMinutes,
   parseHours,
-  isOwnerId
+  isOwnerId,
+  downloadTelegramMedia
 }));
 
 /* =========================================================
@@ -485,12 +490,14 @@ function userPurchaseText(subscription = null) {
     "• Kelola format dan target promosi",
     "• Tidak memiliki menu Admin",
     "• Tidak memiliki Promosi Chat Privat",
+    "• Tidak memiliki Promosi WhatsApp",
     "",
     "⭐ <b>ADMIN VIP — Rp10.000 / bulan</b>",
     "• Semua fitur Admin Biasa",
     "• Bisa tambah maksimal <b>20 Admin Biasa</b>",
     "• Bisa membuka penjualan/pendaftaran bot untuk pengguna lain",
     "• <b>Tidak</b> memiliki Promosi Chat Privat",
+    "• <b>Tidak</b> memiliki Promosi WhatsApp",
     "",
     "💎 <b>ADMIN PREMIUM — Rp20.000 / bulan</b>",
     "• Semua fitur Admin VIP",
@@ -498,6 +505,9 @@ function userPurchaseText(subscription = null) {
     "• Mendapat fitur <b>Promosi Chat Privat</b>",
     "• Mendapat fitur <b>Promosi WhatsApp</b>",
     "• Bisa membuka penjualan/pendaftaran bot untuk pengguna lain",
+    "",
+    "🛡️ <b>GARANSI FULL 1 BULAN</b>",
+    "Berlaku penuh selama bot kamu digunakan di masa aktif. Ada kendala? Langsung hubungi Owner, kami bantu sampai beres. Beli tenang, promosi jalan terus!",
     "",
     "⏳ <b>Masa aktif: 1 bulan</b>",
     "Perpanjangan dapat dilakukan sebelum atau setelah masa aktif habis.",
@@ -530,20 +540,25 @@ function userOrderText(ctx, role, subscription = null) {
       "• Promosi ke grup",
       "• Kelola akun Telegram, format, dan target grup",
       "• Tidak bisa tambah admin",
-      "• Tidak ada Promosi Chat Privat"
+      "• Tidak ada Promosi Chat Privat",
+      "• Tidak ada Promosi WhatsApp",
+      "• 🛡️ Garansi full 1 bulan selama bot digunakan"
     ],
     ADMIN_VIP: [
       "• Semua fitur Admin Biasa",
       "• Bisa tambah maksimal 20 Admin Biasa",
       "• Bisa membuka penjualan/pendaftaran bot",
-      "• Tidak ada Promosi Chat Privat"
+      "• Tidak ada Promosi Chat Privat",
+      "• Tidak ada Promosi WhatsApp",
+      "• 🛡️ Garansi full 1 bulan selama bot digunakan"
     ],
     ADMIN_PREMIUM: [
       "• Semua fitur Admin VIP",
       "• Bisa tambah Admin Biasa tanpa batas",
       "• Promosi Chat Privat tersedia",
       "• Promosi WhatsApp tersedia",
-      "• Bisa membuka penjualan/pendaftaran bot"
+      "• Bisa membuka penjualan/pendaftaran bot",
+      "• 🛡️ Garansi full 1 bulan selama bot digunakan"
     ]
   }[role] || [];
 
@@ -1066,9 +1081,6 @@ function formatDetailKeyboard(accountId, format) {
 function groupListKeyboard(rows, accountId, page, hasNext) {
   const kb = new InlineKeyboard();
 
-  // Tombol memanjang di atas: pilih semua grup yang bisa dikirimi.
-  kb.text("➕ Tambah Semua Grup", `group:all:${accountId}`).row();
-
   // Hanya grup yang bisa dikirimi pesan tampil sebagai target. Tekan nama grup untuk pilih / batal.
   for (const group of rows.filter(g => g.can_send)) {
     const icon = group.enabled ? "✅" : "⬜";
@@ -1080,7 +1092,8 @@ function groupListKeyboard(rows, accountId, page, hasNext) {
   if (hasNext) kb.text("Berikutnya ▶️", `group:list:${accountId}:${page + 1}`);
   kb.row();
   kb.text("🔎 Cari Grup", `group:search:${accountId}`).text("⬅️ Akun", `account:open:${accountId}`).row();
-  // Tombol memanjang di bawah: muat ulang daftar grup dari akun.
+  // Dua tombol memanjang di bagian paling bawah.
+  kb.text("➕ Tambah Semua Grup", `group:all:${accountId}`).row();
   kb.text("🔄 Deteksi Grup", `group:refresh:${accountId}`);
   return kb;
 }
@@ -1199,9 +1212,10 @@ function normalizeFormat(row = {}) {
   return {
     id: String(row.id || newFormatId()),
     name: truncateText(String(row.name || "Format Baru").trim(), 60) || "Format Baru",
-    media_type: row.media_type === "photo" ? "photo" : "text",
+    media_type: row.media_type === "photo" ? "photo" : row.media_type === "video" ? "video" : "text",
     message: cleanText(row.message || ""),
     media_file_id: row.media_file_id || null,
+    media_path: row.media_path ? String(row.media_path) : null,
     caption: row.caption ? cleanText(row.caption) : null,
     interval_minutes: Math.max(1, Number(row.interval_minutes || 10)),
     duration_hours: Math.max(1, Number(row.duration_hours || 1)),
@@ -1361,7 +1375,8 @@ async function getPromotionFormat(accountId, formatId) {
 function formatReady(format) {
   return Boolean(
     (format?.media_type === "text" && String(format?.message || "").trim()) ||
-    (format?.media_type === "photo" && format?.media_file_id)
+    (format?.media_type === "photo" && format?.media_file_id) ||
+    (format?.media_type === "video" && format?.media_path)
   );
 }
 
@@ -2051,6 +2066,120 @@ async function listGroups(accountId, page = 0) {
    PROMOTION FORMAT / MEDIA
 ========================================================= */
 
+/* =========================================================
+   MEDIA FORMAT (video) — unduh & simpan lokal
+   Bot API biasa hanya boleh mengunduh sampai 20 MB. Untuk video yang lebih
+   besar (sampai 2 GB) bot mengunduh lewat MTProto memakai token bot sendiri.
+========================================================= */
+
+const TG_MEDIA_DIR = process.env.TG_MEDIA_DIR || path.join(__dirname, "tg_media");
+const BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024;
+const MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024;
+const CAPTION_LIMIT = 1024;
+
+try { fs.mkdirSync(TG_MEDIA_DIR, { recursive: true }); } catch (e) { console.error("TG MEDIA DIR:", e.message); }
+
+function tgMediaPath(accountId, formatId) {
+  const a = String(accountId).replace(/[^0-9a-zA-Z_-]/g, "");
+  const f = String(formatId).replace(/[^0-9a-zA-Z_-]/g, "");
+  return path.join(TG_MEDIA_DIR, `${a}_${f}.mp4`);
+}
+
+function removeTgMedia(accountId, formatId) {
+  try { fs.rmSync(tgMediaPath(accountId, formatId), { force: true }); } catch (_) {}
+}
+
+function removeTgMediaForAccount(accountId) {
+  try {
+    const prefix = `${String(accountId).replace(/[^0-9a-zA-Z_-]/g, "")}_`;
+    for (const name of fs.readdirSync(TG_MEDIA_DIR)) {
+      if (name.startsWith(prefix)) fs.rmSync(path.join(TG_MEDIA_DIR, name), { force: true });
+    }
+  } catch (_) {}
+}
+
+let botMtprotoClient = null;
+let botMtprotoLoading = null;
+
+async function getBotMtprotoClient() {
+  if (botMtprotoClient?.connected) return botMtprotoClient;
+  if (botMtprotoLoading) return botMtprotoLoading;
+
+  botMtprotoLoading = (async () => {
+    const client = new TelegramClient(
+      new StringSession(""),
+      Number(process.env.API_ID),
+      process.env.API_HASH,
+      { connectionRetries: 5, retryDelay: 2000, useWSS: false }
+    );
+    await client.start({ botAuthToken: process.env.BOT_TOKEN });
+    botMtprotoClient = client;
+    return client;
+  })();
+
+  try {
+    return await botMtprotoLoading;
+  } finally {
+    botMtprotoLoading = null;
+  }
+}
+
+async function downloadViaBotApi(fileId, dest) {
+  const file = await bot.api.getFile(fileId);
+  if (!file?.file_path) throw new Error("Telegram tidak mengembalikan file_path.");
+
+  const response = await fetch(
+    `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`,
+    { signal: AbortSignal.timeout(15 * 60 * 1000) }
+  );
+  if (!response.ok || !response.body) {
+    throw new Error(`Gagal mengunduh media Telegram: HTTP ${response.status}`);
+  }
+  await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(dest));
+}
+
+async function downloadViaMtproto(messageId, dest) {
+  const client = await getBotMtprotoClient();
+  const res = await client.invoke(new Api.messages.GetMessages({
+    id: [new Api.InputMessageID({ id: Number(messageId) })]
+  }));
+  const msg = (res?.messages || []).find(m => m?.media);
+  if (!msg) throw new Error("Video tidak ditemukan di server Telegram. Coba kirim ulang videonya.");
+  await client.downloadMedia(msg.media, { outputFile: dest });
+}
+
+// info: { fileId, messageId, fileSize }. Hasil ditulis ke dest (ditimpa bila sudah ada).
+async function downloadTelegramMedia(info, dest) {
+  const tmp = `${dest}.part`;
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.rmSync(tmp, { force: true });
+
+  try {
+    const size = Number(info.fileSize || 0);
+    let done = false;
+
+    if (!size || size <= BOT_API_DOWNLOAD_LIMIT) {
+      try {
+        await downloadViaBotApi(info.fileId, tmp);
+        done = true;
+      } catch (e) {
+        if (!/too big/i.test(String(e?.description || e?.message || ""))) throw e;
+        fs.rmSync(tmp, { force: true });
+      }
+    }
+
+    if (!done) await downloadViaMtproto(info.messageId, tmp);
+
+    if (!fs.existsSync(tmp) || fs.statSync(tmp).size <= 0) {
+      throw new Error("File media kosong setelah diunduh.");
+    }
+    fs.renameSync(tmp, dest);
+  } catch (e) {
+    fs.rmSync(tmp, { force: true });
+    throw e;
+  }
+}
+
 async function downloadBotPhoto(fileId) {
   const file = await bot.api.getFile(fileId);
   if (!file?.file_path) {
@@ -2120,7 +2249,7 @@ function formatDetailText(account, settings) {
       "",
       "⚠️ <b>Belum ada format promosi.</b>",
       "",
-      "Buat format dengan mengirim teks atau foto + caption."
+      "Buat format dengan mengirim teks atau foto/video + caption."
     ].join("\n");
   }
 
@@ -2606,6 +2735,16 @@ async function fireFormat(accountId, formatId) {
     photoBuffer = await downloadBotPhoto(format.media_file_id);
   }
 
+  let videoPath = null;
+  if (format.media_type === "video") {
+    videoPath = format.media_path;
+    if (!videoPath || !fs.existsSync(videoPath)) {
+      throw new Error("File video format tidak ditemukan di server. Kirim ulang videonya lewat Edit Format.");
+    }
+  }
+  // Setelah upload pertama, media dipakai ulang untuk grup lain (tanpa upload ulang).
+  let cachedVideoMedia = null;
+
   let success = 0;
   let fail = 0;
   let floodWaitMs = 0;
@@ -2638,11 +2777,31 @@ async function fireFormat(accountId, formatId) {
 
     try {
       if (format.media_type === "photo" && photoBuffer) {
+        // Caption di atas batas Telegram dikirim sebagai pesan terpisah.
+        const cap = String(format.caption || "");
+        const splitCap = cap.length > CAPTION_LIMIT;
         await client.sendFile(target, {
           file: photoBuffer,
-          caption: format.caption || "",
+          caption: splitCap ? "" : cap,
           forceDocument: false
         });
+        if (splitCap) await client.sendMessage(target, { message: cap });
+      } else if (format.media_type === "video" && videoPath) {
+        const cap = String(format.caption || "");
+        const splitCap = cap.length > CAPTION_LIMIT;
+        const sendOpts = { caption: splitCap ? "" : cap, forceDocument: false, supportsStreaming: true };
+        let sent = null;
+        if (cachedVideoMedia) {
+          try {
+            sent = await client.sendFile(target, { file: cachedVideoMedia, ...sendOpts });
+          } catch (cacheErr) {
+            if (isSendPermissionError(cacheErr) || extractFloodWaitMs(cacheErr) > 0) throw cacheErr;
+            cachedVideoMedia = null; // media lama tidak bisa dipakai, upload ulang
+          }
+        }
+        if (!sent) sent = await client.sendFile(target, { file: videoPath, ...sendOpts });
+        if (!cachedVideoMedia && sent?.media) cachedVideoMedia = sent.media;
+        if (splitCap) await client.sendMessage(target, { message: cap });
       } else {
         const message = String(format.message || "").trim();
         if (!message) throw new Error("Format teks kosong.");
@@ -4355,9 +4514,12 @@ async function renderFormatDetail(ctx, accountId, formatId, prefixMessage = "") 
   if (!format) return replaceUi(ctx, "❌ Format tidak ditemukan.", new InlineKeyboard().text("⬅️ Kembali", `promo:list:${accountId}:0`), { parse_mode: "HTML" });
 
   const isPhoto = format.media_type === "photo";
+  const isVideo = format.media_type === "video";
   const body = isPhoto
     ? (format.caption || "Foto tanpa caption")
-    : (format.message || "Format teks kosong");
+    : isVideo
+      ? (format.caption || "Video tanpa caption")
+      : (format.message || "Format teks kosong");
   const rule = "━━━━━━━━━━━━━━━━━━━━━━━━━━";
 
   const message = [
@@ -4366,7 +4528,7 @@ async function renderFormatDetail(ctx, accountId, formatId, prefixMessage = "") 
     `🏷️ Nama : <b>${escapeHtml(truncateText(format.name, 100))}</b>`,
     rule,
     "📄 <b>ISI FORMAT</b>",
-    `🖼️ Media : <b>${isPhoto ? "🖼️ Foto" : "📝 Teks"}</b>`,
+    `🖼️ Media : <b>${isPhoto ? "🖼️ Foto" : isVideo ? "🎬 Video" : "📝 Teks"}</b>`,
     `<blockquote>${escapeHtml(truncateText(body, 2500))}</blockquote>`,
     rule,
     "⚙️ <b>PENGATURAN</b>",
@@ -4919,6 +5081,8 @@ bot.callbackQuery(/^account:remove:confirm:(\d+)$/, async ctx => {
         ));
       }
 
+      removeTgMediaForAccount(accountId);
+
       // 3) Hapus setting, lalu akun.
       await withRetry(() => run(
         sb.from("account_settings").delete().eq("account_id", accountId)
@@ -5025,7 +5189,7 @@ bot.callbackQuery(/^promo:add:(\d+)$/, async ctx => {
   const account = await getAccount(accountId);
   if (!account) return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), {parse_mode:"HTML"});
   flows.set(String(ctx.from.id), { t:"format_add", accountId, adminId:adminRow.id });
-  return replaceUi(ctx, `➕ <b>TAMBAH FORMAT</b>\n\nKirim <b>isi format</b> sekarang:\n📝 Teks, atau\n🖼️ Foto (dengan atau tanpa caption)`, cancelKeyboard(false), {parse_mode:"HTML"});
+  return replaceUi(ctx, `➕ <b>TAMBAH FORMAT</b>\n\nKirim <b>isi format</b> sekarang:\n📝 Teks, atau\n🖼️ Foto, atau\n🎬 Video (dengan atau tanpa caption)`, cancelKeyboard(false), {parse_mode:"HTML"});
 });
 
 bot.callbackQuery(/^promo:view:(\d+):([^:]+)$/, async ctx => {
@@ -5044,7 +5208,7 @@ bot.callbackQuery(/^promo:edit:(\d+):([^:]+)$/, async ctx => {
   const format=await getPromotionFormat(accountId, formatId);
   if(!format) return renderFormatList(ctx, accountId, "❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id), {t:"format", accountId, formatId, adminId:adminRow.id});
-  return replaceUi(ctx, `✏️ <b>EDIT FORMAT: ${escapeHtml(format.name)}</b>\n\nKirim <b>teks</b> baru, atau <b>foto + caption</b> untuk mengganti media dan isi.`, cancelKeyboard(false), {parse_mode:"HTML"});
+  return replaceUi(ctx, `✏️ <b>EDIT FORMAT: ${escapeHtml(format.name)}</b>\n\nKirim <b>teks</b> baru, atau <b>foto/video + caption</b> untuk mengganti media dan isi.`, cancelKeyboard(false), {parse_mode:"HTML"});
 });
 
 bot.callbackQuery(/^promo:delete:(\d+):([^:]+)$/, async ctx => {
@@ -5057,6 +5221,7 @@ bot.callbackQuery(/^promo:delete:(\d+):([^:]+)$/, async ctx => {
   if(!format) return renderFormatList(ctx, accountId, "❌ Format tidak ditemukan.");
   await stopFormat(accountId, formatId, adminRow.id).catch(()=>{});
   await savePromotionFormats(accountId, formats.filter(x=>x.id!==formatId));
+  removeTgMedia(accountId, formatId);
   await recordHistory(accountId, adminRow.id, {action:"format_delete",status:"success",details:{format_id:formatId,format_name:format.name}});
   return renderFormatList(ctx, accountId, `🗑️ Format <b>${escapeHtml(format.name)}</b> dihapus.`);
 });
@@ -7303,12 +7468,29 @@ bot.on("message", async (ctx, next) => {
       }
       if (ctx.message.photo?.length) {
         const photo=ctx.message.photo[ctx.message.photo.length-1];
-        format.media_type="photo"; format.message=""; format.media_file_id=photo.file_id; format.caption=ctx.message.caption||"";
+        format.media_type="photo"; format.message=""; format.media_file_id=photo.file_id; format.media_path=null; format.caption=ctx.message.caption||"";
+        removeTgMedia(flow.accountId, format.id);
+      } else if (ctx.message.video || String(ctx.message.document?.mime_type || "").startsWith("video/")) {
+        const v = ctx.message.video || ctx.message.document;
+        const size = Number(v.file_size || 0);
+        if (size > MAX_VIDEO_BYTES) {
+          return replaceUi(ctx,"❌ Video terlalu besar. Maksimal 2 GB.",cancelKeyboard(false));
+        }
+        const dest = tgMediaPath(flow.accountId, format.id);
+        try {
+          await withChatLoading(ctx, "Mengunduh video...", () =>
+            downloadTelegramMedia({ fileId: v.file_id, messageId: ctx.message.message_id, fileSize: size }, dest));
+        } catch (e) {
+          console.error("TG VIDEO DOWNLOAD:", safeErrorMessage(e, 300));
+          return replaceUi(ctx,`❌ <b>Gagal menyimpan video.</b>\n\n${escapeHtml(safeErrorMessage(e))}`,cancelKeyboard(false),{parse_mode:"HTML"});
+        }
+        format.media_type="video"; format.message=""; format.media_file_id=v.file_id; format.media_path=dest; format.caption=ctx.message.caption||"";
       } else if (ctx.message.text) {
         const message=ctx.message.text.trim();
         if(!message)return replaceUi(ctx,"❌ Format teks tidak boleh kosong.",cancelKeyboard(false));
-        format.media_type="text"; format.message=message; format.media_file_id=null; format.caption=null;
-      } else return replaceUi(ctx,"❌ Format tidak didukung. Kirim teks atau foto.",cancelKeyboard(false));
+        format.media_type="text"; format.message=message; format.media_file_id=null; format.media_path=null; format.caption=null;
+        removeTgMedia(flow.accountId, format.id);
+      } else return replaceUi(ctx,"❌ Format tidak didukung. Kirim teks, foto, atau video.",cancelKeyboard(false));
       format.updated_at=new Date().toISOString();
       await savePromotionFormats(flow.accountId,formats);
       await recordHistory(flow.accountId,adminRow.id,{action:"format_update",status:"success",details:{format_id:format.id,format_name:format.name,type:format.media_type}});
