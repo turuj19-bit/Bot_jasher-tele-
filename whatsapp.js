@@ -23,6 +23,8 @@ const GROUP_DELAY_MIN_MS = 20 * 1000;   // jeda acak antar grup
 const GROUP_DELAY_MAX_MS = 60 * 1000;
 const DAILY_CAP = 200;                  // maksimal kirim per akun per hari
 const FLOW_TTL_MS = 10 * 60 * 1000;
+// Lama kode pairing dianggap berlaku. Lewat dari ini bot kirim pemberitahuan "kedaluwarsa".
+const PAIRING_TTL_MS = Math.max(30, Number(process.env.WA_PAIRING_TTL_SEC) || 120) * 1000;
 const RULE = "━━━━━━━━━━━━━━━━━━━━━━━━━━";
 
 fs.mkdirSync(SESSION_ROOT, { recursive: true });
@@ -77,6 +79,38 @@ const clearMedia = (accId, fmtId) => {
 };
 const isVideoMedia = fmt => /\.mp4$/i.test(String(fmt?.media || ""));
 const sessionDir = id => path.join(SESSION_ROOT, String(id));
+
+// Versi WhatsApp Web terbaru. Versi basi bikin WhatsApp menolak penautan (405 / "Gagal menautkan perangkat").
+let waVersionCache = { at: 0, v: undefined };
+async function resolveWaVersion() {
+  if (waVersionCache.v && Date.now() - waVersionCache.at < 10 * 60 * 1000) return waVersionCache.v;
+  for (const fn of [baileys.fetchLatestWaWebVersion, baileys.fetchLatestBaileysVersion]) {
+    if (typeof fn !== "function") continue;
+    try {
+      const r = await fn();
+      if (r && Array.isArray(r.version) && r.isLatest !== false) {
+        waVersionCache = { at: Date.now(), v: r.version };
+        console.log("WA VERSION:", r.version.join("."));
+        return r.version;
+      }
+    } catch (_) { /* coba sumber berikutnya */ }
+  }
+  return undefined; // pakai versi bawaan library
+}
+
+function disconnectReason(code) {
+  switch (Number(code)) {
+    case 401: return "WhatsApp mengeluarkan sesi ini (401).";
+    case 403: return "Nomor ditolak WhatsApp (403).";
+    case 405: return "WhatsApp menolak versi/metode koneksi bot (405). Biasanya library Baileys perlu diperbarui.";
+    case 408: return "Koneksi ke WhatsApp timeout (408).";
+    case 428: return "Koneksi ke WhatsApp terputus (428).";
+    case 440: return "Sesi diganti oleh perangkat lain (440).";
+    case 500: return "Sesi rusak (500).";
+    case 503: return "Server WhatsApp sedang sibuk (503).";
+    default: return code ? `Koneksi ditutup WhatsApp (kode ${code}).` : "Koneksi ditutup tanpa kode status.";
+  }
+}
 
 function register(bot, getDeps) {
   const D = () => getDeps();
@@ -193,7 +227,8 @@ function register(bot, getDeps) {
 
   function isRegistered(id) {
     try {
-      return JSON.parse(fs.readFileSync(path.join(sessionDir(id), "creds.json"), "utf8"))?.registered === true;
+      const c = JSON.parse(fs.readFileSync(path.join(sessionDir(id), "creds.json"), "utf8"));
+      return c?.registered === true || !!c?.me?.id;
     } catch (_) {
       return false;
     }
@@ -224,11 +259,79 @@ function register(bot, getDeps) {
     return rows.length;
   }
 
+  /* ---------- Pairing: pelacakan kode, kedaluwarsa, pembersihan ---------- */
+
+  const pairings = new Map(); // accountId -> { tgId, phone, prepId, codeId, timer, paired }
+  const retries = new Map();  // accountId -> jumlah percobaan sambung ulang
+  const delMsg = (chatId, id) => (id ? bot.api.deleteMessage(chatId, id).catch(() => {}) : Promise.resolve());
+
+  // Pemberitahuan selalu berdiri sendiri sebagai pesan baru, tidak ditempel di kartu akun.
+  const screenNotice = (title, lines, rows) => ({
+    text: [title, RULE, ...lines].join("\n"),
+    kb: buildKb(rows || [[["⬅️ Menu WhatsApp", "whatsapp:menu"]]])
+  });
+  const retryRows = [[["➕ Coba Lagi", "wa:acc:add"]], [["⬅️ Menu WhatsApp", "whatsapp:menu"]]];
+  const accNoticeRows = (accId, extra = []) => [...extra, [["📱 Buka Akun", `wa:acc:view:${accId}`]], [["⬅️ Menu WhatsApp", "whatsapp:menu"]]];
+
+  // Hapus total satu akun: timer, pesan pairing, socket, sesi, dan baris database.
+  async function dropAccount(id) {
+    const key = String(id);
+    const p = pairings.get(key);
+    if (p) {
+      clearTimeout(p.timer);
+      pairings.delete(key);
+      await delMsg(p.tgId, p.codeId);
+      await delMsg(p.tgId, p.prepId);
+    }
+    retries.delete(key);
+    await stopSocket(id);
+    wipeSession(id);
+    await db().from("wa_accounts").delete().eq("id", id);
+  }
+
+  // Pairing gagal / kedaluwarsa: nomor tidak disimpan, lalu kirim pemberitahuan format baru.
+  async function abortPairing(acc, title, lines) {
+    const p = pairings.get(String(acc.id));
+    if (!p) return;
+    await dropAccount(acc.id).catch(e => console.error("WA DROP:", errText(e)));
+    const s = screenNotice(title, [`📞 Nomor : <code>${esc(acc.phone || p.phone || "-")}</code>`, ...lines], retryRows);
+    await note(p.tgId, s.text, s.kb).catch(() => {});
+  }
+
+  async function expirePairing(accId) {
+    const p = pairings.get(String(accId));
+    if (!p || p.paired) return;
+    await abortPairing({ id: accId, phone: p.phone }, "⌛ <b>KODE PAIRING KEDALUWARSA</b>", [
+      `Waktu ${secText(PAIRING_TTL_MS / 1000)} sudah habis dan belum ada penautan yang masuk.`,
+      "Nomor ini tidak disimpan. Tekan Coba Lagi untuk meminta kode baru.",
+      "",
+      "<i>Kalau di HP muncul \"Gagal menautkan perangkat\" padahal kodenya masih baru, itu ditolak WhatsApp, bukan karena telat.</i>"
+    ]);
+  }
+
+  // Akun hantu: tidak pernah terhubung, tidak punya sesi, dan tidak punya format.
+  async function isGhost(a) {
+    if (a.jid || a.status === "connected" || isRegistered(a.id)) return false;
+    const formats = await loadFormats(a.id).catch(() => []);
+    return formats.length === 0;
+  }
+
+  async function purgeGhosts() {
+    const cutoff = Date.now() - (PAIRING_TTL_MS + 60 * 1000);
+    const { data } = await db().from("wa_accounts").select("*").neq("status", "connected").is("jid", null);
+    for (const a of data || []) {
+      if (pairings.has(String(a.id))) continue;
+      if (new Date(a.created_at).getTime() > cutoff) continue;
+      if (await isGhost(a)) await dropAccount(a.id).catch(e => console.error("WA PURGE:", errText(e)));
+    }
+  }
+
+  /* ---------- Sesi & koneksi WhatsApp ---------- */
+
   async function startSocket(acc, pairing) {
     fs.mkdirSync(sessionDir(acc.id), { recursive: true });
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir(acc.id));
-    let version;
-    try { ({ version } = await fetchLatestBaileysVersion()); } catch (_) { /* pakai default */ }
+    const version = await resolveWaVersion();
 
     const sock = makeWASocket({
       auth: state,
@@ -239,30 +342,50 @@ function register(bot, getDeps) {
       markOnlineOnConnect: false
     });
 
+    // Sudah tertaut kalau creds punya registered/me (dibaca dari memori, bukan menunggu file tersimpan).
+    const isPaired = () => state.creds.registered === true || !!state.creds.me?.id;
     const entry = { sock, open: false, stopping: false };
     sockets.set(String(acc.id), entry);
     sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("creds.update", upd => {
+      if (upd?.me?.id || upd?.registered) {
+        const p = pairings.get(String(acc.id));
+        if (p) { p.paired = true; clearTimeout(p.timer); }
+      }
+    });
 
-    let notifyTg = pairing?.tgId ?? null;
-
-    if (pairing && !state.creds.registered) {
-      setTimeout(async () => {
+    if (pairing && !isPaired()) {
+      let requested = false;
+      const requestCode = async () => {
+        if (requested || entry.stopping || isPaired()) return;
+        requested = true;
         try {
           const code = await sock.requestPairingCode(pairing.phone);
           console.log("WA PAIRING: kode diminta untuk", pairing.phone, "->", code);
+          const p = pairings.get(String(acc.id));
+          if (!p || entry.stopping) return;
           const shown = code.match(/.{1,4}/g)?.join("-") || code;
-          await bot.api.sendMessage(pairing.tgId,
-            `🔑 <b>KODE PAIRING WHATSAPP</b>\n${RULE}\nNomor : <code>${esc(pairing.phone)}</code>\nKode : <code>${esc(shown)}</code>\n\nDi HP: WhatsApp → Perangkat tertaut → Tautkan perangkat → Tautkan dengan nomor telepon, lalu masukkan kode ini.`,
-            { parse_mode: "HTML" });
+          const msg = await bot.api.sendMessage(p.tgId,
+            `🔑 <b>KODE PAIRING WHATSAPP</b>\n${RULE}\nNomor : <code>${esc(pairing.phone)}</code>\nKode : <code>${esc(shown)}</code>\n\n⏳ Berlaku sekitar ${secText(PAIRING_TTL_MS / 1000)}. Kalau waktunya habis, bot akan memberi tahu.\n\nDi HP: WhatsApp → Perangkat tertaut → Tautkan perangkat → Tautkan dengan nomor telepon, lalu masukkan kode ini.`,
+            { parse_mode: "HTML", reply_markup: new (IK())().text("❌ Batal", `wa:pair:cancel:${acc.id}`) });
+          p.codeId = msg.message_id;
+          // Pesan "Menyiapkan koneksi" sudah tidak perlu, hapus otomatis.
+          await delMsg(p.tgId, p.prepId);
+          p.prepId = null;
+          clearTimeout(p.timer);
+          p.timer = setTimeout(() => expirePairing(acc.id).catch(e => console.error("WA EXPIRE:", errText(e))), PAIRING_TTL_MS);
         } catch (e) {
-          await bot.api.sendMessage(pairing.tgId,
-            `❌ Gagal meminta kode pairing.\n${esc(errText(e))}`,
-            { parse_mode: "HTML" }).catch(() => {});
+          console.error("WA PAIRING:", errText(e));
+          await abortPairing(acc, "❌ <b>GAGAL MEMINTA KODE PAIRING</b>", [esc(errText(e))]);
         }
-      }, 3000);
+      };
+      // Minta kode begitu socket siap (event qr), dengan cadangan timer jika event itu tidak datang.
+      sock.ev.on("connection.update", u => { if (u?.qr) requestCode(); });
+      setTimeout(requestCode, 6000);
     }
 
-    sock.ev.on("connection.update", async ({ connection, lastDisconnect }) => {
+    sock.ev.on("connection.update", async upd => {
+      const { connection, lastDisconnect } = upd;
       console.log(
         "WA UPDATE:", connection || "-",
         "| code:", lastDisconnect?.error?.output?.statusCode || "-",
@@ -271,15 +394,24 @@ function register(bot, getDeps) {
       try {
         if (connection === "open") {
           entry.open = true;
+          retries.delete(String(acc.id));
           const jid = sock.user?.id ? `${sock.user.id.split(":")[0]}@s.whatsapp.net` : null;
           const waName = sock.user?.name ? trunc(String(sock.user.name).trim(), 60) : "";
           await setAccountStatus(acc.id, "connected", jid, waName || undefined);
           const total = await refreshGroups(acc.id, sock).catch(() => 0);
-          if (notifyTg) {
-            await bot.api.sendMessage(notifyTg,
-              `✅ WhatsApp <b>${esc(acc.label)}</b> terhubung. ${total} grup terdeteksi.`,
-              { parse_mode: "HTML" }).catch(() => {});
-            notifyTg = null;
+
+          const p = pairings.get(String(acc.id));
+          if (p) {
+            clearTimeout(p.timer);
+            pairings.delete(String(acc.id));
+            await delMsg(p.tgId, p.codeId);
+            await delMsg(p.tgId, p.prepId);
+            const s = screenNotice("✅ <b>WHATSAPP TERHUBUNG</b>", [
+              `👤 Nama : <b>${esc(waName || acc.label)}</b>`,
+              `📞 Nomor : <code>${esc(acc.phone || "-")}</code>`,
+              `☑️ ${total} grup terdeteksi.`
+            ], accNoticeRows(acc.id));
+            await note(p.tgId, s.text, s.kb).catch(() => {});
           }
         }
 
@@ -288,13 +420,36 @@ function register(bot, getDeps) {
           if (entry.stopping) return;
           sockets.delete(String(acc.id));
           const code = lastDisconnect?.error?.output?.statusCode;
+          const p = pairings.get(String(acc.id));
+
+          // Pairing belum selesai lalu koneksi putus: gagal. Nomor tidak disimpan.
+          if (p && !isPaired()) {
+            await abortPairing(acc, "❌ <b>PAIRING GAGAL</b>", [
+              `Penyebab : ${esc(disconnectReason(code))}`,
+              "Nomor ini tidak disimpan. Tekan Coba Lagi untuk meminta kode baru."
+            ]);
+            return;
+          }
+
+          // Pairing berhasil: WhatsApp memang menutup koneksi sekali (515), sambung ulang dengan sesi baru.
+          if (p && isPaired()) {
+            p.paired = true;
+            clearTimeout(p.timer);
+            await setAccountStatus(acc.id, "connecting").catch(() => {});
+            for (let i = 0; i < 20 && !isRegistered(acc.id); i++) await sleep(500);
+            setTimeout(() => reconnect(acc.id), 1500);
+            return;
+          }
+
           if (code === DisconnectReason.loggedOut) {
             await setAccountStatus(acc.id, "disconnected", null);
             wipeSession(acc.id);
             return;
           }
           await setAccountStatus(acc.id, "error").catch(() => {});
-          setTimeout(() => reconnect(acc.id), 5000);
+          const n = (retries.get(String(acc.id)) || 0) + 1;
+          retries.set(String(acc.id), n);
+          setTimeout(() => reconnect(acc.id), Math.min(5000 * n, 60000));
         }
       } catch (e) {
         console.error("WA CONNECTION:", errText(e));
@@ -503,6 +658,7 @@ function register(bot, getDeps) {
   async function screenAccounts(admin, page, scope = "own") {
     const isOwner = admin.role === "OWNER";
     const others = isOwner && scope === "others";
+    await purgeGhosts().catch(() => {});
     let q = db().from("wa_accounts").select("*", { count: "exact" })
       .order("id", { ascending: true })
       .range(page * PAGE, page * PAGE + PAGE - 1);
@@ -512,8 +668,9 @@ function register(bot, getDeps) {
     if (error) throw error;
 
     const base = others ? "wa:acc:others" : "wa:acc:list";
-    const total = count || 0;
-    const rows = (data || []).map(a => [[
+    const visible = (data || []).filter(a => !pairings.has(String(a.id)));
+    const total = Math.max(0, (count || 0) - ((data || []).length - visible.length));
+    const rows = visible.map(a => [[
       `${a.status === "connected" ? "🟢" : "⚪"} ${trunc(a.label, 28)}`,
       `wa:acc:view:${a.id}`
     ]]);
@@ -889,23 +1046,45 @@ function register(bot, getDeps) {
     withAccount(ctx, admin, ctx.match[1], async acc => {
       await stopSocket(acc.id);
       await setAccountStatus(acc.id, "disconnected");
-      const fresh = await visibleAccount(acc.id, admin);
-      return show(ctx, withNote(await screenAccount(fresh), "🔌 Akun diputus. Sesi tetap tersimpan, bisa dihubungkan lagi."));
+      return show(ctx, screenNotice("🔌 <b>AKUN DIPUTUS</b>", [
+        "Sesi tetap tersimpan, akun bisa dihubungkan lagi kapan saja."
+      ], accNoticeRows(acc.id)));
     })));
 
   bot.callbackQuery(/^wa:acc:connect:(\d+)$/, guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc => {
       if (!isRegistered(acc.id)) {
-        return show(ctx, withNote(await screenAccount(acc), "❌ Sesi tidak ditemukan. Hapus akun ini lalu tambah ulang dengan kode pairing."));
+        // Nomor yang tidak pernah berhasil terhubung tidak disimpan sama sekali.
+        if (await isGhost(acc)) {
+          await dropAccount(acc.id);
+          return show(ctx, screenNotice("❌ <b>SESI TIDAK DITEMUKAN</b>", [
+            "Nomor ini belum pernah berhasil terhubung, jadi datanya dibersihkan.",
+            "Tambahkan lagi untuk mendapat kode pairing baru."
+          ], [[["➕ Tambah Akun", "wa:acc:add"]], [["⬅️ Menu WhatsApp", "whatsapp:menu"]]]));
+        }
+        return show(ctx, screenNotice("❌ <b>SESI TIDAK DITEMUKAN</b>", [
+          `Sesi akun <b>${esc(acc.label)}</b> hilang dari server.`,
+          "Hapus akun ini lalu tambah ulang dengan kode pairing."
+        ], [[["🗑️ Hapus Akun", `wa:acc:del:${acc.id}`]], [["⬅️ Akun", `wa:acc:view:${acc.id}`]]]));
       }
       if (sockets.get(String(acc.id))) {
-        return show(ctx, withNote(await screenAccount(acc), "ℹ️ Akun sudah tersambung atau sedang menyambung."));
+        return show(ctx, screenNotice("ℹ️ <b>SUDAH TERSAMBUNG</b>", [
+          "Akun sudah tersambung atau sedang menyambung."
+        ], accNoticeRows(acc.id)));
       }
       await setAccountStatus(acc.id, "connecting");
       await startSocket({ ...acc, status: "connecting" }, null);
-      const fresh = await visibleAccount(acc.id, admin);
-      return show(ctx, withNote(await screenAccount(fresh), "🔗 Menyambungkan ulang. Tekan Refresh di Status beberapa detik lagi."));
+      return show(ctx, screenNotice("🔗 <b>MENYAMBUNGKAN ULANG</b>", [
+        "Tekan Refresh di Status beberapa detik lagi."
+      ], accNoticeRows(acc.id, [[["📊 Status", `wa:acc:status:${acc.id}`]]])));
     })));
+
+  // Batal saat menunggu kode pairing: nomor tidak disimpan.
+  bot.callbackQuery(/^wa:pair:cancel:(\d+)$/, guard(async (ctx, admin) => {
+    const acc = await visibleAccount(Number(ctx.match[1]), admin);
+    if (acc && (pairings.has(String(acc.id)) || await isGhost(acc))) await dropAccount(acc.id);
+    return show(ctx, await screenMain());
+  }));
 
   bot.callbackQuery(/^wa:acc:stopall:(\d+)$/, guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc => {
@@ -1125,6 +1304,21 @@ function register(bot, getDeps) {
           return note(tgId, "❌ Nomor tidak valid. Contoh: 628123456789 (tanpa +).", buildKb([[["❌ Batal", "wa:cancel"]]]));
         }
         clearFlow(tgId);
+
+        // Percobaan lama untuk nomor yang sama dibersihkan dulu, supaya tidak ada kode ganda yang saling membatalkan.
+        const { data: olds } = await db().from("wa_accounts").select("*").eq("phone", phone);
+        for (const o of olds || []) {
+          if (pairings.has(String(o.id)) || await isGhost(o)) {
+            await dropAccount(o.id).catch(e => console.error("WA DROP:", errText(e)));
+          } else {
+            const s = screenNotice("ℹ️ <b>NOMOR SUDAH TERDAFTAR</b>", [
+              `📞 Nomor : <code>${esc(phone)}</code>`,
+              "Nomor ini sudah punya akun WhatsApp. Hapus akun lamanya dulu kalau mau menautkan ulang."
+            ], [[["📱 Akun WhatsApp", "wa:acc:list:0"]], [["⬅️ Menu WhatsApp", "whatsapp:menu"]]]);
+            return note(tgId, s.text, s.kb);
+          }
+        }
+
         const { data, error } = await db().from("wa_accounts").insert({
           label: `WA ${phone}`,
           phone,
@@ -1132,9 +1326,17 @@ function register(bot, getDeps) {
           created_by: admin.telegram_user_id
         }).select().single();
         if (error) throw error;
-        await startSocket(data, { tgId, phone });
-        return note(tgId, "⏳ Menyiapkan koneksi. Kode pairing akan dikirim sebentar lagi.",
-          buildKb([[["📱 Akun WhatsApp", "wa:acc:list:0"]]]));
+
+        const prep = await note(tgId, "⏳ Menyiapkan koneksi. Kode pairing akan dikirim sebentar lagi.",
+          buildKb([[["❌ Batal", `wa:pair:cancel:${data.id}`]]]));
+        pairings.set(String(data.id), { tgId, phone, prepId: prep?.message_id ?? null, codeId: null, timer: null, paired: false });
+        try {
+          await startSocket(data, { tgId, phone });
+        } catch (e) {
+          console.error("WA START:", errText(e));
+          await abortPairing(data, "❌ <b>KONEKSI GAGAL</b>", [esc(errText(e))]);
+        }
+        return;
       }
 
       const acc = await visibleAccount(flow.accountId, admin);
@@ -1270,6 +1472,7 @@ function register(bot, getDeps) {
   /* ---------- Startup: sambungkan ulang sesi & lanjutkan promosi aktif ---------- */
 
   async function restore() {
+    await purgeGhosts().catch(e => console.error("WA PURGE:", errText(e)));
     const { data: accs, error } = await db().from("wa_accounts").select("*").neq("status", "disconnected");
     if (error) throw error;
     for (const acc of accs || []) {
