@@ -54,6 +54,12 @@ const sockets = new Map(); // accountId -> { sock, open, stopping }
 const tasks = new Map();   // "accountId:formatId" -> { running }
 const flows = new Map();   // telegramId -> { t, accountId?, formatId?, at }
 const daily = new Map();   // accountId -> { day, n }
+// Cache yang dibutuhkan Baileys supaya pesan ke grup benar-benar sampai.
+const groupCache = new Map(); // "accountId:groupJid" -> { at, meta } (daftar peserta grup untuk enkripsi)
+const sentCache = new Map();  // "accountId:messageId" -> pesan terkirim (untuk kirim ulang bila penerima gagal dekripsi)
+const GROUP_META_TTL_MS = 5 * 60 * 1000;
+const SENT_CACHE_MAX = 500;
+const SEND_TIMEOUT_MS = 90 * 1000;      // kirim ke satu grup tidak boleh menggantung lebih dari ini
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const rnd = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
@@ -260,9 +266,12 @@ function register(bot, getDeps) {
 
   async function refreshGroups(accountId, sock) {
     const all = await sock.groupFetchAllParticipating();
-    const me = sock.user?.id ? sock.user.id.split(":")[0] : null;
+    // Baileys 7: identitas bisa berupa nomor (PN) atau LID, jadi cocokkan keduanya.
+    const bare = x => String(x || "").split(":")[0].split("@")[0];
+    const meIds = new Set([sock.user?.id, sock.user?.lid].filter(Boolean).map(bare));
     const rows = Object.values(all || {}).map(g => {
-      const mine = (g.participants || []).find(p => p.id?.split("@")[0] === me);
+      groupCache.set(`${accountId}:${g.id}`, { at: Date.now(), meta: g });
+      const mine = (g.participants || []).find(p => [p.id, p.lid, p.phoneNumber].some(x => x && meIds.has(bare(x))));
       const isAdmin = mine?.admin === "admin" || mine?.admin === "superadmin";
       return {
         account_id: accountId,
@@ -360,7 +369,15 @@ function register(bot, getDeps) {
       logger: pino({ level: "silent" }),
       browser: ["Ubuntu", "Chrome", "22.04.4"],
       syncFullHistory: false,
-      markOnlineOnConnect: false
+      markOnlineOnConnect: false,
+      // Tanpa ini, syncFullHistory:false ikut mematikan sinkron data grup/LID di Baileys 7 (FULL = 2 saja yang dilewati).
+      shouldSyncHistoryMessage: ({ syncType }) => syncType !== 2,
+      // Wajib untuk kirim ke grup: daftar peserta (cache) dan pesan asli untuk kirim ulang.
+      cachedGroupMetadata: async jid => {
+        const c = groupCache.get(`${acc.id}:${jid}`);
+        return c && Date.now() - c.at < GROUP_META_TTL_MS ? c.meta : undefined;
+      },
+      getMessage: async key => sentCache.get(`${acc.id}:${key?.id}`)?.message
     });
 
     // Sudah tertaut kalau creds punya registered/me (dibaca dari memori, bukan menunggu file tersimpan).
@@ -368,6 +385,12 @@ function register(bot, getDeps) {
     const entry = { sock, open: false, stopping: false };
     sockets.set(String(acc.id), entry);
     sock.ev.on("creds.update", saveCreds);
+    // Anggota/pengaturan grup berubah: buang cache supaya metadata diambil ulang.
+    const dropGroupMeta = list => {
+      for (const u of Array.isArray(list) ? list : [list]) if (u?.id) groupCache.delete(`${acc.id}:${u.id}`);
+    };
+    sock.ev.on("groups.update", dropGroupMeta);
+    sock.ev.on("group-participants.update", dropGroupMeta);
     sock.ev.on("creds.update", upd => {
       if (upd?.me?.id || upd?.registered) {
         const p = pairings.get(String(acc.id));
@@ -546,14 +569,21 @@ function register(bot, getDeps) {
     }
   }
 
-  async function sendFormat(sock, jid, fmt) {
+  async function sendFormat(sock, jid, fmt, accountId) {
+    let sent;
     if (fmt.media && fs.existsSync(fmt.media)) {
       const caption = fmt.message || undefined;
       // Video dibaca streaming dari disk agar video besar tidak memenuhi memori.
-      if (isVideoMedia(fmt)) return sock.sendMessage(jid, { video: { url: fmt.media }, caption, mimetype: "video/mp4" });
-      return sock.sendMessage(jid, { image: fs.readFileSync(fmt.media), caption });
+      if (isVideoMedia(fmt)) sent = await sock.sendMessage(jid, { video: { url: fmt.media }, caption, mimetype: "video/mp4" });
+      else sent = await sock.sendMessage(jid, { image: fs.readFileSync(fmt.media), caption });
+    } else {
+      sent = await sock.sendMessage(jid, { text: fmt.message });
     }
-    return sock.sendMessage(jid, { text: fmt.message });
+    if (sent?.key?.id) {
+      sentCache.set(`${accountId}:${sent.key.id}`, sent);
+      if (sentCache.size > SENT_CACHE_MAX) sentCache.delete(sentCache.keys().next().value);
+    }
+    return sent;
   }
 
   async function sendRoundReport(acc, fmt, round) {
@@ -622,11 +652,16 @@ function register(bot, getDeps) {
             const sock = sockets.get(String(accountId))?.sock;
             try {
               if (!sock) throw new Error("Akun WhatsApp terputus");
-              await sendFormat(sock, g.group_jid, fmt);
+              const sent = await Promise.race([
+                sendFormat(sock, g.group_jid, fmt, accountId),
+                sleep(SEND_TIMEOUT_MS).then(() => { throw new Error("Timeout kirim ke grup (90 detik)"); })
+              ]);
+              console.log("WA SEND: ok", accountId, "->", g.title, "| id:", sent?.key?.id || "-");
               bumpDaily(accountId);
               round.ok++;
               await logHistory(acc, null, "promotion_send", "success", { group_title: g.title });
             } catch (e) {
+              console.error("WA SEND: gagal", accountId, "->", g.title, "|", errText(e));
               round.fail.push({ title: g.title, reason: errText(e) });
               await logHistory(acc, null, "promotion_send", "error", { group_title: g.title, error: errText(e) });
             }
