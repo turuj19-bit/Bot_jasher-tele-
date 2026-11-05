@@ -82,6 +82,9 @@ function register(bot, getDeps) {
         : a.status === "error" ? "🟠 Error, mencoba sambung ulang"
           : "⚪ Terputus";
 
+  // Promosi WhatsApp hanya untuk OWNER dan ADMIN_PREMIUM.
+  const canUseWhatsapp = role => role === "OWNER" || role === "ADMIN_PREMIUM";
+
   /* ---------- Flow input (teks/foto) ---------- */
 
   function setFlow(tgId, data) { flows.set(String(tgId), { ...data, at: Date.now() }); }
@@ -466,31 +469,41 @@ function register(bot, getDeps) {
     };
   }
 
-  async function screenAccounts(admin, page) {
+  async function screenAccounts(admin, page, scope = "own") {
+    const isOwner = admin.role === "OWNER";
+    const others = isOwner && scope === "others";
     let q = db().from("wa_accounts").select("*", { count: "exact" })
       .order("id", { ascending: true })
       .range(page * PAGE, page * PAGE + PAGE - 1);
-    if (admin.role !== "OWNER") q = q.eq("created_by", admin.telegram_user_id);
+    if (others) q = q.or(`created_by.is.null,created_by.neq.${Number(admin.telegram_user_id)}`);
+    else q = q.eq("created_by", admin.telegram_user_id);
     const { data, count, error } = await q;
     if (error) throw error;
 
+    const base = others ? "wa:acc:others" : "wa:acc:list";
     const total = count || 0;
     const rows = (data || []).map(a => [[
       `${a.status === "connected" ? "🟢" : "⚪"} ${trunc(a.label, 28)}`,
       `wa:acc:view:${a.id}`
     ]]);
     const nav = [];
-    if (page > 0) nav.push(["◀️", `wa:acc:list:${page - 1}`]);
-    if ((page + 1) * PAGE < total) nav.push(["▶️", `wa:acc:list:${page + 1}`]);
+    if (page > 0) nav.push(["◀️", `${base}:${page - 1}`]);
+    if ((page + 1) * PAGE < total) nav.push(["▶️", `${base}:${page + 1}`]);
+
+    const title = others ? "👥 <b>AKUN WHATSAPP USER LAIN</b>" : "📱 <b>AKUN WHATSAPP</b>";
+    const empty = others ? "<i>Belum ada akun WhatsApp user lain.</i>" : "<i>Belum ada akun WhatsApp.</i>";
 
     return {
-      text: ["📱 <b>AKUN WHATSAPP</b>", RULE, `Total akun : <b>${total}</b>`, total ? "" : "<i>Belum ada akun WhatsApp.</i>"].join("\n"),
+      text: [title, RULE, `Total akun : <b>${total}</b>`, total ? "" : empty].join("\n"),
       kb: buildKb([
         ...rows,
         nav,
-        [["➕ Tambah Akun", "wa:acc:add"]],
+        others
+          ? [["⬅️ Akun Saya", "wa:acc:list:0"]]
+          : [["➕ Tambah Akun", "wa:acc:add"]],
+        !others && isOwner ? [["👥 Akun User Lain", "wa:acc:others:0"]] : null,
         [["⬅️ Menu WhatsApp", "whatsapp:menu"]]
-      ])
+      ].filter(Boolean))
     };
   }
 
@@ -591,7 +604,8 @@ function register(bot, getDeps) {
     const navBase = n => (opts.token ? `wa:grp:find:${acc.id}:${opts.token}:${n}` : `wa:grp:list:${acc.id}:${n}`);
     const backOf = n => (opts.token ? `f:${opts.token}:${n}` : `l:${n}`);
 
-    const kb = [];
+    // Tombol memanjang di atas: pilih semua grup yang bisa dikirimi.
+    const kb = [[["➕ Tambah Semua Grup", `wa:grp:all:${acc.id}:${backOf(p)}`]]];
     for (const g of rows.filter(x => x.can_send)) {
       kb.push([[`${g.enabled ? "✅" : "⬜"} ${trunc(g.title, 30)}`, `wa:grp:tog:${acc.id}:${g.id}:${backOf(p)}`]]);
     }
@@ -601,9 +615,10 @@ function register(bot, getDeps) {
     if (p < pages - 1) nav.push(["Berikutnya ▶️", navBase(p + 1)]);
     kb.push(nav);
     kb.push(opts.token
-      ? [["⬅️ Semua Grup", `wa:grp:list:${acc.id}:0`], ["➕ Tambah Semua", `wa:grp:all:${acc.id}:${backOf(p)}`]]
-      : [["🔎 Cari Grup", `wa:grp:search:${acc.id}`], ["➕ Tambah Semua", `wa:grp:all:${acc.id}:${backOf(p)}`]]);
-    kb.push([["🔄 Deteksi Grup", `wa:grp:refresh:${acc.id}`], ["⬅️ Akun", `wa:acc:view:${acc.id}`]]);
+      ? [["⬅️ Semua Grup", `wa:grp:list:${acc.id}:0`], ["⬅️ Akun", `wa:acc:view:${acc.id}`]]
+      : [["🔎 Cari Grup", `wa:grp:search:${acc.id}`], ["⬅️ Akun", `wa:acc:view:${acc.id}`]]);
+    // Tombol memanjang di bawah: muat ulang daftar grup dari akun.
+    kb.push([["🔄 Deteksi Grup", `wa:grp:refresh:${acc.id}`]]);
 
     const lines = [
       "🎯 <b>GRUP TARGET</b>",
@@ -745,6 +760,13 @@ function register(bot, getDeps) {
     return async ctx => {
       const admin = await D().requireAdmin(ctx);
       if (!admin) return;
+      if (!canUseWhatsapp(admin.role)) {
+        await ctx.answerCallbackQuery(
+          "Promosi WhatsApp hanya tersedia untuk Admin Premium dan OWNER.",
+          { show_alert: true }
+        ).catch(() => {});
+        return;
+      }
       await ctx.answerCallbackQuery().catch(() => {});
       clearFlow(ctx.from.id);
       try {
@@ -791,7 +813,13 @@ function register(bot, getDeps) {
   bot.callbackQuery("wa:cancel", guard(async ctx => show(ctx, await screenMain())));
 
   bot.callbackQuery(/^wa:acc:list:(\d+)$/, guard(async (ctx, admin) =>
-    show(ctx, await screenAccounts(admin, Number(ctx.match[1])))));
+    show(ctx, await screenAccounts(admin, Number(ctx.match[1]), "own"))));
+
+  // Akun WhatsApp milik user/admin lain: khusus OWNER.
+  bot.callbackQuery(/^wa:acc:others:(\d+)$/, guard(async (ctx, admin) => {
+    if (admin.role !== "OWNER") return show(ctx, denied());
+    return show(ctx, await screenAccounts(admin, Number(ctx.match[1]), "others"));
+  }));
 
   bot.callbackQuery("wa:acc:add", guard(async ctx => {
     setFlow(ctx.from.id, { t: "phone" });
@@ -1052,7 +1080,7 @@ function register(bot, getDeps) {
 
     const tgId = ctx.from.id;
     const admin = await adminOfTg(tgId);
-    if (!admin) { clearFlow(tgId); return next(); }
+    if (!admin || !canUseWhatsapp(admin.role)) { clearFlow(tgId); return next(); }
 
     try {
       if (flow.t === "photo") {
@@ -1168,7 +1196,7 @@ function register(bot, getDeps) {
     }
 
     const admin = await adminOfTg(tgId);
-    if (!admin) { clearFlow(tgId); return next(); }
+    if (!admin || !canUseWhatsapp(admin.role)) { clearFlow(tgId); return next(); }
 
     try {
       const acc = await visibleAccount(flow.accountId, admin);

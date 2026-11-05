@@ -385,7 +385,7 @@ function decryptSession(encoded) {
 
 const OFFICIAL_CHANNEL = "@jasebvortex";
 const OWNER_CONTACT = "farishost1";
-const ROLE_PRICES = { ADMIN_ANAK: 5000, ADMIN_VIP: 10000, ADMIN_PREMIUM: 15000 };
+const ROLE_PRICES = { ADMIN_ANAK: 5000, ADMIN_VIP: 10000, ADMIN_PREMIUM: 20000 };
 const ROLE_LABELS = { ADMIN_ANAK: "ADMIN BIASA", ADMIN_VIP: "ADMIN VIP", ADMIN_PREMIUM: "ADMIN PREMIUM" };
 
 function subscriptionTableMissing(error) {
@@ -492,10 +492,11 @@ function userPurchaseText(subscription = null) {
     "• Bisa membuka penjualan/pendaftaran bot untuk pengguna lain",
     "• <b>Tidak</b> memiliki Promosi Chat Privat",
     "",
-    "💎 <b>ADMIN PREMIUM — Rp15.000 / bulan</b>",
+    "💎 <b>ADMIN PREMIUM — Rp20.000 / bulan</b>",
     "• Semua fitur Admin VIP",
     "• Bisa tambah <b>Admin Biasa tanpa batas</b>",
     "• Mendapat fitur <b>Promosi Chat Privat</b>",
+    "• Mendapat fitur <b>Promosi WhatsApp</b>",
     "• Bisa membuka penjualan/pendaftaran bot untuk pengguna lain",
     "",
     "⏳ <b>Masa aktif: 1 bulan</b>",
@@ -511,7 +512,7 @@ function userPurchaseKeyboard() {
     .row()
     .text("⭐ Order Admin VIP — 10K", "user:order:ADMIN_VIP")
     .row()
-    .text("💎 Order Admin Premium — 15K", "user:order:ADMIN_PREMIUM")
+    .text("💎 Order Admin Premium — 20K", "user:order:ADMIN_PREMIUM")
     .row()
     .url("📢 Channel Resmi", "https://t.me/jasebvortex");
 }
@@ -541,6 +542,7 @@ function userOrderText(ctx, role, subscription = null) {
       "• Semua fitur Admin VIP",
       "• Bisa tambah Admin Biasa tanpa batas",
       "• Promosi Chat Privat tersedia",
+      "• Promosi WhatsApp tersedia",
       "• Bisa membuka penjualan/pendaftaran bot"
     ]
   }[role] || [];
@@ -815,7 +817,7 @@ function dashboardText(ctx, stats, extra = "", role = "") {
     rule,
     "📊 <b>STATUS SISTEM</b>",
     `👤 Total User : <b>${stats.totalUsers}</b>`,
-    `🛡️ Admin : <b>${stats.admins}</b>`,
+    role === "OWNER" ? `🛡️ Admin : <b>${stats.admins}</b>` : null,
     `📱 Akun : <b>${stats.accounts}</b>`,
     `🟢 Terhubung : <b>${stats.connected}</b>`
   ].filter(line => line !== null).join("\n");
@@ -918,10 +920,8 @@ function adminDashboardMenu(adminRow = null) {
   if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(role)) {
     rows.push([DASH_BTN.add, DASH_BTN.admin]);
     if (role === "ADMIN_PREMIUM") rows.push([DASH_BTN.privatePromo, DASH_BTN.whatsapp]);
-    else rows.push([DASH_BTN.whatsapp]);
     rows.push([DASH_BTN.refresh]);
   } else {
-    rows.push([DASH_BTN.whatsapp]);
     rows.push([DASH_BTN.add, DASH_BTN.refresh]);
   }
   return buildDashboardKeyboard(rows);
@@ -931,8 +931,9 @@ function backDashboardKeyboard() {
   return new InlineKeyboard().text("🏠 Menu Utama", "menu:dashboard");
 }
 
-function accountListKeyboard(accounts, page, hasNext) {
+function accountListKeyboard(accounts, page, hasNext, opts = {}) {
   const kb = new InlineKeyboard();
+  const listCb = opts.scope === "others" ? "accounts:others" : "accounts:list";
 
   for (const account of accounts) {
     kb
@@ -943,11 +944,17 @@ function accountListKeyboard(accounts, page, hasNext) {
       .row();
   }
 
-  if (page > 0) kb.text("◀️", `accounts:list:${page - 1}`);
+  if (page > 0) kb.text("◀️", `${listCb}:${page - 1}`);
   kb.text("🏠", "menu:dashboard");
-  if (hasNext) kb.text("▶️", `accounts:list:${page + 1}`);
+  if (hasNext) kb.text("▶️", `${listCb}:${page + 1}`);
   kb.row();
-  kb.text("➕ Tambah Akun", "account:add");
+  if (opts.scope === "others") {
+    kb.text("⬅️ Akun Saya", "accounts:list:0");
+  } else {
+    kb.text("➕ Tambah Akun", "account:add");
+    // Hanya OWNER yang punya tombol ke akun user lain.
+    if (opts.isOwner) kb.row().text("👥 Akun User Lain", "accounts:others:0");
+  }
 
   return kb;
 }
@@ -1059,6 +1066,9 @@ function formatDetailKeyboard(accountId, format) {
 function groupListKeyboard(rows, accountId, page, hasNext) {
   const kb = new InlineKeyboard();
 
+  // Tombol memanjang di atas: pilih semua grup yang bisa dikirimi.
+  kb.text("➕ Tambah Semua Grup", `group:all:${accountId}`).row();
+
   // Hanya grup yang bisa dikirimi pesan tampil sebagai target. Tekan nama grup untuk pilih / batal.
   for (const group of rows.filter(g => g.can_send)) {
     const icon = group.enabled ? "✅" : "⬜";
@@ -1069,8 +1079,9 @@ function groupListKeyboard(rows, accountId, page, hasNext) {
   kb.text("🏠 Menu", "menu:dashboard");
   if (hasNext) kb.text("Berikutnya ▶️", `group:list:${accountId}:${page + 1}`);
   kb.row();
-  kb.text("🔎 Cari Grup", `group:search:${accountId}`).text("➕ Tambah Semua", `group:all:${accountId}`).row();
-  kb.text("🔄 Deteksi Grup", `group:refresh:${accountId}`).text("⬅️ Akun", `account:open:${accountId}`);
+  kb.text("🔎 Cari Grup", `group:search:${accountId}`).text("⬅️ Akun", `account:open:${accountId}`).row();
+  // Tombol memanjang di bawah: muat ulang daftar grup dari akun.
+  kb.text("🔄 Deteksi Grup", `group:refresh:${accountId}`);
   return kb;
 }
 
@@ -1503,7 +1514,9 @@ async function createAccountShell(label, adminId, phone = null) {
   return data;
 }
 
-async function listAccounts(page = 0, adminRow = null) {
+// scope hanya berlaku untuk OWNER: "own" = akun milik OWNER sendiri,
+// "others" = akun milik user/admin lain. Role lain selalu hanya akun miliknya.
+async function listAccounts(page = 0, adminRow = null, scope = "own") {
   const offset = page * ACCOUNT_PAGE_SIZE;
   const owner = adminRow?.role === "OWNER";
 
@@ -1517,6 +1530,15 @@ async function listAccounts(page = 0, adminRow = null) {
   if (adminRow && !owner) {
     rowsQuery = rowsQuery.eq("created_by", adminRow.telegram_user_id);
     countQuery = countQuery.eq("created_by", adminRow.telegram_user_id);
+  } else if (adminRow && owner) {
+    if (scope === "others") {
+      const othersFilter = `created_by.is.null,created_by.neq.${Number(adminRow.telegram_user_id)}`;
+      rowsQuery = rowsQuery.or(othersFilter);
+      countQuery = countQuery.or(othersFilter);
+    } else {
+      rowsQuery = rowsQuery.eq("created_by", adminRow.telegram_user_id);
+      countQuery = countQuery.eq("created_by", adminRow.telegram_user_id);
+    }
   }
 
   const [{ data, error }, { count, error: countError }] = await Promise.all([
@@ -4622,22 +4644,22 @@ bot.callbackQuery("menu:dashboard", async ctx => {
    ACCOUNT LIST / ADD
 ========================================================= */
 
-bot.callbackQuery(/^accounts:list:(\d+)$/, async ctx => {
-  const adminRow = await requireAdmin(ctx);
-  if (!adminRow) return;
-
-  await ctx.answerCallbackQuery().catch(() => {});
-  const rawPage = Number(ctx.match[1]);
+async function renderAccountList(ctx, adminRow, rawPage, scope) {
+  const isOwner = adminRow.role === "OWNER";
+  const effScope = isOwner && scope === "others" ? "others" : "own";
 
   try {
-    const result = await listAccounts(rawPage, adminRow);
+    const result = await listAccounts(rawPage, adminRow, effScope);
     const page = ensurePage(rawPage, Math.floor(Math.max(0, result.total - 1) / ACCOUNT_PAGE_SIZE));
 
     // Re-load if the requested page was beyond current max.
-    const current = page === rawPage ? result : await listAccounts(page, adminRow);
+    const current = page === rawPage ? result : await listAccounts(page, adminRow, effScope);
+
+    const title = effScope === "others" ? "👥 <b>AKUN USER LAIN</b>" : "📱 <b>AKUN TELEGRAM</b>";
+    const empty = effScope === "others" ? "<i>Belum ada akun user lain.</i>" : "<i>Belum ada akun Telegram.</i>";
 
     const lines = [
-      "📱 <b>AKUN TELEGRAM</b>",
+      title,
       `Total: <b>${current.total}</b>`,
       `Halaman: <b>${page + 1}</b>`,
       "",
@@ -4645,7 +4667,7 @@ bot.callbackQuery(/^accounts:list:(\d+)$/, async ctx => {
         ? current.rows.map((x, i) =>
             `${String(page * ACCOUNT_PAGE_SIZE + i + 1).padStart(2, "0")}. ${accountStatusIcon(x)} <b>${escapeHtml(x.label)}</b>\n   🆔 <code>${escapeHtml(x.telegram_user_id || "belum login")}</code>`
           ).join("\n\n")
-        : "<i>Belum ada akun Telegram.</i>",
+        : empty,
       "",
       "Tekan nama akun untuk membuka semua kontrol account."
     ].join("\n");
@@ -4653,7 +4675,7 @@ bot.callbackQuery(/^accounts:list:(\d+)$/, async ctx => {
     return replaceUi(
       ctx,
       lines,
-      accountListKeyboard(current.rows, page, current.hasNext),
+      accountListKeyboard(current.rows, page, current.hasNext, { scope: effScope, isOwner }),
       { parse_mode: "HTML" }
     );
   } catch (e) {
@@ -4664,6 +4686,23 @@ bot.callbackQuery(/^accounts:list:(\d+)$/, async ctx => {
       { parse_mode: "HTML" }
     );
   }
+}
+
+bot.callbackQuery(/^accounts:list:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  return renderAccountList(ctx, adminRow, Number(ctx.match[1]), "own");
+});
+
+// Daftar akun milik user/admin lain: khusus OWNER.
+bot.callbackQuery(/^accounts:others:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx, { ownerOnly: true });
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  return renderAccountList(ctx, adminRow, Number(ctx.match[1]), "others");
 });
 
 bot.callbackQuery("account:add", async ctx => {
