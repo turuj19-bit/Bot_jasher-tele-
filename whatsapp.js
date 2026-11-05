@@ -70,8 +70,8 @@ function register(bot, getDeps) {
     return kb;
   }
 
-  const show = (ctx, s) => D().replaceUi(ctx, s.text, s.kb, { parse_mode: "HTML" });
-  const note = (tgId, text, kb) => D().renderUi(tgId, text, kb, { parse_mode: "HTML" });
+  const show = (ctx, s) => D().sendFresh(ctx.from.id, s.text, s.kb, { parse_mode: "HTML" });
+  const note = (tgId, text, kb) => D().sendFresh(tgId, text, kb, { parse_mode: "HTML" });
   const cancelKb = (accId, fmtId) => buildKb([[["❌ Batal", `wa:fmt:view:${accId}:${fmtId}`]]]);
   const backKb = buildKb([[["⬅️ Menu WhatsApp", "whatsapp:menu"]]]);
   const denied = () => ({ text: "⛔ Akun tidak ditemukan atau bukan milikmu.", kb: backKb });
@@ -406,6 +406,18 @@ function register(bot, getDeps) {
 
   /* ---------- Layar ---------- */
 
+  const searchTerms = new Map(); // token -> { accountId, term, rawTerm } untuk Cari Grup
+
+  const ASK = {
+    msg: "✏️ Kirim isi pesan promosi sekarang.\nBisa memakai emoji dan format WhatsApp: *tebal*, _miring_, ~coret~.\nTidak ada batas panjang pesan.",
+    photo: "🖼️ Kirim <b>foto</b> atau <b>video</b> (sebagai media, bukan file). Isi pesan akan dipakai sebagai caption.\nUkuran file maksimal 20 MB.",
+    interval: `⏱️ Kirim jeda antar putaran, minimal ${MIN_INTERVAL_MIN} menit.\nContoh: 30 menit, 1 jam`,
+    duration: "📅 Kirim durasi promosi.\nContoh: 1 jam, 3 hari"
+  };
+
+  const cancelAcc = accId => buildKb([[["❌ Batal", `wa:acc:view:${accId}`]]]);
+  const withNote = (s, msg) => ({ text: `${msg}\n\n${s.text}`, kb: s.kb });
+
   async function screenMain() {
     return {
       text: [
@@ -450,10 +462,32 @@ function register(bot, getDeps) {
     };
   }
 
+  async function allGroups(accountId) {
+    const { data, error } = await db().from("wa_account_groups").select("*")
+      .eq("account_id", accountId).order("title", { ascending: true }).limit(5000);
+    if (error) throw error;
+    return data || [];
+  }
+
+  function accountKb(acc) {
+    const connected = acc.status === "connected";
+    return buildKb([
+      [["📊 Status", `wa:acc:status:${acc.id}`], ["⚙️ Pengaturan", `wa:acc:settings:${acc.id}`]],
+      [
+        connected ? ["🔌 Putus", `wa:acc:disconnect:${acc.id}`] : ["🔗 Hubungkan", `wa:acc:connect:${acc.id}`],
+        ["👥 Grup", `wa:grp:list:${acc.id}:0`]
+      ],
+      [["➕ Tambah Grup", `wa:grp:add:${acc.id}`], ["📝 Format", `wa:fmt:list:${acc.id}:0`]],
+      [["➕ Format Baru", `wa:fmt:add:${acc.id}`], ["▶️ Format Aktif", `wa:fmt:active:${acc.id}:0`]],
+      [["⏹ Stop Promosi", `wa:acc:stopall:${acc.id}`], ["📋 Riwayat", `wa:hist:${acc.id}`]],
+      [["🏷️ Nama", `wa:acc:label:${acc.id}`], ["🗑️ Hapus", `wa:acc:del:${acc.id}`]],
+      [["⬅️ Kembali", "wa:acc:list:0"]]
+    ]);
+  }
+
   async function screenAccount(acc) {
-    const { data: groups } = await db().from("wa_account_groups").select("enabled").eq("account_id", acc.id);
+    const groups = await allGroups(acc.id);
     const formats = await loadFormats(acc.id);
-    const g = groups || [];
     return {
       text: [
         "📱 <b>AKUN WHATSAPP</b>",
@@ -461,79 +495,140 @@ function register(bot, getDeps) {
         `👤 Nama: <b>${esc(acc.label)}</b>`,
         `📞 Nomor: <code>${esc(acc.phone || "-")}</code>`,
         `Status: ${statusLabel(acc)}`,
-        `Grup target aktif: <b>${g.filter(x => x.enabled).length}</b> dari ${g.length}`,
-        `Format: <b>${formats.length}</b> (berjalan ${formats.filter(f => f.active).length})`
+        `☑️ Grup dipilih: <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`,
+        `📝 Format: <b>${formats.length}</b> (berjalan ${formats.filter(f => f.active).length})`
       ].join("\n"),
-      kb: buildKb([
-        [["📝 Format", `wa:fmt:list:${acc.id}:0`], ["🎯 Grup Target", `wa:grp:list:${acc.id}:0`]],
-        [["🔄 Muat Ulang Grup", `wa:grp:refresh:${acc.id}`]],
-        [["🕒 Riwayat", `wa:hist:${acc.id}`]],
-        [["🗑️ Hapus Akun", `wa:acc:del:${acc.id}`]],
-        [["⬅️ Daftar Akun", "wa:acc:list:0"]]
-      ])
+      kb: accountKb(acc)
     };
   }
 
-  async function screenGroups(acc, page) {
-    const { data, count, error } = await db().from("wa_account_groups").select("*", { count: "exact" })
-      .eq("account_id", acc.id)
-      .order("title", { ascending: true })
-      .range(page * PAGE, page * PAGE + PAGE - 1);
-    if (error) throw error;
-
-    const total = count || 0;
-    const rows = (data || []).map(g => [[
-      `${g.enabled ? "✅" : "⬜"} ${trunc(g.title, 30)}${g.can_send ? "" : " 🔒"}`,
-      `wa:grp:tog:${acc.id}:${g.id}:${page}`
-    ]]);
-    const nav = [];
-    if (page > 0) nav.push(["◀️", `wa:grp:list:${acc.id}:${page - 1}`]);
-    if ((page + 1) * PAGE < total) nav.push(["▶️", `wa:grp:list:${acc.id}:${page + 1}`]);
-
+  async function screenStatus(acc) {
+    const entry = sockets.get(String(acc.id));
+    const groups = await allGroups(acc.id);
+    const formats = await loadFormats(acc.id);
     return {
       text: [
-        "🎯 <b>GRUP TARGET</b>",
+        "📊 <b>STATUS WHATSAPP</b>",
         RULE,
-        `Akun: <b>${esc(acc.label)}</b>`,
-        `Total grup: <b>${total}</b>`,
-        "",
-        "✅ = jadi target promosi · 🔒 = hanya admin yang bisa kirim",
-        total ? "" : "<i>Belum ada grup. Tekan Muat Ulang Grup setelah akun terhubung.</i>"
+        `👤 Nama: <b>${esc(acc.label)}</b>`,
+        `📞 Nomor: <code>${esc(acc.phone || "-")}</code>`,
+        `Koneksi: ${statusLabel(acc)}`,
+        `Socket: <b>${entry?.open ? "aktif" : "tidak aktif"}</b>`,
+        `▶️ Promosi berjalan: <b>${formats.filter(f => f.active).length}</b>`,
+        `☑️ Grup dipilih: <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`,
+        `🕒 Diperbarui: ${esc(dateText(acc.updated_at))}`
       ].join("\n"),
       kb: buildKb([
-        ...rows,
-        nav,
-        total ? [["✅ Pilih Semua Group", `wa:grp:all:${acc.id}:${page}`]] : [],
-        [["🔄 Muat Ulang Grup", `wa:grp:refresh:${acc.id}`]],
-        [["⬅️ Kembali", `wa:acc:view:${acc.id}`]]
+        [["🔄 Refresh", `wa:acc:status:${acc.id}`]],
+        [["⬅️ Akun", `wa:acc:view:${acc.id}`]]
       ])
     };
   }
 
-  async function screenFormatList(acc, page) {
+  async function screenSettings(acc) {
     const formats = await loadFormats(acc.id);
-    const rows = formats.slice(page * PAGE, page * PAGE + PAGE).map(f => [[
+    return {
+      text: [
+        "⚙️ <b>PENGATURAN AKUN</b>",
+        RULE,
+        `👤 Nama: <b>${esc(acc.label)}</b>`,
+        `📞 Nomor: <code>${esc(acc.phone || "-")}</code>`,
+        `🔗 Koneksi: ${statusLabel(acc)}`,
+        `▶️ Promosi berjalan: <b>${formats.filter(f => f.active).length}</b>`,
+        `📝 Format: <b>${formats.length}</b>`
+      ].join("\n"),
+      kb: buildKb([
+        [["🏷️ Nama", `wa:acc:label:${acc.id}`], ["📝 Format", `wa:fmt:list:${acc.id}:0`]],
+        [["➕ Format Baru", `wa:fmt:add:${acc.id}`]],
+        [["⬅️ Akun", `wa:acc:view:${acc.id}`]]
+      ])
+    };
+  }
+
+  async function screenGroups(acc, page, opts = {}) {
+    const all = await allGroups(acc.id);
+    const term = opts.term || "";
+    const scope = term ? all.filter(g => String(g.title).toLowerCase().includes(term)) : all;
+    const pages = Math.max(1, Math.ceil(scope.length / PAGE));
+    const p = Math.min(Math.max(0, page), pages - 1);
+    const rows = scope.slice(p * PAGE, p * PAGE + PAGE);
+    const picked = all.filter(g => g.enabled && g.can_send).length;
+    const locked = all.filter(g => !g.can_send).length;
+    const navBase = n => (opts.token ? `wa:grp:find:${acc.id}:${opts.token}:${n}` : `wa:grp:list:${acc.id}:${n}`);
+    const backOf = n => (opts.token ? `f:${opts.token}:${n}` : `l:${n}`);
+
+    const kb = [];
+    for (const g of rows.filter(x => x.can_send)) {
+      kb.push([[`${g.enabled ? "✅" : "⬜"} ${trunc(g.title, 30)}`, `wa:grp:tog:${acc.id}:${g.id}:${backOf(p)}`]]);
+    }
+    const nav = [];
+    if (p > 0) nav.push(["◀️", navBase(p - 1)]);
+    nav.push(["🏠", "menu:dashboard"]);
+    if (p < pages - 1) nav.push(["▶️", navBase(p + 1)]);
+    kb.push(nav);
+    if (opts.token) kb.push([["⬅️ Semua Grup", `wa:grp:list:${acc.id}:0`]]);
+    else kb.push([["🔎 Cari Grup", `wa:grp:search:${acc.id}`]]);
+    kb.push([["➕ Tambah Semua Grup", `wa:grp:all:${acc.id}:${backOf(p)}`]]);
+    kb.push([["🔄 Deteksi Grup", `wa:grp:refresh:${acc.id}`]]);
+    kb.push([["⬅️ Akun", `wa:acc:view:${acc.id}`]]);
+
+    const lines = [
+      "🎯 <b>GRUP TARGET</b>",
+      RULE,
+      `Akun: <b>${esc(acc.label)}</b>`,
+      `Total grup: <b>${all.length}</b>`,
+      `☑️ Grup dipilih: <b>${picked}</b>`,
+      `🔒 Hanya admin bisa kirim: <b>${locked}</b>`
+    ];
+    if (term) lines.push(`🔎 Pencarian: <b>${esc(opts.rawTerm || term)}</b> (${scope.length} hasil)`);
+    if (opts.prefix) lines.push("", opts.prefix);
+    lines.push("", `Halaman: <b>${p + 1}</b> dari ${pages}`, "", "✅ = jadi target promosi · ⬜ = belum dipilih");
+    if (!all.length) lines.push("", "<i>Belum ada grup. Tekan Deteksi Grup setelah akun terhubung.</i>");
+    return { text: lines.join("\n"), kb: buildKb(kb) };
+  }
+
+  async function groupScreenFromBack(acc, back, opts = {}) {
+    const parts = String(back).split(":");
+    if (parts[0] === "f") {
+      const s = searchTerms.get(parts[1]);
+      if (s && s.accountId === String(acc.id)) {
+        return screenGroups(acc, Number(parts[2]) || 0, { ...opts, term: s.term, rawTerm: s.rawTerm, token: parts[1] });
+      }
+    }
+    return screenGroups(acc, Number(parts[parts.length - 1]) || 0, opts);
+  }
+
+  async function detectGroups(acc) {
+    const entry = sockets.get(String(acc.id));
+    if (!entry?.open) return { error: "⚠️ Akun belum terhubung, grup belum bisa dideteksi." };
+    try {
+      const n = await refreshGroups(acc.id, entry.sock);
+      return { n };
+    } catch (e) {
+      return { error: `❌ Deteksi grup gagal: ${esc(errText(e))}` };
+    }
+  }
+
+  async function screenFormatList(acc, page, mode = "all") {
+    const formats = (await loadFormats(acc.id)).filter(f => mode === "all" || f.active);
+    const pages = Math.max(1, Math.ceil(formats.length / PAGE));
+    const p = Math.min(Math.max(0, page), pages - 1);
+    const kb = formats.slice(p * PAGE, p * PAGE + PAGE).map(f => [[
       `${f.active ? "▶️" : "⏹"} ${trunc(f.name, 28)}`,
       `wa:fmt:view:${acc.id}:${f.id}`
     ]]);
     const nav = [];
-    if (page > 0) nav.push(["◀️", `wa:fmt:list:${acc.id}:${page - 1}`]);
-    if ((page + 1) * PAGE < formats.length) nav.push(["▶️", `wa:fmt:list:${acc.id}:${page + 1}`]);
+    if (p > 0) nav.push(["◀️", `wa:fmt:${mode}:${acc.id}:${p - 1}`]);
+    if (p < pages - 1) nav.push(["▶️", `wa:fmt:${mode}:${acc.id}:${p + 1}`]);
+    if (nav.length) kb.push(nav);
+    if (mode === "all") kb.push([["➕ Format Baru", `wa:fmt:add:${acc.id}`]]);
+    kb.push([["⬅️ Akun", `wa:acc:view:${acc.id}`]]);
 
+    const title = mode === "active" ? "▶️ <b>FORMAT AKTIF</b>" : "📝 <b>FORMAT PROMOSI</b>";
+    const empty = mode === "active" ? "<i>Tidak ada format yang sedang berjalan.</i>" : "<i>Belum ada format.</i>";
     return {
-      text: [
-        "📝 <b>FORMAT PROMOSI</b>",
-        RULE,
-        `Akun: <b>${esc(acc.label)}</b>`,
-        `Total format: <b>${formats.length}</b>`,
-        formats.length ? "" : "<i>Belum ada format.</i>"
-      ].join("\n"),
-      kb: buildKb([
-        ...rows,
-        nav,
-        [["➕ Format Baru", `wa:fmt:add:${acc.id}`]],
-        [["⬅️ Kembali", `wa:acc:view:${acc.id}`]]
-      ])
+      text: [title, RULE, `Akun: <b>${esc(acc.label)}</b>`, `Total: <b>${formats.length}</b>`, formats.length ? "" : empty].join("\n"),
+      kb: buildKb(kb)
     };
   }
 
@@ -560,8 +655,7 @@ function register(bot, getDeps) {
           fmt.media ? ["🗑️ Hapus Media", `wa:fmt:nophoto:${id}:${f}`] : null
         ],
         [["⏱️ Jeda", `wa:fmt:ask:interval:${id}:${f}`], ["📅 Durasi", `wa:fmt:ask:duration:${id}:${f}`]],
-        [fmt.active ? ["⏹ Stop", `wa:fmt:stop:${id}:${f}`] : ["▶️ Mulai", `wa:fmt:start:${id}:${f}`]],
-        [["🗑️ Hapus Format", `wa:fmt:del:${id}:${f}`]],
+        [fmt.active ? ["⏹ Stop", `wa:fmt:stop:${id}:${f}`] : ["▶️ Mulai", `wa:fmt:start:${id}:${f}`], ["🗑️ Hapus Format", `wa:fmt:del:${id}:${f}`]],
         [["⬅️ Daftar Format", `wa:fmt:list:${id}:0`]]
       ])
     };
@@ -589,16 +683,9 @@ function register(bot, getDeps) {
         "",
         ...(lines.length ? lines : ["<i>Belum ada riwayat.</i>"])
       ].join("\n"),
-      kb: buildKb([[["⬅️ Kembali", `wa:acc:view:${acc.id}`]]])
+      kb: buildKb([[["⬅️ Akun", `wa:acc:view:${acc.id}`]]])
     };
   }
-
-  const ASK = {
-    msg: "✏️ Kirim isi pesan promosi sekarang.\nBisa memakai emoji dan format WhatsApp: *tebal*, _miring_, ~coret~.",
-    photo: "🖼️ Kirim <b>foto</b> atau <b>video</b> (sebagai media, bukan file). Isi pesan akan dipakai sebagai caption.\nUkuran file maksimal 20 MB.",
-    interval: `⏱️ Kirim jeda antar putaran, minimal ${MIN_INTERVAL_MIN} menit.\nContoh: 30 menit, 1 jam`,
-    duration: "📅 Kirim durasi promosi.\nContoh: 1 jam, 3 hari"
-  };
 
   /* ---------- Guard & lookup ---------- */
 
@@ -672,6 +759,53 @@ function register(bot, getDeps) {
   bot.callbackQuery(/^wa:acc:view:(\d+)$/, guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc => show(ctx, await screenAccount(acc)))));
 
+  bot.callbackQuery(/^wa:acc:status:(\d+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc => show(ctx, await screenStatus(acc)))));
+
+  bot.callbackQuery(/^wa:acc:settings:(\d+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc => show(ctx, await screenSettings(acc)))));
+
+  bot.callbackQuery(/^wa:acc:label:(\d+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc => {
+      setFlow(ctx.from.id, { t: "label", accountId: acc.id });
+      await show(ctx, {
+        text: `${RULE}\n🏷️ <b>UBAH NAMA AKUN</b>\nNama saat ini: <b>${esc(acc.label)}</b>\n\nKirim nama baru.`,
+        kb: cancelAcc(acc.id)
+      });
+    })));
+
+  bot.callbackQuery(/^wa:acc:disconnect:(\d+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc => {
+      await stopSocket(acc.id);
+      await setAccountStatus(acc.id, "disconnected");
+      const fresh = await visibleAccount(acc.id, admin);
+      return show(ctx, withNote(await screenAccount(fresh), "🔌 Akun diputus. Sesi tetap tersimpan, bisa dihubungkan lagi."));
+    })));
+
+  bot.callbackQuery(/^wa:acc:connect:(\d+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc => {
+      if (!isRegistered(acc.id)) {
+        return show(ctx, withNote(await screenAccount(acc), "❌ Sesi tidak ditemukan. Hapus akun ini lalu tambah ulang dengan kode pairing."));
+      }
+      if (sockets.get(String(acc.id))) {
+        return show(ctx, withNote(await screenAccount(acc), "ℹ️ Akun sudah tersambung atau sedang menyambung."));
+      }
+      await setAccountStatus(acc.id, "connecting");
+      await startSocket({ ...acc, status: "connecting" }, null);
+      const fresh = await visibleAccount(acc.id, admin);
+      return show(ctx, withNote(await screenAccount(fresh), "🔗 Menyambungkan ulang. Tekan Refresh di Status beberapa detik lagi."));
+    })));
+
+  bot.callbackQuery(/^wa:acc:stopall:(\d+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc => {
+      let n = 0;
+      for (const f of await loadFormats(acc.id)) {
+        if (f.active) { await stopFormat(acc, f.id, ctx.from.id); n++; }
+      }
+      const fresh = await visibleAccount(acc.id, admin);
+      return show(ctx, withNote(await screenAccount(fresh), n ? `⏹ ${n} promosi dihentikan.` : "ℹ️ Tidak ada promosi yang berjalan."));
+    })));
+
   bot.callbackQuery(/^wa:acc:del:(\d+)$/, guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc => show(ctx, confirmScreen(
       `🗑️ <b>HAPUS AKUN WHATSAPP?</b>\n${RULE}\nAkun <b>${esc(acc.label)}</b> akan diputus, sesinya dihapus, dan format serta grup targetnya ikut hilang.`,
@@ -701,45 +835,64 @@ function register(bot, getDeps) {
     withAccount(ctx, admin, ctx.match[1], async acc =>
       show(ctx, await screenGroups(acc, Number(ctx.match[2]))))));
 
-  bot.callbackQuery(/^wa:grp:tog:(\d+):(\d+):(\d+)$/, guard((ctx, admin) =>
+  bot.callbackQuery(/^wa:grp:search:(\d+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc => {
+      setFlow(ctx.from.id, { t: "gsearch", accountId: acc.id });
+      await show(ctx, {
+        text: `${RULE}\n🔎 <b>CARI GRUP</b>\nKirim sebagian nama grup yang dicari.`,
+        kb: buildKb([[["❌ Batal", `wa:grp:list:${acc.id}:0`]]])
+      });
+    })));
+
+  bot.callbackQuery(/^wa:grp:find:(\d+):([a-f0-9]+):(\d+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc => {
+      const s = searchTerms.get(ctx.match[2]);
+      if (!s || s.accountId !== String(acc.id)) {
+        return show(ctx, await screenGroups(acc, 0, { prefix: "⚠️ Pencarian sudah kedaluwarsa, silakan cari ulang." }));
+      }
+      return show(ctx, await screenGroups(acc, Number(ctx.match[3]), {
+        term: s.term, rawTerm: s.rawTerm, token: ctx.match[2]
+      }));
+    })));
+
+  bot.callbackQuery(/^wa:grp:tog:(\d+):(\d+):(.+)$/, guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc => {
       const gid = Number(ctx.match[2]);
       const { data: g } = await db().from("wa_account_groups").select("*")
         .eq("id", gid).eq("account_id", acc.id).maybeSingle();
-      if (g) await db().from("wa_account_groups").update({ enabled: !g.enabled }).eq("id", gid);
-      return show(ctx, await screenGroups(acc, Number(ctx.match[3])));
+      if (g && g.can_send) {
+        await db().from("wa_account_groups").update({ enabled: !g.enabled }).eq("id", gid);
+      }
+      return show(ctx, await groupScreenFromBack(acc, ctx.match[3]));
     })));
 
-  bot.callbackQuery(/^wa:grp:all:(\d+):(\d+)$/, guard((ctx, admin) =>
+  bot.callbackQuery(/^wa:grp:all:(\d+):(.+)$/, guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc => {
       await db().from("wa_account_groups").update({ enabled: true })
         .eq("account_id", acc.id).eq("can_send", true);
-      return show(ctx, await screenGroups(acc, Number(ctx.match[2])));
+      return show(ctx, await groupScreenFromBack(acc, ctx.match[2], {
+        prefix: "➕ Semua grup yang bisa dikirimi sudah dipilih."
+      }));
     })));
 
-  bot.callbackQuery(/^wa:grp:refresh:(\d+)$/, guard((ctx, admin) =>
+  const detectHandler = guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc => {
-      const entry = sockets.get(String(acc.id));
-      let msg = "";
-      if (!entry?.open) {
-        msg = "⚠️ Akun belum terhubung, grup belum bisa dimuat ulang.\n\n";
-      } else {
-        try {
-          const n = await refreshGroups(acc.id, entry.sock);
-          msg = `✅ ${n} grup dimuat ulang.\n\n`;
-        } catch (e) {
-          msg = `❌ ${esc(errText(e))}\n\n`;
-        }
-      }
-      const s = await screenGroups(acc, 0);
-      return show(ctx, { text: msg + s.text, kb: s.kb });
-    })));
+      const r = await detectGroups(acc);
+      const prefix = r.error ? r.error : `🔎 <b>${r.n}</b> grup terdeteksi.`;
+      return show(ctx, await screenGroups(acc, 0, { prefix }));
+    }));
+  bot.callbackQuery(/^wa:grp:add:(\d+)$/, detectHandler);
+  bot.callbackQuery(/^wa:grp:refresh:(\d+)$/, detectHandler);
 
   /* ---------- Callback: format ---------- */
 
   bot.callbackQuery(/^wa:fmt:list:(\d+):(\d+)$/, guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc =>
-      show(ctx, await screenFormatList(acc, Number(ctx.match[2]))))));
+      show(ctx, await screenFormatList(acc, Number(ctx.match[2]), "all")))));
+
+  bot.callbackQuery(/^wa:fmt:active:(\d+):(\d+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc =>
+      show(ctx, await screenFormatList(acc, Number(ctx.match[2]), "active")))));
 
   bot.callbackQuery(/^wa:fmt:add:(\d+)$/, guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc => {
@@ -794,7 +947,7 @@ function register(bot, getDeps) {
 
   bot.callbackQuery(/^wa:fmt:del:(\d+):([a-f0-9]+)$/, guard((ctx, admin) =>
     withFormat(ctx, admin, ctx.match[1], ctx.match[2], async (acc, fmt) => show(ctx, confirmScreen(
-      `🗑️ <b>HAPUS FORMAT?</b>\n${RULE}\nFormat <b>${esc(trunc(fmt.name, 100))}</b> dan fotonya akan dihapus.`,
+      `🗑️ <b>HAPUS FORMAT?</b>\n${RULE}\nFormat <b>${esc(trunc(fmt.name, 100))}</b> dan medianya akan dihapus.`,
       `wa:fmt:delok:${acc.id}:${fmt.id}`,
       `wa:fmt:view:${acc.id}:${fmt.id}`
     )))));
@@ -806,10 +959,10 @@ function register(bot, getDeps) {
       clearMedia(acc.id, fmt.id);
       const formats = (await loadFormats(acc.id)).filter(f => f.id !== fmt.id);
       await saveFormats(acc.id, formats);
-      return show(ctx, await screenFormatList(acc, 0));
+      return show(ctx, await screenFormatList(acc, 0, "all"));
     })));
 
-  /* ---------- Input teks (nama, nomor, pesan, jeda, durasi) ---------- */
+  /* ---------- Input teks (nama, nomor, pesan, jeda, durasi, label, cari grup) ---------- */
 
   bot.on("message:text", async (ctx, next) => {
     const text = String(ctx.message.text || "").trim();
@@ -850,9 +1003,7 @@ function register(bot, getDeps) {
       if (!acc) { clearFlow(tgId); return note(tgId, denied().text, backKb); }
 
       if (flow.t === "name") {
-        if (!text) {
-          return note(tgId, "❌ Nama format tidak boleh kosong.", buildKb([[["❌ Batal", `wa:fmt:list:${acc.id}:0`]]]));
-        }
+        if (!text) return note(tgId, "❌ Nama format tidak boleh kosong.", buildKb([[["❌ Batal", `wa:fmt:list:${acc.id}:0`]]]));
         const fmt = {
           id: newId(),
           name: text,
@@ -899,6 +1050,26 @@ function register(bot, getDeps) {
         return showFormatNote(tgId, acc, flow.formatId);
       }
 
+      if (flow.t === "label") {
+        if (!text) return note(tgId, "❌ Nama tidak boleh kosong.", cancelAcc(acc.id));
+        await db().from("wa_accounts").update({ label: trunc(text, 60), updated_at: nowIso() }).eq("id", acc.id);
+        clearFlow(tgId);
+        const fresh = await visibleAccount(acc.id, admin);
+        const s = await screenAccount(fresh);
+        return note(tgId, `✅ Nama akun diubah.\n\n${s.text}`, s.kb);
+      }
+
+      if (flow.t === "gsearch") {
+        if (!text) return note(tgId, "❌ Kata pencarian tidak boleh kosong.", cancelAcc(acc.id));
+        const rawTerm = trunc(text, 60);
+        const token = newId();
+        searchTerms.set(token, { accountId: String(acc.id), term: rawTerm.toLowerCase(), rawTerm });
+        if (searchTerms.size > 200) searchTerms.delete(searchTerms.keys().next().value);
+        clearFlow(tgId);
+        const s = await screenGroups(acc, 0, { term: rawTerm.toLowerCase(), rawTerm, token });
+        return note(tgId, s.text, s.kb);
+      }
+
       clearFlow(tgId);
       return next();
     } catch (e) {
@@ -907,7 +1078,7 @@ function register(bot, getDeps) {
     }
   });
 
-  /* ---------- Input foto (gambar format) ---------- */
+  /* ---------- Input foto/video (media format) ---------- */
 
   bot.on(["message:photo", "message:video"], async (ctx, next) => {
     const flow = getFlow(ctx.from.id);
@@ -929,7 +1100,7 @@ function register(bot, getDeps) {
       const fileId = isVideo ? ctx.message.video.file_id : ctx.message.photo[ctx.message.photo.length - 1].file_id;
       const file = await ctx.api.getFile(fileId);
       const res = await fetch(`https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`);
-      if (!res.ok) throw new Error("Gagal mengunduh foto dari Telegram.");
+      if (!res.ok) throw new Error("Gagal mengunduh media dari Telegram.");
 
       clearMedia(acc.id, flow.formatId);
       const dest = mediaPath(acc.id, flow.formatId, isVideo ? "mp4" : "jpg");
@@ -938,8 +1109,8 @@ function register(bot, getDeps) {
       clearFlow(tgId);
       return showFormatNote(tgId, acc, flow.formatId);
     } catch (e) {
-      console.error("WA PHOTO:", errText(e));
-      return note(tgId, `❌ Gagal menyimpan foto.\n${esc(errText(e))}`, cancelKb(flow.accountId, flow.formatId));
+      console.error("WA MEDIA:", errText(e));
+      return note(tgId, `❌ Gagal menyimpan media.\n${esc(errText(e))}`, cancelKb(flow.accountId, flow.formatId));
     }
   });
 

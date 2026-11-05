@@ -75,6 +75,7 @@ const bot = new Bot(process.env.BOT_TOKEN);
 // Modul Promosi WhatsApp (file terpisah: whatsapp.js). Didaftarkan di sini agar
 // handler teks/foto WhatsApp dicek lebih dulu. Dependensi diambil saat dipakai.
 const waPromo = require("./whatsapp").register(bot, () => ({
+  sendFresh: (userId, text, keyboard, options) => sendFreshUi(userId, text, keyboard, options),
   sb,
   InlineKeyboard,
   requireAdmin,
@@ -686,51 +687,19 @@ async function withUiLock(userId, fn) {
   }
 }
 
-async function renderUi(userId, text, keyboard, options = {}) {
-  const key = String(userId);
-  const saved = uiMessages.get(key);
-
-  const extra = {
-    reply_markup: keyboard
-  };
-
+// Setiap menu/pemberitahuan dikirim sebagai pesan BARU di paling bawah chat.
+// Pesan panel sebelumnya dihapus, jadi tidak ada pesan lama yang berubah di atas.
+async function sendFreshUi(userId, text, keyboard, options = {}) {
+  await deleteSavedUi(userId);
+  const extra = { reply_markup: keyboard };
   if (options.parse_mode) extra.parse_mode = options.parse_mode;
-
-  if (saved) {
-    try {
-      if (saved.isMedia) {
-        await bot.api.editMessageCaption(
-          saved.chatId,
-          saved.messageId,
-          {
-            caption: text,
-            ...extra
-          }
-        );
-        return;
-      }
-
-      await bot.api.editMessageText(
-        saved.chatId,
-        saved.messageId,
-        text,
-        extra
-      );
-      return;
-    } catch (e) {
-      if (/message is not modified/i.test(String(e.message || e))) {
-        return;
-      }
-
-      await deleteSavedUi(userId);
-
-      // Let the caller decide how to re-create the message (e.g. with banner).
-      if (options.sendFallback === false) return false;
-    }
-  }
-
   const msg = await bot.api.sendMessage(userId, text, extra);
   await saveUiMessage(userId, msg, false);
+  return msg;
+}
+
+async function renderUi(userId, text, keyboard, options = {}) {
+  return sendFreshUi(userId, text, keyboard, options);
 }
 
 async function replaceUi(ctx, text, keyboard, options = {}) {
@@ -925,19 +894,17 @@ const DASH_BTN = {
   accounts: { label: "📱 Akun Telegram", data: "accounts:list:0" },
   add: { label: "➕ Tambah Akun", data: "account:add" },
   admin: { label: "👥 Admin", data: "admin:list:0" },
-  privatePromo: { label: "📢 Promosi Chat Privat", data: "privatepromo:accounts:0" },
-  whatsapp: { label: "💬 Promosi WhatsApp", data: "whatsapp:menu" },
+  privatePromo: { label: "📢 Chat Privat", data: "privatepromo:accounts:0" },
+  whatsapp: { label: "💬 WhatsApp", data: "whatsapp:menu" },
   refresh: { label: "🔄 Refresh", data: "menu:dashboard" }
 };
 
-// Setiap tombol menu utama ditaruh satu baris penuh agar lebarnya seragam dan rapi.
+// Menu utama: tombol berpasangan dengan label pendek agar ringkas dan sejajar.
 function ownerDashboardMenu() {
   return buildDashboardKeyboard([
     [DASH_BTN.accounts],
-    [DASH_BTN.add],
-    [DASH_BTN.admin],
-    [DASH_BTN.privatePromo],
-    [DASH_BTN.whatsapp],
+    [DASH_BTN.add, DASH_BTN.admin],
+    [DASH_BTN.privatePromo, DASH_BTN.whatsapp],
     [DASH_BTN.refresh]
   ]);
 }
@@ -947,11 +914,13 @@ function adminDashboardMenu(adminRow = null) {
   const rows = [[DASH_BTN.accounts]];
 
   if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(role)) {
-    rows.push([DASH_BTN.add], [DASH_BTN.admin]);
-    if (role === "ADMIN_PREMIUM") rows.push([DASH_BTN.privatePromo]);
-    rows.push([DASH_BTN.whatsapp], [DASH_BTN.refresh]);
+    rows.push([DASH_BTN.add, DASH_BTN.admin]);
+    if (role === "ADMIN_PREMIUM") rows.push([DASH_BTN.privatePromo, DASH_BTN.whatsapp]);
+    else rows.push([DASH_BTN.whatsapp]);
+    rows.push([DASH_BTN.refresh]);
   } else {
-    rows.push([DASH_BTN.whatsapp], [DASH_BTN.add], [DASH_BTN.refresh]);
+    rows.push([DASH_BTN.whatsapp]);
+    rows.push([DASH_BTN.add, DASH_BTN.refresh]);
   }
   return buildDashboardKeyboard(rows);
 }
