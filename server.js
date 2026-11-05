@@ -459,7 +459,7 @@ function joinChannelKeyboard() {
 function userJoinText() {
   return [
     "🔒 <b>AKSES BOT BELUM TERSEDIA</b>",
-    "━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
     "Untuk melanjutkan, kamu wajib bergabung terlebih dahulu ke <b>Channel Resmi</b> kami.",
     "",
     "📢 <b>Channel Resmi:</b> @jasebvortex",
@@ -474,7 +474,7 @@ function userPurchaseText(subscription = null) {
   const renewal = subscription && !subscriptionIsActive(subscription);
   return [
     renewal ? "🔄 <b>MASA AKTIF HABIS</b>" : "🛒 <b>DAFTAR & BELI AKSES BOT</b>",
-    "━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
     renewal
       ? "Masa aktif akses kamu sudah berakhir. Silakan pilih role untuk melakukan perpanjangan."
       : "Pilih role yang sesuai kebutuhan. Semua paket berlaku <b>1 bulan</b> dan dapat diperpanjang.",
@@ -547,7 +547,7 @@ function userOrderText(ctx, role, subscription = null) {
 
   return [
     "🧾 <b>ORDER AKSES BOT</b>",
-    "━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
     `👤 Nama: <b>${escapeHtml(name)}</b>`,
     `🔗 Username: <b>${escapeHtml(username)}</b>`,
     `🆔 Telegram ID: <code>${escapeHtml(tgId)}</code>`,
@@ -799,7 +799,7 @@ function dashboardText(ctx, stats, extra = "", role = "") {
   const name = [first, last].filter(Boolean).join(" ") || "Admin";
   const username = ctx.from?.username ? `@${ctx.from.username}` : "-";
   const roleLabel = role ? displayAdminRole(role) : "";
-  const rule = "━━━━━━━━━━━━━━━━━━";
+  const rule = "━━━━━━━━━━━━━━━━━━━━━━━━";
 
   // Every value that may be copied sits in its own <code> element, so a single
   // tap copies just that value (never one big block).
@@ -807,13 +807,16 @@ function dashboardText(ctx, stats, extra = "", role = "") {
     "🎛️ <b>PANEL KONTROL</b>",
     rule,
     `👤 <b>${escapeHtml(name)}</b>`,
-    `🆔 <code>${escapeHtml(ctx.from.id)}</code> · 🔗 <code>${escapeHtml(username)}</code>`,
-    roleLabel ? `🎖️ <code>${roleLabel}</code> · <code>v${escapeHtml(BOT_VERSION)}</code>` : `🤖 <code>v${escapeHtml(BOT_VERSION)}</code>`,
+    `🆔 <code>${escapeHtml(ctx.from.id)}</code>`,
+    `🔗 <code>${escapeHtml(username)}</code>`,
+    roleLabel ? `🎖️ <code>${roleLabel}</code>` : null,
+    `🤖 <code>v${escapeHtml(BOT_VERSION)}</code>`,
     extra ? `\n<blockquote>${escapeHtml(extra)}</blockquote>` : null,
     rule,
     "📊 <b>STATUS SISTEM</b>",
-    `👥 Admin <b>${stats.admins}</b> · 📱 Akun <b>${stats.accounts}</b> · 🟢 Terhubung <b>${stats.connected}</b>`,
-    `▶️ Promosi berjalan <b>${stats.running}</b> · 🎯 Target grup <b>${stats.groups}</b>`
+    `👥 Admin: <b>${stats.admins}</b>`,
+    `📱 Akun: <b>${stats.accounts}</b>`,
+    `🟢 Terhubung: <b>${stats.connected}</b>`
   ].filter(line => line !== null).join("\n");
 }
 
@@ -1811,14 +1814,14 @@ bot.callbackQuery(/^promo:failures:(\d+):([a-f0-9]+)(?::(\d+))?$/, async ctx => 
 
   const lines = [
     "❌ <b>DAFTAR GROUP GAGAL</b>",
-    "━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
     `📝 <b>Format:</b> ${escapeHtml(report.formatName || "-")}`,
     `👤 <b>Nama:</b> ${escapeHtml(report.accountName || report.accountLabel || "-")}`,
     `🔗 <b>Username:</b> ${escapeHtml(report.accountUsername ? `@${report.accountUsername}` : "-")}`,
     `🆔 <b>ID Akun:</b> <code>${escapeHtml(report.accountTelegramId || "-")}</code>`,
     `📱 <b>Nomor:</b> <code>${escapeHtml(report.accountPhone || "-")}</code>`,
     `📄 <b>Halaman:</b> ${safePage + 1}/${totalPages}`,
-    "━━━━━━━━━━━━━━━━━━"
+    "━━━━━━━━━━━━━━━━━━━━━━━━"
   ];
 
   if (!visible.length) lines.push("<i>Tidak ada group yang gagal.</i>");
@@ -2090,7 +2093,7 @@ function formatDetailText(account, settings) {
     ].join("\n");
   }
 
-  const separator = "━━━━━━━━━━━━━━━━━━";
+  const separator = "━━━━━━━━━━━━━━━━━━━━━━━━";
   const body = hasText
     ? String(settings.message).trim()
     : (settings.caption ? String(settings.caption).trim() : "Foto tanpa caption");
@@ -2495,13 +2498,13 @@ async function sendPromotionReport(account, format, total, success, failed, fail
 
   const lines = [
     "📊 <b>HASIL PROMOSI</b>",
-    "━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
     `📝 <b>Format:</b> ${escapeHtml(format.name || "-")}`,
     `👤 <b>Nama:</b> ${escapeHtml(accountName)}`,
     `🔗 <b>Username:</b> ${escapeHtml(accountUsername ? `@${accountUsername}` : "-")}`,
     `🆔 <b>ID Akun:</b> <code>${escapeHtml(accountTelegramId || "-")}</code>`,
     `📱 <b>Nomor:</b> <code>${escapeHtml(accountPhone || "-")}</code>`,
-    "━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
     "📤 <b>HASIL PENGIRIMAN</b>",
     `Total group dipilih: <b>${total}</b>`,
     `Berhasil terkirim: <b>${success}</b>`,
@@ -4288,9 +4291,11 @@ async function showAccount(ctx, accountId, prefixMessage = "") {
     prefixMessage,
     `📱 <b>AKUN TELEGRAM</b>`,
     `👤 Nama: <b>${escapeHtml(name)}</b>`,
-    `🔗 <code>${escapeHtml(account.username ? `@${account.username}` : "-")}</code> · 🆔 <code>${escapeHtml(account.telegram_user_id || "-")}</code>`,
+    `🔗 <code>${escapeHtml(account.username ? `@${account.username}` : "-")}</code>`,
+    `🆔 <code>${escapeHtml(account.telegram_user_id || "-")}</code>`,
     `🟢 Koneksi: <b>${escapeHtml(account.status || "-")}</b>`,
-    `📝 Format: <b>${formats.length}</b> · ▶️ Aktif: <b>${activeCount}</b>`,
+    `📝 Format: <b>${formats.length}</b>`,
+    `▶️ Aktif: <b>${activeCount}</b>`,
     `🎯 Target aktif: <b>dibagi bersama akun ini</b>`
   ].filter(Boolean).join("\n");
   return replaceUi(ctx, message, accountMenu(account, settings), { parse_mode: "HTML" });
@@ -4303,7 +4308,7 @@ async function renderFormatList(ctx, accountId, prefixMessage = "") {
   const lines = [
     prefixMessage,
     "📝 <b>FORMAT PROMOSI</b>",
-    "━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
     `👤 Akun: <b>${escapeHtml(account.label || "Akun Telegram")}</b>`,
     `📦 Total format: <b>${formats.length}</b>`,
     formats.length ? "" : "Belum ada format. Tekan ➕ Tambah Format untuk membuat."
@@ -4321,7 +4326,7 @@ async function renderFormatDetail(ctx, accountId, formatId, prefixMessage = "") 
   const body = isPhoto
     ? (format.caption || "Foto tanpa caption")
     : (format.message || "Format teks kosong");
-  const rule = "━━━━━━━━━━━━━━━━━━";
+  const rule = "━━━━━━━━━━━━━━━━━━━━━━━━";
 
   const message = [
     prefixMessage,
@@ -5015,9 +5020,9 @@ bot.callbackQuery(/^promo:active:(\d+):\d+$/, async ctx => {
   const formats=await getPromotionFormats(accountId);
   const active=formats.filter(x=>x.active);
   const activeText = active.length
-    ? active.map(x => `🟢 <b>${escapeHtml(x.name)}</b>\n⏱️ ${escapeHtml(formatInterval(x.interval_minutes))} · 📅 ${escapeHtml(formatDuration(x.duration_hours))} · 🕐 ${escapeHtml(formatWindowLabel(x))}`).join("\n\n")
+    ? active.map(x => `🟢 <b>${escapeHtml(x.name)}</b>\n⏱️ Jeda: ${escapeHtml(formatInterval(x.interval_minutes))}\n📅 Durasi: ${escapeHtml(formatDuration(x.duration_hours))}\n🕐 Waktu: ${escapeHtml(formatWindowLabel(x))}`).join("\n\n")
     : "⚪ Tidak ada format yang sedang berjalan.";
-  return replaceUi(ctx, `▶️ <b>FORMAT AKTIF</b>\n━━━━━━━━━━━━━━━━━━\n\n${activeText}`, activeFormatKeyboard(active, accountId), { parse_mode: "HTML" });
+  return replaceUi(ctx, `▶️ <b>FORMAT AKTIF</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n${activeText}`, activeFormatKeyboard(active, accountId), { parse_mode: "HTML" });
 });
 
 bot.callbackQuery(/^promo:delay:(\d+):([^:]+)$/, async ctx => {
@@ -5026,7 +5031,7 @@ bot.callbackQuery(/^promo:delay:(\d+):([^:]+)$/, async ctx => {
   if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const f=await getPromotionFormat(accountId,formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id),{t:"delay",accountId,formatId,adminId:adminRow.id});
-  return replaceUi(ctx, `⏱️ <b>ATUR JEDA</b>\n━━━━━━━━━━━━━━━━━━\nFormat: <b>${escapeHtml(f.name)}</b>\n\nPilih jeda cepat di bawah, atau tekan ⌨️ Ketik sendiri.`, formatDelayKeyboard(accountId, formatId), { parse_mode: "HTML" });
+  return replaceUi(ctx, `⏱️ <b>ATUR JEDA</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nFormat: <b>${escapeHtml(f.name)}</b>\n\nPilih jeda cepat di bawah, atau tekan ⌨️ Ketik sendiri.`, formatDelayKeyboard(accountId, formatId), { parse_mode: "HTML" });
 });
 
 bot.callbackQuery(/^promo:duration:(\d+):([^:]+)$/, async ctx => {
@@ -5035,7 +5040,7 @@ bot.callbackQuery(/^promo:duration:(\d+):([^:]+)$/, async ctx => {
   if (!await requireAccountAccess(ctx, adminRow, accountId)) return; const f=await getPromotionFormat(accountId,formatId);
   if(!f)return renderFormatList(ctx,accountId,"❌ Format tidak ditemukan.");
   flows.set(String(ctx.from.id),{t:"duration",accountId,formatId,adminId:adminRow.id});
-  return replaceUi(ctx, `📅 <b>ATUR DURASI</b>\n━━━━━━━━━━━━━━━━━━\nFormat: <b>${escapeHtml(f.name)}</b>\n\nPilih durasi cepat di bawah, atau tekan ⌨️ Ketik sendiri.`, formatDurationKeyboard(accountId, formatId), { parse_mode: "HTML" });
+  return replaceUi(ctx, `📅 <b>ATUR DURASI</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nFormat: <b>${escapeHtml(f.name)}</b>\n\nPilih durasi cepat di bawah, atau tekan ⌨️ Ketik sendiri.`, formatDurationKeyboard(accountId, formatId), { parse_mode: "HTML" });
 });
 
 bot.callbackQuery(/^promo:delayset:(\d+):([^:]+):(\d+)$/, async ctx => {
@@ -5665,7 +5670,7 @@ async function renderPrivatePromoGroups(ctx, page = 0, notice = "") {
   const text = [
     notice,
     "📢 <b>PROMOSI CHAT PRIVAT</b>",
-    "━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━",
     `📱 Akun pengirim: <b>${escapeHtml(account.label)}</b>`,
     `👥 Grup tersedia: <b>${total}</b>`,
     `☑️ Grup dipilih: <b>${selectedCount}</b>`,
@@ -6231,7 +6236,7 @@ bot.callbackQuery(/^privatepromo:accounts:(\d+)$/, async ctx => {
     const result = await listConnectedPrivatePromoAccounts(page, adminRow);
     const lines = [
       "📢 <b>PROMOSI CHAT PRIVAT</b>",
-      "━━━━━━━━━━━━━━━━━━",
+      "━━━━━━━━━━━━━━━━━━━━━━━━",
       "Pilih akun Telegram yang sudah terhubung. Pesan privat akan dikirim oleh <b>akun Telegram tersebut</b>, bukan bot.",
       "",
       `📱 Akun terhubung: <b>${result.total}</b>`,

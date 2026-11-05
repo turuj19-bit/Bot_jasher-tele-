@@ -23,7 +23,7 @@ const GROUP_DELAY_MIN_MS = 20 * 1000;   // jeda acak antar grup
 const GROUP_DELAY_MAX_MS = 60 * 1000;
 const DAILY_CAP = 200;                  // maksimal kirim per akun per hari
 const FLOW_TTL_MS = 10 * 60 * 1000;
-const RULE = "━━━━━━━━━━━━━━━━━━";
+const RULE = "━━━━━━━━━━━━━━━━━━━━━━━━";
 
 fs.mkdirSync(SESSION_ROOT, { recursive: true });
 fs.mkdirSync(MEDIA_ROOT, { recursive: true });
@@ -340,7 +340,7 @@ function register(bot, getDeps) {
     const reasons = new Map();
     for (const f of round.fail) reasons.set(f.reason, (reasons.get(f.reason) || 0) + 1);
     const lines = [
-      "📊 <b>HASIL PROMOSI WHATSAPP</b>",
+      "📊 <b>HASIL PROMOSI</b>",
       RULE,
       `📝 Format: <b>${esc(trunc(fmt.name, 100))}</b>`,
       `👤 Nama: <b>${esc((acc && acc.label) || "-")}</b>`,
@@ -511,7 +511,7 @@ function register(bot, getDeps) {
       ],
       [["➕ Tambah Grup", `wa:grp:add:${acc.id}`], ["📝 Format", `wa:fmt:list:${acc.id}:0`]],
       [["➕ Format Baru", `wa:fmt:add:${acc.id}`], ["▶️ Format Aktif", `wa:fmt:active:${acc.id}:0`]],
-      [["⏹ Stop Promosi", `wa:acc:stopall:${acc.id}`], ["📋 Riwayat", `wa:hist:${acc.id}`]],
+      [["⏹ Stop Semua", `wa:acc:stopall:${acc.id}`], ["📋 Riwayat", `wa:hist:${acc.id}`]],
       [["🏷️ Nama", `wa:acc:label:${acc.id}`], ["🗑️ Hapus", `wa:acc:del:${acc.id}`]],
       [["⬅️ Kembali", "wa:acc:list:0"]]
     ]);
@@ -615,7 +615,7 @@ function register(bot, getDeps) {
     ];
     if (term) lines.push(`🔎 Pencarian: <b>${esc(opts.rawTerm || term)}</b> (${scope.length} hasil)`);
     if (opts.prefix) lines.push("", opts.prefix);
-    lines.push("", `Halaman: <b>${p + 1}</b> dari ${pages}`, "", "✅ = jadi target promosi · ⬜ = belum dipilih");
+    lines.push("", `Halaman: <b>${p + 1}</b> dari ${pages}`, "", "✅ = jadi target promosi", "⬜ = belum dipilih");
     if (!all.length) lines.push("", "<i>Belum ada grup. Tekan Deteksi Grup setelah akun terhubung.</i>");
     return { text: lines.join("\n"), kb: buildKb(kb) };
   }
@@ -705,8 +705,8 @@ function register(bot, getDeps) {
       .eq("account_id", acc.id).order("created_at", { ascending: false }).limit(10);
     if (error) throw error;
     const lines = (data || []).map(h =>
-      `• ${esc(dateText(h.created_at))}\n   ${esc(h.action)} · ${esc(h.status)}` +
-      (h.group_title ? ` · ${esc(trunc(h.group_title, 30))}` : "") +
+      `• ${esc(dateText(h.created_at))}\n   ${esc(h.action)}: ${esc(h.status)}` +
+      (h.group_title ? `\n   Grup: ${esc(trunc(h.group_title, 30))}` : "") +
       (h.error ? `\n   <i>${esc(trunc(h.error, 120))}</i>` : "")
     );
     return {
@@ -928,12 +928,35 @@ function register(bot, getDeps) {
     withAccount(ctx, admin, ctx.match[1], async acc =>
       show(ctx, await screenFormatList(acc, Number(ctx.match[2]), "active")))));
 
+  function nextFormatName(formats) {
+    const nums = formats
+      .map(f => /^Format (\d+)$/.exec(String(f.name || "")))
+      .filter(Boolean)
+      .map(m => Number(m[1]));
+    return `Format ${(nums.length ? Math.max(...nums) : 0) + 1}`;
+  }
+
   bot.callbackQuery(/^wa:fmt:add:(\d+)$/, guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc => {
-      setFlow(ctx.from.id, { t: "name", accountId: acc.id });
+      const formats = await loadFormats(acc.id);
+      const fmt = {
+        id: newId(),
+        name: nextFormatName(formats),
+        message: "",
+        media: null,
+        interval_minutes: MIN_INTERVAL_MIN,
+        duration_hours: 24,
+        active: false,
+        started_at: null,
+        expires_at: null,
+        created_at: nowIso()
+      };
+      formats.push(fmt);
+      await saveFormats(acc.id, formats);
+      setFlow(ctx.from.id, { t: "msg", accountId: acc.id, formatId: fmt.id });
       await show(ctx, {
-        text: `📝 <b>FORMAT BARU</b>\n${RULE}\nKirim nama format.\nNama ini hanya untuk pengenal di menu.`,
-        kb: buildKb([[["❌ Batal", `wa:fmt:list:${acc.id}:0`]]])
+        text: `✅ <b>${esc(fmt.name)}</b> dibuat.\n${RULE}\nKirim <b>teks</b> untuk isi pesan promosi.\nAtau kirim <b>foto/video</b> dengan caption.`,
+        kb: cancelKb(acc.id, fmt.id)
       });
     })));
 
