@@ -23,7 +23,7 @@ const GROUP_DELAY_MIN_MS = 20 * 1000;   // jeda acak antar grup
 const GROUP_DELAY_MAX_MS = 60 * 1000;
 const DAILY_CAP = 200;                  // maksimal kirim per akun per hari
 const FLOW_TTL_MS = 10 * 60 * 1000;
-const RULE = "━━━━━━━━━━━━━━━━━━━━━━━━";
+const RULE = "━━━━━━━━━━━━━━━━━━━━━━━━━━";
 
 fs.mkdirSync(SESSION_ROOT, { recursive: true });
 fs.mkdirSync(MEDIA_ROOT, { recursive: true });
@@ -526,7 +526,7 @@ function register(bot, getDeps) {
         RULE,
         `👤 Nama : <b>${esc(acc.label)}</b>`,
         `📞 Nomor : <code>${esc(acc.phone || "-")}</code>`,
-        `Status : ${statusLabel(acc)}`,
+        `📌 Status : ${statusLabel(acc)}`,
         `☑️ Grup dipilih : <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`,
         `📝 Format : <b>${formats.length}</b> (berjalan ${formats.filter(f => f.active).length})`
       ].join("\n"),
@@ -544,8 +544,8 @@ function register(bot, getDeps) {
         RULE,
         `👤 Nama : <b>${esc(acc.label)}</b>`,
         `📞 Nomor : <code>${esc(acc.phone || "-")}</code>`,
-        `Koneksi : ${statusLabel(acc)}`,
-        `Socket : <b>${entry?.open ? "aktif" : "tidak aktif"}</b>`,
+        `🔗 Koneksi : ${statusLabel(acc)}`,
+        `🔌 Socket : <b>${entry?.open ? "aktif" : "tidak aktif"}</b>`,
         `▶️ Promosi berjalan : <b>${formats.filter(f => f.active).length}</b>`,
         `☑️ Grup dipilih : <b>${groups.filter(g => g.enabled && g.can_send).length}</b> dari ${groups.length}`,
         `🕒 Diperbarui : ${esc(dateText(acc.updated_at))}`
@@ -595,9 +595,9 @@ function register(bot, getDeps) {
       kb.push([[`${g.enabled ? "✅" : "⬜"} ${trunc(g.title, 30)}`, `wa:grp:tog:${acc.id}:${g.id}:${backOf(p)}`]]);
     }
     const nav = [];
-    if (p > 0) nav.push(["◀️", navBase(p - 1)]);
-    nav.push(["🏠", "menu:dashboard"]);
-    if (p < pages - 1) nav.push(["▶️", navBase(p + 1)]);
+    if (p > 0) nav.push(["◀️ Sebelumnya", navBase(p - 1)]);
+    nav.push(["🏠 Menu", "menu:dashboard"]);
+    if (p < pages - 1) nav.push(["Berikutnya ▶️", navBase(p + 1)]);
     kb.push(nav);
     kb.push(opts.token
       ? [["⬅️ Semua Grup", `wa:grp:list:${acc.id}:0`], ["➕ Tambah Semua", `wa:grp:all:${acc.id}:${backOf(p)}`]]
@@ -730,7 +730,7 @@ function register(bot, getDeps) {
       text: [
         "🕒 <b>RIWAYAT TERAKHIR</b>",
         RULE,
-        `Akun : <b>${esc(acc.label)}</b>`,
+        `📱 Akun : <b>${esc(acc.label)}</b>`,
         "",
         ...(lines.length ? lines : ["<i>Belum ada riwayat.</i>"])
       ].join("\n"),
