@@ -930,11 +930,14 @@ const DASH_BTN = {
   refresh: { label: "🔄 Refresh", data: "menu:dashboard" }
 };
 
+// Setiap tombol menu utama ditaruh satu baris penuh agar lebarnya seragam dan rapi.
 function ownerDashboardMenu() {
   return buildDashboardKeyboard([
     [DASH_BTN.accounts],
-    [DASH_BTN.add, DASH_BTN.admin],
-    [DASH_BTN.privatePromo, DASH_BTN.whatsapp],
+    [DASH_BTN.add],
+    [DASH_BTN.admin],
+    [DASH_BTN.privatePromo],
+    [DASH_BTN.whatsapp],
     [DASH_BTN.refresh]
   ]);
 }
@@ -944,13 +947,11 @@ function adminDashboardMenu(adminRow = null) {
   const rows = [[DASH_BTN.accounts]];
 
   if (["ADMIN_VIP", "ADMIN_PREMIUM"].includes(role)) {
-    rows.push([DASH_BTN.add, DASH_BTN.admin]);
-    if (role === "ADMIN_PREMIUM") rows.push([DASH_BTN.privatePromo, DASH_BTN.whatsapp]);
-    else rows.push([DASH_BTN.whatsapp]);
-    rows.push([DASH_BTN.refresh]);
+    rows.push([DASH_BTN.add], [DASH_BTN.admin]);
+    if (role === "ADMIN_PREMIUM") rows.push([DASH_BTN.privatePromo]);
+    rows.push([DASH_BTN.whatsapp], [DASH_BTN.refresh]);
   } else {
-    rows.push([DASH_BTN.whatsapp]);
-    rows.push([DASH_BTN.add, DASH_BTN.refresh]);
+    rows.push([DASH_BTN.whatsapp], [DASH_BTN.add], [DASH_BTN.refresh]);
   }
   return buildDashboardKeyboard(rows);
 }

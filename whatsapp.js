@@ -42,7 +42,11 @@ const trunc = (s, n) => Array.from(String(s ?? "")).slice(0, n).join("");
 const mins = m => (m >= 60 && m % 60 === 0 ? `${m / 60} jam` : `${m} menit`);
 const hours = h => (h >= 24 && h % 24 === 0 ? `${h / 24} hari` : `${h} jam`);
 const dateText = v => (v ? new Date(v).toLocaleString("id-ID") : "-");
-const mediaPath = (accId, fmtId) => path.join(MEDIA_ROOT, `${accId}_${fmtId}.jpg`);
+const mediaPath = (accId, fmtId, ext = "jpg") => path.join(MEDIA_ROOT, `${accId}_${fmtId}.${ext}`);
+const clearMedia = (accId, fmtId) => {
+  for (const ext of ["jpg", "mp4"]) fs.rmSync(mediaPath(accId, fmtId, ext), { force: true });
+};
+const isVideoMedia = fmt => /\.mp4$/i.test(String(fmt?.media || ""));
 const sessionDir = id => path.join(SESSION_ROOT, String(id));
 
 function register(bot, getDeps) {
@@ -106,9 +110,10 @@ function register(bot, getDeps) {
     return data;
   }
 
-  async function setAccountStatus(id, status, jid) {
+  async function setAccountStatus(id, status, jid, name) {
     const patch = { status, updated_at: nowIso() };
     if (jid !== undefined) patch.jid = jid;
+    if (name) patch.label = name;
     await db().from("wa_accounts").update(patch).eq("id", id);
   }
 
@@ -235,7 +240,8 @@ function register(bot, getDeps) {
         if (connection === "open") {
           entry.open = true;
           const jid = sock.user?.id ? `${sock.user.id.split(":")[0]}@s.whatsapp.net` : null;
-          await setAccountStatus(acc.id, "connected", jid);
+          const waName = sock.user?.name ? trunc(String(sock.user.name).trim(), 60) : "";
+          await setAccountStatus(acc.id, "connected", jid, waName || undefined);
           const total = await refreshGroups(acc.id, sock).catch(() => 0);
           if (notifyTg) {
             await bot.api.sendMessage(notifyTg,
@@ -319,10 +325,10 @@ function register(bot, getDeps) {
 
   async function sendFormat(sock, jid, fmt) {
     if (fmt.media && fs.existsSync(fmt.media)) {
-      return sock.sendMessage(jid, {
-        image: fs.readFileSync(fmt.media),
-        caption: fmt.message || undefined
-      });
+      const buffer = fs.readFileSync(fmt.media);
+      const caption = fmt.message || undefined;
+      if (isVideoMedia(fmt)) return sock.sendMessage(jid, { video: buffer, caption, mimetype: "video/mp4" });
+      return sock.sendMessage(jid, { image: buffer, caption });
     }
     return sock.sendMessage(jid, { text: fmt.message });
   }
@@ -450,16 +456,18 @@ function register(bot, getDeps) {
     const g = groups || [];
     return {
       text: [
-        `📱 <b>${esc(acc.label)}</b>`,
+        "📱 <b>AKUN WHATSAPP</b>",
         RULE,
+        `👤 Nama: <b>${esc(acc.label)}</b>`,
+        `📞 Nomor: <code>${esc(acc.phone || "-")}</code>`,
         `Status: ${statusLabel(acc)}`,
-        `Nomor: <code>${esc(acc.phone || "-")}</code>`,
         `Grup target aktif: <b>${g.filter(x => x.enabled).length}</b> dari ${g.length}`,
         `Format: <b>${formats.length}</b> (berjalan ${formats.filter(f => f.active).length})`
       ].join("\n"),
       kb: buildKb([
         [["📝 Format", `wa:fmt:list:${acc.id}:0`], ["🎯 Grup Target", `wa:grp:list:${acc.id}:0`]],
-        [["🔄 Muat Ulang Grup", `wa:grp:refresh:${acc.id}`], ["🕒 Riwayat", `wa:hist:${acc.id}`]],
+        [["🔄 Muat Ulang Grup", `wa:grp:refresh:${acc.id}`]],
+        [["🕒 Riwayat", `wa:hist:${acc.id}`]],
         [["🗑️ Hapus Akun", `wa:acc:del:${acc.id}`]],
         [["⬅️ Daftar Akun", "wa:acc:list:0"]]
       ])
@@ -495,6 +503,7 @@ function register(bot, getDeps) {
       kb: buildKb([
         ...rows,
         nav,
+        total ? [["✅ Pilih Semua Group", `wa:grp:all:${acc.id}:${page}`]] : [],
         [["🔄 Muat Ulang Grup", `wa:grp:refresh:${acc.id}`]],
         [["⬅️ Kembali", `wa:acc:view:${acc.id}`]]
       ])
@@ -533,10 +542,10 @@ function register(bot, getDeps) {
     const f = fmt.id;
     const preview = fmt.message ? esc(trunc(fmt.message, 400)) : "<i>Belum diisi</i>";
     const lines = [
-      `${fmt.active ? "▶️" : "⏹"} <b>${esc(fmt.name)}</b>`,
+      `${fmt.active ? "▶️" : "⏹"} <b>${esc(trunc(fmt.name, 100))}</b>`,
       RULE,
       `Status: ${fmt.active ? "Berjalan" : "Berhenti"}`,
-      `Jenis: ${fmt.media ? "🖼️ Foto + teks" : "📝 Teks saja"}`,
+      `Jenis: ${fmt.media ? (isVideoMedia(fmt) ? "🎬 Video + teks" : "🖼️ Foto + teks") : "📝 Teks saja"}`,
       `Jeda: <b>${mins(fmt.interval_minutes)}</b> · Durasi: <b>${hours(fmt.duration_hours)}</b>`
     ];
     if (fmt.active && fmt.expires_at) lines.push(`Berakhir: ${esc(dateText(fmt.expires_at))}`);
@@ -547,8 +556,8 @@ function register(bot, getDeps) {
       kb: buildKb([
         [["✏️ Ubah Pesan", `wa:fmt:ask:msg:${id}:${f}`]],
         [
-          [fmt.media ? "🔁 Ganti Foto" : "🖼️ Tambah Foto", `wa:fmt:ask:photo:${id}:${f}`],
-          fmt.media ? ["🗑️ Hapus Foto", `wa:fmt:nophoto:${id}:${f}`] : null
+          [fmt.media ? "🔁 Ganti Media" : "🖼️ Tambah Foto/Video", `wa:fmt:ask:photo:${id}:${f}`],
+          fmt.media ? ["🗑️ Hapus Media", `wa:fmt:nophoto:${id}:${f}`] : null
         ],
         [["⏱️ Jeda", `wa:fmt:ask:interval:${id}:${f}`], ["📅 Durasi", `wa:fmt:ask:duration:${id}:${f}`]],
         [fmt.active ? ["⏹ Stop", `wa:fmt:stop:${id}:${f}`] : ["▶️ Mulai", `wa:fmt:start:${id}:${f}`]],
@@ -586,7 +595,7 @@ function register(bot, getDeps) {
 
   const ASK = {
     msg: "✏️ Kirim isi pesan promosi sekarang.\nBisa memakai emoji dan format WhatsApp: *tebal*, _miring_, ~coret~.",
-    photo: "🖼️ Kirim foto (sebagai foto, bukan file). Isi pesan akan dipakai sebagai caption.",
+    photo: "🖼️ Kirim <b>foto</b> atau <b>video</b> (sebagai media, bukan file). Isi pesan akan dipakai sebagai caption.\nUkuran file maksimal 20 MB.",
     interval: `⏱️ Kirim jeda antar putaran, minimal ${MIN_INTERVAL_MIN} menit.\nContoh: 30 menit, 1 jam`,
     duration: "📅 Kirim durasi promosi.\nContoh: 1 jam, 3 hari"
   };
@@ -675,7 +684,7 @@ function register(bot, getDeps) {
       for (const f of await loadFormats(acc.id)) {
         const t = tasks.get(`${acc.id}:${f.id}`);
         if (t) t.running = false;
-        fs.rmSync(mediaPath(acc.id, f.id), { force: true });
+        clearMedia(acc.id, f.id);
       }
       await stopSocket(acc.id, { logout: true });
       wipeSession(acc.id);
@@ -699,6 +708,13 @@ function register(bot, getDeps) {
         .eq("id", gid).eq("account_id", acc.id).maybeSingle();
       if (g) await db().from("wa_account_groups").update({ enabled: !g.enabled }).eq("id", gid);
       return show(ctx, await screenGroups(acc, Number(ctx.match[3])));
+    })));
+
+  bot.callbackQuery(/^wa:grp:all:(\d+):(\d+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc => {
+      await db().from("wa_account_groups").update({ enabled: true })
+        .eq("account_id", acc.id).eq("can_send", true);
+      return show(ctx, await screenGroups(acc, Number(ctx.match[2])));
     })));
 
   bot.callbackQuery(/^wa:grp:refresh:(\d+)$/, guard((ctx, admin) =>
@@ -729,7 +745,7 @@ function register(bot, getDeps) {
     withAccount(ctx, admin, ctx.match[1], async acc => {
       setFlow(ctx.from.id, { t: "name", accountId: acc.id });
       await show(ctx, {
-        text: `📝 <b>FORMAT BARU</b>\n${RULE}\nKirim nama format (maks 40 karakter).\nNama ini hanya untuk pengenal di menu.`,
+        text: `📝 <b>FORMAT BARU</b>\n${RULE}\nKirim nama format.\nNama ini hanya untuk pengenal di menu.`,
         kb: buildKb([[["❌ Batal", `wa:fmt:list:${acc.id}:0`]]])
       });
     })));
@@ -750,7 +766,7 @@ function register(bot, getDeps) {
 
   bot.callbackQuery(/^wa:fmt:nophoto:(\d+):([a-f0-9]+)$/, guard((ctx, admin) =>
     withFormat(ctx, admin, ctx.match[1], ctx.match[2], async (acc, fmt) => {
-      fs.rmSync(mediaPath(acc.id, fmt.id), { force: true });
+      clearMedia(acc.id, fmt.id);
       await updateFormat(acc.id, fmt.id, { media: null });
       return show(ctx, await screenFormat(acc, await getFormat(acc.id, fmt.id)));
     })));
@@ -778,7 +794,7 @@ function register(bot, getDeps) {
 
   bot.callbackQuery(/^wa:fmt:del:(\d+):([a-f0-9]+)$/, guard((ctx, admin) =>
     withFormat(ctx, admin, ctx.match[1], ctx.match[2], async (acc, fmt) => show(ctx, confirmScreen(
-      `🗑️ <b>HAPUS FORMAT?</b>\n${RULE}\nFormat <b>${esc(fmt.name)}</b> dan fotonya akan dihapus.`,
+      `🗑️ <b>HAPUS FORMAT?</b>\n${RULE}\nFormat <b>${esc(trunc(fmt.name, 100))}</b> dan fotonya akan dihapus.`,
       `wa:fmt:delok:${acc.id}:${fmt.id}`,
       `wa:fmt:view:${acc.id}:${fmt.id}`
     )))));
@@ -787,7 +803,7 @@ function register(bot, getDeps) {
     withFormat(ctx, admin, ctx.match[1], ctx.match[2], async (acc, fmt) => {
       const t = tasks.get(`${acc.id}:${fmt.id}`);
       if (t) t.running = false;
-      fs.rmSync(mediaPath(acc.id, fmt.id), { force: true });
+      clearMedia(acc.id, fmt.id);
       const formats = (await loadFormats(acc.id)).filter(f => f.id !== fmt.id);
       await saveFormats(acc.id, formats);
       return show(ctx, await screenFormatList(acc, 0));
@@ -809,7 +825,7 @@ function register(bot, getDeps) {
 
     try {
       if (flow.t === "photo") {
-        return note(tgId, "🖼️ Kirim <b>foto</b> untuk format ini, atau tekan Batal.", cancelKb(flow.accountId, flow.formatId));
+        return note(tgId, "🖼️ Kirim <b>foto</b> atau <b>video</b> untuk format ini, atau tekan Batal.", cancelKb(flow.accountId, flow.formatId));
       }
 
       if (flow.t === "phone") {
@@ -834,8 +850,8 @@ function register(bot, getDeps) {
       if (!acc) { clearFlow(tgId); return note(tgId, denied().text, backKb); }
 
       if (flow.t === "name") {
-        if (!text || text.length > 40) {
-          return note(tgId, "❌ Nama format 1–40 karakter.", buildKb([[["❌ Batal", `wa:fmt:list:${acc.id}:0`]]]));
+        if (!text) {
+          return note(tgId, "❌ Nama format tidak boleh kosong.", buildKb([[["❌ Batal", `wa:fmt:list:${acc.id}:0`]]]));
         }
         const fmt = {
           id: newId(),
@@ -854,12 +870,12 @@ function register(bot, getDeps) {
         await saveFormats(acc.id, formats);
         setFlow(tgId, { t: "msg", accountId: acc.id, formatId: fmt.id });
         return note(tgId,
-          `✅ Format <b>${esc(text)}</b> dibuat.\n\n✏️ Kirim isi pesan promosinya sekarang.`,
+          `✅ Format <b>${esc(trunc(text, 100))}</b> dibuat.\n\n✏️ Kirim isi pesan promosinya sekarang.`,
           cancelKb(acc.id, fmt.id));
       }
 
       if (flow.t === "msg") {
-        if (!text || text.length > 4000) return note(tgId, "❌ Isi pesan 1–4000 karakter.", cancelKb(acc.id, flow.formatId));
+        if (!text) return note(tgId, "❌ Isi pesan tidak boleh kosong.", cancelKb(acc.id, flow.formatId));
         await updateFormat(acc.id, flow.formatId, { message: text });
         clearFlow(tgId);
         return showFormatNote(tgId, acc, flow.formatId);
@@ -893,7 +909,7 @@ function register(bot, getDeps) {
 
   /* ---------- Input foto (gambar format) ---------- */
 
-  bot.on("message:photo", async (ctx, next) => {
+  bot.on(["message:photo", "message:video"], async (ctx, next) => {
     const flow = getFlow(ctx.from.id);
     if (!flow) return next();
     const tgId = ctx.from.id;
@@ -909,12 +925,14 @@ function register(bot, getDeps) {
       const acc = await visibleAccount(flow.accountId, admin);
       if (!acc) { clearFlow(tgId); return note(tgId, denied().text, backKb); }
 
-      const photo = ctx.message.photo[ctx.message.photo.length - 1];
-      const file = await ctx.api.getFile(photo.file_id);
+      const isVideo = !!ctx.message.video;
+      const fileId = isVideo ? ctx.message.video.file_id : ctx.message.photo[ctx.message.photo.length - 1].file_id;
+      const file = await ctx.api.getFile(fileId);
       const res = await fetch(`https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`);
       if (!res.ok) throw new Error("Gagal mengunduh foto dari Telegram.");
 
-      const dest = mediaPath(acc.id, flow.formatId);
+      clearMedia(acc.id, flow.formatId);
+      const dest = mediaPath(acc.id, flow.formatId, isVideo ? "mp4" : "jpg");
       fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
       await updateFormat(acc.id, flow.formatId, { media: dest });
       clearFlow(tgId);
