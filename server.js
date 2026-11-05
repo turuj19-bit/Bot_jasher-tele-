@@ -2697,6 +2697,11 @@ async function sendPromotionReport(account, format, total, success, failed, fail
   ).catch(e => console.warn("PROMOTION REPORT:", safeErrorMessage(e, 220)));
 }
 
+// Anti-flood: jeda antar grup + lanjut dari grup terakhir kalau Telegram minta menunggu lama.
+const PROMO_GAP_MS = Math.max(0, Number(process.env.PROMO_SEND_GAP_MS || 2500));
+const PROMO_FLOOD_INLINE_MAX_MS = 90000; // flood wait <= 90 dtk: tunggu lalu coba lagi grup yang sama
+const promoCursors = new Map();          // `${accountId}:${formatId}` -> index grup untuk siklus berikutnya
+
 async function fireFormat(accountId, formatId) {
   const account = await getAccount(accountId);
   const format = await getPromotionFormat(accountId, formatId);
@@ -2757,7 +2762,30 @@ async function fireFormat(accountId, formatId) {
   let floodWaitMs = 0;
   const failures = [];
 
-  for (const group of groups) {
+  // Lanjut dari grup yang tertunda di siklus sebelumnya (kalau ada), supaya
+  // grup di urutan belakang tidak selalu kebagian paling akhir / tidak pernah terkirim.
+  const cursorKey = `${accountId}:${formatId}`;
+  let startIdx = Number(promoCursors.get(cursorKey) || 0);
+  if (!Number.isFinite(startIdx) || startIdx < 0 || startIdx >= groups.length) startIdx = 0;
+  promoCursors.delete(cursorKey);
+  const ordered = startIdx ? groups.slice(startIdx).concat(groups.slice(0, startIdx)) : groups;
+
+  let aborted = false;
+  let floodRetries = 0;
+
+  for (let gi = 0; gi < ordered.length; gi++) {
+    const group = ordered[gi];
+
+    if (aborted) {
+      // Telegram minta menunggu lama: sisa grup ditunda ke siklus berikutnya, bukan dipaksa kirim.
+      fail++;
+      failures.push({ groupId: group.id, groupTitle: group.title, reason: "Ditunda, Telegram meminta menunggu sebelum mengirim lagi" });
+      continue;
+    }
+
+    // Jeda antar grup agar tidak kena FLOOD_WAIT.
+    if (gi > 0 && PROMO_GAP_MS > 0) await sleepMs(PROMO_GAP_MS + Math.floor(Math.random() * 800));
+
     let target = entityMap.get(String(group.telegram_group_id));
 
     if (!target) {
@@ -2816,6 +2844,7 @@ async function fireFormat(accountId, formatId) {
       }
 
       success++;
+      floodRetries = 0;
       await recordHistory(accountId, null, {
         accountLabel: account.label,
         action: "promotion_send",
@@ -2825,10 +2854,26 @@ async function fireFormat(accountId, formatId) {
         details: { format_id: format.id, format_name: format.name }
       });
     } catch (e) {
+      const fw = extractFloodWaitMs(e);
+      if (fw > 0) {
+        if (fw <= PROMO_FLOOD_INLINE_MAX_MS && floodRetries < 3) {
+          // Flood wait pendek: tunggu, lalu ulangi grup yang sama.
+          floodRetries++;
+          console.warn(`PROMOTION FLOOD_WAIT ${Math.round(fw / 1000)}s account=${accountId} format=${formatId}, menunggu lalu ulangi`);
+          await sleepMs(fw);
+          gi--;
+          continue;
+        }
+        // Flood wait panjang: hentikan siklus ini, lanjutkan dari grup ini di siklus berikutnya.
+        aborted = true;
+        promoCursors.set(cursorKey, (startIdx + gi) % groups.length);
+        console.warn(`PROMOTION FLOOD_WAIT ${Math.round(fw / 1000)}s account=${accountId} format=${formatId}, siklus dihentikan, sisa grup ditunda`);
+      }
+      floodRetries = 0;
       fail++;
       const reason = classifySendError(e);
       failures.push({ groupId: group.id, groupTitle: group.title, reason });
-      floodWaitMs = Math.max(floodWaitMs, extractFloodWaitMs(e));
+      floodWaitMs = Math.max(floodWaitMs, fw);
 
       console.warn(
         `PROMOTION SEND FAIL account=${accountId} group=${group.id} title=${JSON.stringify(truncateText(group.title, 80))} ` +
@@ -7879,6 +7924,43 @@ async function gracefulShutdown(signal) {
 
   process.exit(0);
 }
+
+// Anti-crash: error tak tertangani dari library Telegram/WhatsApp cukup dicatat,
+// jangan sampai mematikan seluruh bot (yang membuat promosi berhenti diam-diam).
+process.on("unhandledRejection", reason => {
+  console.error("UNHANDLED REJECTION:", safeErrorMessage(reason, 500));
+});
+process.on("uncaughtException", err => {
+  console.error("UNCAUGHT EXCEPTION:", safeErrorMessage(err, 500));
+});
+
+// Watchdog: tiap 60 detik pastikan semua format yang aktif punya timer jalan.
+// Kalau timer-nya mati (mis. akibat error), dijadwalkan ulang otomatis.
+let promoWatchdogBusy = false;
+setInterval(async () => {
+  if (promoWatchdogBusy) return;
+  promoWatchdogBusy = true;
+  try {
+    const { data } = await sb.from("telegram_accounts").select("id");
+    for (const row of data || []) {
+      const formats = await getPromotionFormats(row.id);
+      for (const f of formats) {
+        if (!f.active) continue;
+        if (!f.expires_at || new Date(f.expires_at) <= new Date()) continue;
+        const task = schedulerTasks.get(schedulerKey(row.id, f.id));
+        const dead = !task || (!task.firing && !task.timeout);
+        if (dead) {
+          console.warn(`PROMO WATCHDOG: timer format ${f.id} akun ${row.id} mati, dijadwalkan ulang`);
+          scheduleFormat(row.id, f.id, 0);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("PROMO WATCHDOG:", safeErrorMessage(e, 200));
+  } finally {
+    promoWatchdogBusy = false;
+  }
+}, 60000);
 
 process.once("SIGINT", () => {
   void gracefulShutdown("SIGINT");

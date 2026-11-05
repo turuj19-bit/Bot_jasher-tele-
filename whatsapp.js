@@ -40,7 +40,10 @@ const PAGE = 8;
 const DEFAULT_INTERVAL_SEC = 30 * 60;   // jeda bawaan antar putaran (detik); bebas diubah tanpa batas minimum
 const GROUP_DELAY_MIN_MS = 1000;        // jeda antar grup: 1 detik
 const GROUP_DELAY_MAX_MS = 1000;
-const DAILY_CAP = 200;                  // maksimal kirim per akun per hari
+// Batas kirim per akun per hari (reset ganti hari UTC). Atur lewat env WA_DAILY_CAP; 0 = tanpa batas.
+const DAILY_CAP = Number.isFinite(Number(process.env.WA_DAILY_CAP)) && process.env.WA_DAILY_CAP !== undefined && process.env.WA_DAILY_CAP !== ""
+  ? Number(process.env.WA_DAILY_CAP)
+  : 5000;
 const FLOW_TTL_MS = 10 * 60 * 1000;
 // Lama kode pairing dianggap berlaku. Lewat dari ini bot kirim pemberitahuan "kedaluwarsa".
 const PAIRING_TTL_MS = Math.max(30, Number(process.env.WA_PAIRING_TTL_SEC) || 120) * 1000;
@@ -559,7 +562,7 @@ function register(bot, getDeps) {
   function overDailyCap(id) {
     const today = nowIso().slice(0, 10);
     const cur = daily.get(String(id));
-    return !!cur && cur.day === today && cur.n >= DAILY_CAP;
+    return DAILY_CAP > 0 && !!cur && cur.day === today && cur.n >= DAILY_CAP;
   }
 
   async function waitTask(task, ms) {
@@ -604,6 +607,9 @@ function register(bot, getDeps) {
       `Berhasil terkirim: <b>${round.ok}</b>`,
       `Gagal: <b>${round.fail.length}</b>`
     ];
+    if (round.capped) {
+      lines.push("", `⚠️ <b>Putaran terpotong:</b> batas kirim harian (${DAILY_CAP}) tercapai, promosi lanjut otomatis setelah reset harian.`);
+    }
     if (reasons.size) {
       lines.push("", "❌ <b>Ringkasan gagal:</b>");
       for (const [reason, n] of reasons) lines.push(`• ${n} grup — ${esc(trunc(reason, 160))}`);
@@ -642,11 +648,12 @@ function register(bot, getDeps) {
           const { data: acc } = await db().from("wa_accounts").select("*").eq("id", accountId).maybeSingle();
           const groups = await enabledGroups(accountId);
 
-          const round = { ok: 0, fail: [] };
+          const round = { ok: 0, fail: [], capped: false };
           for (const g of groups) {
             if (!task.running) break;
             if (overDailyCap(accountId)) {
-              await waitTask(task, 60 * 60 * 1000);
+              // Jangan menunggu di sini: laporan dikirim dulu, baru menunggu.
+              round.capped = true;
               break;
             }
             const sock = sockets.get(String(accountId))?.sock;
@@ -669,6 +676,11 @@ function register(bot, getDeps) {
           }
 
           if (round.ok + round.fail.length) await sendRoundReport(acc, fmt, round).catch(() => {});
+          if (round.capped) {
+            console.warn("WA LOOP: batas harian", DAILY_CAP, "tercapai untuk akun", accountId, "- menunggu 1 jam");
+            await waitTask(task, 60 * 60 * 1000);
+            continue;
+          }
           // Jeda bebas (detik pun bisa). Putaran tanpa grup ditunggu min. 10 detik agar tidak looping rapat.
           const gapMs = intervalSec(fmt) * 1000;
           await waitTask(task, round.ok + round.fail.length ? gapMs : Math.max(gapMs, 10000));
