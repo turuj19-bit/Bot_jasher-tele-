@@ -1045,13 +1045,13 @@ function activeFormatKeyboard(formats, accountId) {
 
 function formatDelayKeyboard(accountId, formatId) {
   return new InlineKeyboard()
+    .text("1 menit", `promo:delayset:${accountId}:${formatId}:1`)
     .text("5 menit", `promo:delayset:${accountId}:${formatId}:5`)
+    .row()
     .text("10 menit", `promo:delayset:${accountId}:${formatId}:10`)
-    .row()
     .text("30 menit", `promo:delayset:${accountId}:${formatId}:30`)
-    .text("1 jam", `promo:delayset:${accountId}:${formatId}:60`)
     .row()
-    .text("2 jam", `promo:delayset:${accountId}:${formatId}:120`)
+    .text("1 jam", `promo:delayset:${accountId}:${formatId}:60`)
     .row()
     .text("⌨️ Ketik sendiri", `promo:delay:${accountId}:${formatId}`)
     .row()
@@ -1090,7 +1090,7 @@ function groupListKeyboard(rows, accountId, page, hasNext) {
 
   // Hanya grup yang bisa dikirimi pesan tampil sebagai target. Tekan nama grup untuk pilih / batal.
   for (const group of rows.filter(g => g.can_send)) {
-    const icon = group.enabled ? "✅" : "⬜";
+    const icon = group.enabled ? "✅" : "❎";
     kb.text(`${icon} ${safeButtonText(group.title, 34)}`, `group:toggle:${group.id}:${page}`).row();
   }
 
@@ -1101,6 +1101,7 @@ function groupListKeyboard(rows, accountId, page, hasNext) {
   kb.text("🔎 Cari Grup", `group:search:${accountId}`).text("⬅️ Akun", `account:open:${accountId}`).row();
   // Dua tombol memanjang di bagian paling bawah.
   kb.text("➕ Tambah Semua Grup", `group:all:${accountId}`).row();
+  kb.text("❎ Batalkan Semua Grup", `group:none:${accountId}`).row();
   kb.text("🔄 Deteksi Grup", `group:refresh:${accountId}`);
   return kb;
 }
@@ -2666,6 +2667,7 @@ async function sendPromotionReport(account, format, total, success, failed, fail
   const lines = [
     "📊 <b>HASIL PROMOSI</b>",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "📲 <b>Akun:</b> Telegram",
     `📝 <b>Format:</b> ${escapeHtml(format.name || "-")}`,
     `👤 <b>Nama:</b> ${escapeHtml(accountName)}`,
     `🔗 <b>Username:</b> ${escapeHtml(accountUsername ? `@${accountUsername}` : "-")}`,
@@ -2696,11 +2698,6 @@ async function sendPromotionReport(account, format, total, success, failed, fail
     }
   ).catch(e => console.warn("PROMOTION REPORT:", safeErrorMessage(e, 220)));
 }
-
-// Anti-flood: jeda antar grup + lanjut dari grup terakhir kalau Telegram minta menunggu lama.
-const PROMO_GAP_MS = Math.max(0, Number(process.env.PROMO_SEND_GAP_MS || 2500));
-const PROMO_FLOOD_INLINE_MAX_MS = 90000; // flood wait <= 90 dtk: tunggu lalu coba lagi grup yang sama
-const promoCursors = new Map();          // `${accountId}:${formatId}` -> index grup untuk siklus berikutnya
 
 async function fireFormat(accountId, formatId) {
   const account = await getAccount(accountId);
@@ -2762,30 +2759,7 @@ async function fireFormat(accountId, formatId) {
   let floodWaitMs = 0;
   const failures = [];
 
-  // Lanjut dari grup yang tertunda di siklus sebelumnya (kalau ada), supaya
-  // grup di urutan belakang tidak selalu kebagian paling akhir / tidak pernah terkirim.
-  const cursorKey = `${accountId}:${formatId}`;
-  let startIdx = Number(promoCursors.get(cursorKey) || 0);
-  if (!Number.isFinite(startIdx) || startIdx < 0 || startIdx >= groups.length) startIdx = 0;
-  promoCursors.delete(cursorKey);
-  const ordered = startIdx ? groups.slice(startIdx).concat(groups.slice(0, startIdx)) : groups;
-
-  let aborted = false;
-  let floodRetries = 0;
-
-  for (let gi = 0; gi < ordered.length; gi++) {
-    const group = ordered[gi];
-
-    if (aborted) {
-      // Telegram minta menunggu lama: sisa grup ditunda ke siklus berikutnya, bukan dipaksa kirim.
-      fail++;
-      failures.push({ groupId: group.id, groupTitle: group.title, reason: "Ditunda, Telegram meminta menunggu sebelum mengirim lagi" });
-      continue;
-    }
-
-    // Jeda antar grup agar tidak kena FLOOD_WAIT.
-    if (gi > 0 && PROMO_GAP_MS > 0) await sleepMs(PROMO_GAP_MS + Math.floor(Math.random() * 800));
-
+  for (const group of groups) {
     let target = entityMap.get(String(group.telegram_group_id));
 
     if (!target) {
@@ -2844,7 +2818,6 @@ async function fireFormat(accountId, formatId) {
       }
 
       success++;
-      floodRetries = 0;
       await recordHistory(accountId, null, {
         accountLabel: account.label,
         action: "promotion_send",
@@ -2854,26 +2827,10 @@ async function fireFormat(accountId, formatId) {
         details: { format_id: format.id, format_name: format.name }
       });
     } catch (e) {
-      const fw = extractFloodWaitMs(e);
-      if (fw > 0) {
-        if (fw <= PROMO_FLOOD_INLINE_MAX_MS && floodRetries < 3) {
-          // Flood wait pendek: tunggu, lalu ulangi grup yang sama.
-          floodRetries++;
-          console.warn(`PROMOTION FLOOD_WAIT ${Math.round(fw / 1000)}s account=${accountId} format=${formatId}, menunggu lalu ulangi`);
-          await sleepMs(fw);
-          gi--;
-          continue;
-        }
-        // Flood wait panjang: hentikan siklus ini, lanjutkan dari grup ini di siklus berikutnya.
-        aborted = true;
-        promoCursors.set(cursorKey, (startIdx + gi) % groups.length);
-        console.warn(`PROMOTION FLOOD_WAIT ${Math.round(fw / 1000)}s account=${accountId} format=${formatId}, siklus dihentikan, sisa grup ditunda`);
-      }
-      floodRetries = 0;
       fail++;
       const reason = classifySendError(e);
       failures.push({ groupId: group.id, groupTitle: group.title, reason });
-      floodWaitMs = Math.max(floodWaitMs, fw);
+      floodWaitMs = Math.max(floodWaitMs, extractFloodWaitMs(e));
 
       console.warn(
         `PROMOTION SEND FAIL account=${accountId} group=${group.id} title=${JSON.stringify(truncateText(group.title, 80))} ` +
@@ -5405,7 +5362,7 @@ function rememberGroupSearch(accountId, query, page = 0) {
 function groupSearchKeyboard(rows, accountId, token, page, hasNext) {
   const kb = new InlineKeyboard();
   for (const group of rows) {
-    const icon = group.enabled ? "✅" : "❌";
+    const icon = group.enabled ? "✅" : "❎";
     kb.text(`${icon} ${safeButtonText(group.title, 34)}`, `group:searchtoggle:${group.id}:${token}`).row();
   }
   if (page > 0) kb.text("◀️", `group:searchpage:${token}:${page - 1}`);
@@ -5439,7 +5396,7 @@ async function renderGroupSearch(ctx, token, page = 0) {
     `Ditemukan: <b>${total}</b>`,
     `Halaman: <b>${safePage + 1}</b>`,
     "",
-    rows.length ? rows.map(g => `${g.enabled ? "✅" : "❌"} <b>${escapeHtml(g.title)}</b>`).join("\n\n") : "<i>Tidak ada grup yang mengandung kata tersebut.</i>",
+    rows.length ? rows.map(g => `${g.enabled ? "✅" : "❎"} <b>${escapeHtml(g.title)}</b>`).join("\n\n") : "<i>Tidak ada grup yang mengandung kata tersebut.</i>",
     "",
     "Tekan nama grup untuk memilih / membatalkan target."
   ].join("\n");
@@ -5484,6 +5441,8 @@ bot.callbackQuery(/^group:searchtoggle:(\d+):([a-f0-9]+)$/, async ctx => {
   return renderGroupSearch(ctx, token, state.page);
 });
 
+const groupAutoRefreshAt = new Map(); // accountId -> waktu auto-refresh grup terakhir
+
 bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
   const adminRow = await requireAdmin(ctx);
   if (!adminRow) return;
@@ -5496,6 +5455,18 @@ bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
 
   if (!account) {
     return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  // Masuk menu grup (halaman pertama): daftar grup otomatis disegarkan. Dibatasi 1x per 45 detik per akun
+  // agar tidak membebani Telegram. Kalau gagal (mis. akun belum terhubung), menu tetap tampil dari data tersimpan.
+  if (requestedPage === 0) {
+    const lastSync = groupAutoRefreshAt.get(accountId) || 0;
+    if (Date.now() - lastSync > 45000) {
+      groupAutoRefreshAt.set(accountId, Date.now());
+      try {
+        await withChatLoading(ctx, "Menyegarkan daftar grup...", () => refreshGroups(accountId));
+      } catch (_) { /* tampilkan data yang sudah tersimpan */ }
+    }
   }
 
   try {
@@ -5529,7 +5500,7 @@ bot.callbackQuery(/^group:list:(\d+):(\d+)$/, async ctx => {
       `☑️ Dipilih : <b>${activeCountResult.count || 0}</b>`,
       `📄 Halaman : <b>${page + 1}</b>`,
       "",
-      "<blockquote>✅ = jadi target promosi\n⬜ = belum dipilih</blockquote>",
+      "<blockquote>✅ = jadi target promosi\n❎ = belum dipilih</blockquote>",
       result.rows.length ? "" : "<i>Belum ada grup. Tekan Deteksi Grup untuk memuat grup.</i>",
       "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     ].filter(Boolean).join("\n");
@@ -5642,7 +5613,7 @@ async function renderGroupPageDirect(ctx, accountId, page, prefix = "") {
     `☑️ Dipilih : <b>${activeCountResult.count || 0}</b>`,
     `📄 Halaman : <b>${page + 1}</b>`,
     "",
-    "<blockquote>✅ = jadi target promosi\n⬜ = belum dipilih</blockquote>",
+    "<blockquote>✅ = jadi target promosi\n❎ = belum dipilih</blockquote>",
     result.rows.length ? "" : "<i>Belum ada grup.</i>",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━"
   ].filter(Boolean).join("\n");
@@ -5700,6 +5671,48 @@ bot.callbackQuery(/^group:toggle:(\d+):(\d+)$/, async ctx => {
   });
 
   return renderGroupPageDirect(ctx, group.data.account_id, page);
+});
+
+/* Batalkan pilihan semua grup (tidak ada grup yang jadi target). */
+bot.callbackQuery(/^group:none:(\d+)$/, async ctx => {
+  const adminRow = await requireAdmin(ctx);
+  if (!adminRow) return;
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  const accountId = String(ctx.match[1]);
+  if (!await requireAccountAccess(ctx, adminRow, accountId)) return;
+  const account = await getAccount(accountId);
+  if (!account) {
+    return replaceUi(ctx, "❌ Account tidak ditemukan.", backDashboardKeyboard(), { parse_mode: "HTML" });
+  }
+
+  try {
+    const { error } = await sb
+      .from("account_groups")
+      .update({ enabled: false })
+      .eq("account_id", accountId)
+      .eq("enabled", true);
+    if (error) throw error;
+
+    await Promise.resolve(recordHistory(accountId, adminRow.id, {
+      action: "group_disable_all",
+      status: "success"
+    })).catch(() => {});
+
+    return renderGroupPageDirect(
+      ctx,
+      accountId,
+      0,
+      "❎ <b>Semua grup dibatalkan.</b>\n\nTidak ada grup yang dipilih sebagai target promosi."
+    );
+  } catch (e) {
+    return replaceUi(
+      ctx,
+      `❌ Gagal membatalkan pilihan grup.\n\n${escapeHtml(safeErrorMessage(e))}`,
+      new InlineKeyboard().text("◀️ Account", `account:open:${accountId}`),
+      { parse_mode: "HTML" }
+    );
+  }
 });
 
 /* Add/select all writable groups for this account in one action. */
@@ -7924,43 +7937,6 @@ async function gracefulShutdown(signal) {
 
   process.exit(0);
 }
-
-// Anti-crash: error tak tertangani dari library Telegram/WhatsApp cukup dicatat,
-// jangan sampai mematikan seluruh bot (yang membuat promosi berhenti diam-diam).
-process.on("unhandledRejection", reason => {
-  console.error("UNHANDLED REJECTION:", safeErrorMessage(reason, 500));
-});
-process.on("uncaughtException", err => {
-  console.error("UNCAUGHT EXCEPTION:", safeErrorMessage(err, 500));
-});
-
-// Watchdog: tiap 60 detik pastikan semua format yang aktif punya timer jalan.
-// Kalau timer-nya mati (mis. akibat error), dijadwalkan ulang otomatis.
-let promoWatchdogBusy = false;
-setInterval(async () => {
-  if (promoWatchdogBusy) return;
-  promoWatchdogBusy = true;
-  try {
-    const { data } = await sb.from("telegram_accounts").select("id");
-    for (const row of data || []) {
-      const formats = await getPromotionFormats(row.id);
-      for (const f of formats) {
-        if (!f.active) continue;
-        if (!f.expires_at || new Date(f.expires_at) <= new Date()) continue;
-        const task = schedulerTasks.get(schedulerKey(row.id, f.id));
-        const dead = !task || (!task.firing && !task.timeout);
-        if (dead) {
-          console.warn(`PROMO WATCHDOG: timer format ${f.id} akun ${row.id} mati, dijadwalkan ulang`);
-          scheduleFormat(row.id, f.id, 0);
-        }
-      }
-    }
-  } catch (e) {
-    console.warn("PROMO WATCHDOG:", safeErrorMessage(e, 200));
-  } finally {
-    promoWatchdogBusy = false;
-  }
-}, 60000);
 
 process.once("SIGINT", () => {
   void gracefulShutdown("SIGINT");

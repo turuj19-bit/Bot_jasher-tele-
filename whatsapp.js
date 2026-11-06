@@ -40,10 +40,6 @@ const PAGE = 8;
 const DEFAULT_INTERVAL_SEC = 30 * 60;   // jeda bawaan antar putaran (detik); bebas diubah tanpa batas minimum
 const GROUP_DELAY_MIN_MS = 1000;        // jeda antar grup: 1 detik
 const GROUP_DELAY_MAX_MS = 1000;
-// Batas kirim per akun per hari (reset ganti hari UTC). Atur lewat env WA_DAILY_CAP; 0 = tanpa batas.
-const DAILY_CAP = Number.isFinite(Number(process.env.WA_DAILY_CAP)) && process.env.WA_DAILY_CAP !== undefined && process.env.WA_DAILY_CAP !== ""
-  ? Number(process.env.WA_DAILY_CAP)
-  : 5000;
 const FLOW_TTL_MS = 10 * 60 * 1000;
 // Lama kode pairing dianggap berlaku. Lewat dari ini bot kirim pemberitahuan "kedaluwarsa".
 const PAIRING_TTL_MS = Math.max(30, Number(process.env.WA_PAIRING_TTL_SEC) || 120) * 1000;
@@ -56,13 +52,19 @@ fs.mkdirSync(MEDIA_ROOT, { recursive: true });
 const sockets = new Map(); // accountId -> { sock, open, stopping }
 const tasks = new Map();   // "accountId:formatId" -> { running }
 const flows = new Map();   // telegramId -> { t, accountId?, formatId?, at }
-const daily = new Map();   // accountId -> { day, n }
 // Cache yang dibutuhkan Baileys supaya pesan ke grup benar-benar sampai.
 const groupCache = new Map(); // "accountId:groupJid" -> { at, meta } (daftar peserta grup untuk enkripsi)
 const sentCache = new Map();  // "accountId:messageId" -> pesan terkirim (untuk kirim ulang bila penerima gagal dekripsi)
 const GROUP_META_TTL_MS = 5 * 60 * 1000;
 const SENT_CACHE_MAX = 500;
 const SEND_TIMEOUT_MS = 90 * 1000;      // kirim ke satu grup tidak boleh menggantung lebih dari ini
+
+// Error nyasar dari library WhatsApp cukup dicatat, jangan sampai mematikan seluruh bot.
+if (!global.__waGuardInstalled) {
+  global.__waGuardInstalled = true;
+  process.on("unhandledRejection", r => console.error("WA UNHANDLED REJECTION:", String((r && r.message) || r).slice(0, 300)));
+  process.on("uncaughtException", e => console.error("WA UNCAUGHT EXCEPTION:", String((e && e.message) || e).slice(0, 300)));
+}
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const rnd = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
@@ -373,6 +375,10 @@ function register(bot, getDeps) {
       browser: ["Ubuntu", "Chrome", "22.04.4"],
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      keepAliveIntervalMs: 20000,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      retryRequestDelayMs: 500,
       // Tanpa ini, syncFullHistory:false ikut mematikan sinkron data grup/LID di Baileys 7 (FULL = 2 saja yang dilewati).
       shouldSyncHistoryMessage: ({ syncType }) => syncType !== 2,
       // Wajib untuk kirim ke grup: daftar peserta (cache) dan pesan asli untuk kirim ulang.
@@ -442,6 +448,7 @@ function register(bot, getDeps) {
         if (connection === "open") {
           entry.open = true;
           retries.delete(String(acc.id));
+          onConnOpened(acc);
           const jid = sock.user?.id ? `${sock.user.id.split(":")[0]}@s.whatsapp.net` : null;
           const waName = sock.user?.name ? trunc(String(sock.user.name).trim(), 60) : "";
           await setAccountStatus(acc.id, "connected", jid, waName || undefined);
@@ -503,15 +510,19 @@ function register(bot, getDeps) {
           if (code === 401) {
             // Sesi ditolak/dikeluarkan WhatsApp: berhenti sambung ulang, hapus sesi.
             console.log("WA LOGOUT: akun", acc.id, "sesi ditolak (401), sesi dihapus");
+            onConnClosed(acc, code, true);
             await setAccountStatus(acc.id, "disconnected", null);
             retries.delete(String(acc.id));
             wipeSession(acc.id);
             return;
           }
           await setAccountStatus(acc.id, "error").catch(() => {});
+          onConnClosed(acc, code, false);
           const n = (retries.get(String(acc.id)) || 0) + 1;
           retries.set(String(acc.id), n);
-          setTimeout(() => reconnect(acc.id), Math.min(5000 * n, 60000));
+          // Sambung ulang cepat (2 dtk, lalu bertahap sampai maks 30 dtk). 440 = sesi dipakai tempat lain, beri jeda lebih lama.
+          const wait = Number(code) === 440 ? 30000 : Math.min(2000 * n, 30000);
+          setTimeout(() => reconnect(acc.id), wait);
         }
       } catch (e) {
         console.error("WA CONNECTION:", errText(e));
@@ -519,8 +530,82 @@ function register(bot, getDeps) {
     });
   }
 
+  /* ---------- Pemberitahuan koneksi ---------- */
+
+  const outages = new Map();       // accountId -> { timer, notified }
+  const reconnecting = new Set();  // cegah dua socket dibuat bersamaan
+
+  async function alertTargets(acc) {
+    const ids = new Set();
+    if (acc?.created_by) ids.add(Number(acc.created_by));
+    try {
+      for (const f of await loadFormats(acc.id)) if (f.active && f.started_by) ids.add(Number(f.started_by));
+    } catch (_) { /* abaikan */ }
+    return [...ids].filter(Boolean);
+  }
+
+  async function sendConnAlert(acc, title, lines) {
+    const s = screenNotice(title, [
+      `👤 Nama : <b>${esc(acc.label || "-")}</b>`,
+      `📞 Nomor : <code>${esc(acc.phone || "-")}</code>`,
+      ...lines
+    ], accNoticeRows(acc.id));
+    for (const to of await alertTargets(acc)) await note(to, s.text, s.kb).catch(() => {});
+  }
+
+  // Putus sebentar (kurang dari 15 detik) tidak diberitahukan supaya tidak spam.
+  function onConnClosed(acc, code, fatal) {
+    const key = String(acc.id);
+    const o = outages.get(key) || { timer: null, notified: false, reason: "" };
+    o.reason = disconnectReason(code);
+    outages.set(key, o);
+    if (fatal) {
+      clearTimeout(o.timer);
+      o.notified = false;
+      outages.delete(key);
+      sendConnAlert(acc, "🚫 <b>WHATSAPP KELUAR / SESI DITOLAK</b>", [
+        `⚠️ Penyebab : ${esc(o.reason)}`,
+        "⏹ Promosi WhatsApp akun ini berhenti karena sesi tidak berlaku lagi.",
+        "👉 Hubungkan ulang akun ini dengan kode pairing, lalu mulai promosi lagi."
+      ]).catch(() => {});
+      return;
+    }
+    if (o.timer || o.notified) return;
+    o.timer = setTimeout(() => {
+      o.timer = null;
+      if (sockets.get(key)?.open) return;
+      o.notified = true;
+      sendConnAlert(acc, "⚠️ <b>WHATSAPP TERPUTUS</b>", [
+        `⚠️ Penyebab : ${esc(o.reason)}`,
+        "🔄 Bot menyambung ulang otomatis. Promosi lanjut sendiri begitu tersambung."
+      ]).catch(() => {});
+    }, 15000);
+  }
+
+  function onConnOpened(acc) {
+    const key = String(acc.id);
+    const o = outages.get(key);
+    if (!o) return;
+    clearTimeout(o.timer);
+    outages.delete(key);
+    if (o.notified) {
+      sendConnAlert(acc, "✅ <b>WHATSAPP TERSAMBUNG KEMBALI</b>", [
+        "▶️ Promosi yang aktif lanjut otomatis."
+      ]).catch(() => {});
+    }
+  }
+
   async function reconnect(id) {
-    if (sockets.has(String(id)) || !isRegistered(id)) return;
+    if (sockets.has(String(id)) || !isRegistered(id) || reconnecting.has(String(id))) return;
+    reconnecting.add(String(id));
+    try {
+      await reconnectInner(id);
+    } finally {
+      reconnecting.delete(String(id));
+    }
+  }
+
+  async function reconnectInner(id) {
     const { data: acc } = await db().from("wa_accounts").select("*").eq("id", id).maybeSingle();
     if (!acc || acc.status === "disconnected") return;
     try {
@@ -552,19 +637,6 @@ function register(bot, getDeps) {
     return data || [];
   }
 
-  function bumpDaily(id) {
-    const today = nowIso().slice(0, 10);
-    const cur = daily.get(String(id));
-    if (!cur || cur.day !== today) daily.set(String(id), { day: today, n: 1 });
-    else cur.n++;
-  }
-
-  function overDailyCap(id) {
-    const today = nowIso().slice(0, 10);
-    const cur = daily.get(String(id));
-    return DAILY_CAP > 0 && !!cur && cur.day === today && cur.n >= DAILY_CAP;
-  }
-
   async function waitTask(task, ms) {
     const end = Date.now() + ms;
     while (task.running && Date.now() < end) {
@@ -589,6 +661,43 @@ function register(bot, getDeps) {
     return sent;
   }
 
+  // Error yang tidak berguna diulang (grup memang menolak).
+  const PERMANENT_SEND_ERR = /forbidden|not-authorized|item-not-found/i;
+  const SEND_RETRIES = 3;
+
+  async function waitSocketOpen(task, accountId, maxMs) {
+    const end = Date.now() + maxMs;
+    while (task.running && Date.now() < end) {
+      const e = sockets.get(String(accountId));
+      if (e?.open) return e.sock;
+      await sleep(1000);
+    }
+    return null;
+  }
+
+  // Pesan wajib terkirim: kalau koneksi putus, tunggu tersambung lagi; kalau gagal sementara, coba ulang.
+  async function sendWithRetry(task, accountId, jid, fmt) {
+    let lastErr;
+    for (let attempt = 1; attempt <= SEND_RETRIES; attempt++) {
+      if (!task.running) throw new Error("Promosi dihentikan");
+      let e0 = sockets.get(String(accountId));
+      let sock = e0?.open ? e0.sock : await waitSocketOpen(task, accountId, 5 * 60 * 1000);
+      if (!sock) throw new Error("Akun WhatsApp terputus dan belum tersambung kembali");
+      try {
+        return await Promise.race([
+          sendFormat(sock, jid, fmt, accountId),
+          sleep(SEND_TIMEOUT_MS).then(() => { throw new Error("Timeout kirim ke grup (90 detik)"); })
+        ]);
+      } catch (e) {
+        lastErr = e;
+        if (PERMANENT_SEND_ERR.test(errText(e))) throw e;
+        console.warn("WA SEND: coba ulang", attempt, "/", SEND_RETRIES, "|", errText(e));
+        await waitTask(task, attempt * 3000);
+      }
+    }
+    throw lastErr;
+  }
+
   async function sendRoundReport(acc, fmt, round) {
     const to = fmt.started_by;
     if (!to) return;
@@ -598,6 +707,7 @@ function register(bot, getDeps) {
     const lines = [
       "📊 <b>HASIL PROMOSI</b>",
       RULE,
+      "💬 Akun: <b>WhatsApp</b>",
       `📝 Format: <b>${esc(await fmtLabel(acc.id, fmt))}</b>`,
       `👤 Nama: <b>${esc((acc && acc.label) || "-")}</b>`,
       `📞 Nomor: <code>${esc((acc && acc.phone) || "-")}</code>`,
@@ -607,9 +717,6 @@ function register(bot, getDeps) {
       `Berhasil terkirim: <b>${round.ok}</b>`,
       `Gagal: <b>${round.fail.length}</b>`
     ];
-    if (round.capped) {
-      lines.push("", `⚠️ <b>Putaran terpotong:</b> batas kirim harian (${DAILY_CAP}) tercapai, promosi lanjut otomatis setelah reset harian.`);
-    }
     if (reasons.size) {
       lines.push("", "❌ <b>Ringkasan gagal:</b>");
       for (const [reason, n] of reasons) lines.push(`• ${n} grup — ${esc(trunc(reason, 160))}`);
@@ -631,6 +738,7 @@ function register(bot, getDeps) {
     (async () => {
       try {
         while (task.running) {
+          const roundStart = Date.now();
           const fmt = await getFormat(accountId, formatId);
           if (!fmt || !fmt.active) break;
 
@@ -641,30 +749,19 @@ function register(bot, getDeps) {
 
           const entry = sockets.get(String(accountId));
           if (!entry?.open || (!fmt.message && !fmt.media)) {
-            await waitTask(task, 60 * 1000);
+            await waitTask(task, 2000);   // begitu tersambung, langsung lanjut
             continue;
           }
 
           const { data: acc } = await db().from("wa_accounts").select("*").eq("id", accountId).maybeSingle();
           const groups = await enabledGroups(accountId);
 
-          const round = { ok: 0, fail: [], capped: false };
+          const round = { ok: 0, fail: [] };
           for (const g of groups) {
             if (!task.running) break;
-            if (overDailyCap(accountId)) {
-              // Jangan menunggu di sini: laporan dikirim dulu, baru menunggu.
-              round.capped = true;
-              break;
-            }
-            const sock = sockets.get(String(accountId))?.sock;
             try {
-              if (!sock) throw new Error("Akun WhatsApp terputus");
-              const sent = await Promise.race([
-                sendFormat(sock, g.group_jid, fmt, accountId),
-                sleep(SEND_TIMEOUT_MS).then(() => { throw new Error("Timeout kirim ke grup (90 detik)"); })
-              ]);
+              const sent = await sendWithRetry(task, accountId, g.group_jid, fmt);
               console.log("WA SEND: ok", accountId, "->", g.title, "| id:", sent?.key?.id || "-");
-              bumpDaily(accountId);
               round.ok++;
               await logHistory(acc, null, "promotion_send", "success", { group_title: g.title });
             } catch (e) {
@@ -675,15 +772,24 @@ function register(bot, getDeps) {
             await waitTask(task, rnd(GROUP_DELAY_MIN_MS, GROUP_DELAY_MAX_MS));
           }
 
-          if (round.ok + round.fail.length) await sendRoundReport(acc, fmt, round).catch(() => {});
-          if (round.capped) {
-            console.warn("WA LOOP: batas harian", DAILY_CAP, "tercapai untuk akun", accountId, "- menunggu 1 jam");
-            await waitTask(task, 60 * 60 * 1000);
-            continue;
+          const hadGroups = round.ok + round.fail.length > 0;
+          if (hadGroups) await sendRoundReport(acc, fmt, round).catch(() => {});
+
+          // Putaran berikutnya mulai = awal putaran ini + jeda. Jeda dibaca ulang tiap 3 detik,
+          // jadi kalau kamu ubah jeda (mis. 30 menit -> 1 menit) langsung berlaku, tidak menunggu jeda lama habis.
+          let cur = fmt;
+          let lastRead = Date.now();
+          while (task.running) {
+            const gapMs = intervalSec(cur) * 1000;
+            if (Date.now() >= roundStart + (hadGroups ? gapMs : Math.max(gapMs, 10000))) break;
+            await sleep(1000);
+            if (Date.now() - lastRead >= 3000) {
+              lastRead = Date.now();
+              const f = await getFormat(accountId, formatId).catch(() => null);
+              if (f) cur = f;
+              if (f && !f.active) break;
+            }
           }
-          // Jeda bebas (detik pun bisa). Putaran tanpa grup ditunggu min. 10 detik agar tidak looping rapat.
-          const gapMs = intervalSec(fmt) * 1000;
-          await waitTask(task, round.ok + round.fail.length ? gapMs : Math.max(gapMs, 10000));
         }
       } catch (e) {
         console.error("WA LOOP:", errText(e));
@@ -877,7 +983,7 @@ function register(bot, getDeps) {
 
     const kb = [];
     for (const g of rows.filter(x => x.can_send)) {
-      kb.push([[`${g.enabled ? "✅" : "⬜"} ${trunc(g.title, 30)}`, `wa:grp:tog:${acc.id}:${g.id}:${backOf(p)}`]]);
+      kb.push([[`${g.enabled ? "✅" : "❎"} ${trunc(g.title, 30)}`, `wa:grp:tog:${acc.id}:${g.id}:${backOf(p)}`]]);
     }
     const nav = [];
     if (p > 0) nav.push(["◀️ Sebelumnya", navBase(p - 1)]);
@@ -889,6 +995,7 @@ function register(bot, getDeps) {
       : [["🔎 Cari Grup", `wa:grp:search:${acc.id}`], ["⬅️ Akun", `wa:acc:view:${acc.id}`]]);
     // Dua tombol memanjang di bagian paling bawah.
     kb.push([["➕ Tambah Semua Grup", `wa:grp:all:${acc.id}:${backOf(p)}`]]);
+    kb.push([["❎ Batalkan Semua Grup", `wa:grp:none:${acc.id}:${backOf(p)}`]]);
     kb.push([["🔄 Deteksi Grup", `wa:grp:refresh:${acc.id}`]]);
 
     const lines = [
@@ -902,7 +1009,7 @@ function register(bot, getDeps) {
     if (term) lines.push(`Pencarian  : <b>${esc(opts.rawTerm || term)}</b> (${scope.length} hasil)`);
     lines.push(`Halaman  : <b>${p + 1}</b> / ${pages}`);
     if (opts.prefix) lines.push("", opts.prefix);
-    lines.push("", "<blockquote>✅ = jadi target promosi\n⬜ = belum dipilih</blockquote>");
+    lines.push("", "<blockquote>✅ = jadi target promosi\n❎ = belum dipilih</blockquote>");
     if (!all.length) lines.push("", "<i>Belum ada grup. Tekan Deteksi Grup setelah akun terhubung.</i>");
     return { text: lines.join("\n"), kb: buildKb(kb) };
   }
@@ -923,6 +1030,7 @@ function register(bot, getDeps) {
     if (!entry?.open) return { error: "⚠️ Akun belum terhubung, grup belum bisa dideteksi." };
     try {
       const n = await refreshGroups(acc.id, entry.sock);
+      if (typeof lastGroupSync !== "undefined") lastGroupSync.set(String(acc.id), Date.now());
       return { n };
     } catch (e) {
       return { error: `❌ Deteksi grup gagal : ${esc(errText(e))}` };
@@ -1204,9 +1312,27 @@ function register(bot, getDeps) {
 
   /* ---------- Callback: grup target ---------- */
 
+  // Masuk menu grup (halaman pertama): daftar grup otomatis disegarkan (maks 1x per 45 detik per akun).
+  const lastGroupSync = new Map();
+  async function autoSyncGroups(acc) {
+    const key = String(acc.id);
+    if (Date.now() - (lastGroupSync.get(key) || 0) < 45000) return;
+    const entry = sockets.get(key);
+    if (!entry?.open) return;
+    lastGroupSync.set(key, Date.now());
+    try {
+      await refreshGroups(acc.id, entry.sock);
+    } catch (e) {
+      console.warn("WA GROUP AUTO-SYNC:", errText(e));   // tampilkan data tersimpan saja
+    }
+  }
+
   bot.callbackQuery(/^wa:grp:list:(\d+):(\d+)$/, guard((ctx, admin) =>
-    withAccount(ctx, admin, ctx.match[1], async acc =>
-      show(ctx, await screenGroups(acc, Number(ctx.match[2]))))));
+    withAccount(ctx, admin, ctx.match[1], async acc => {
+      const page = Number(ctx.match[2]);
+      if (page === 0) await autoSyncGroups(acc);
+      return show(ctx, await screenGroups(acc, page));
+    })));
 
   bot.callbackQuery(/^wa:grp:search:(\d+)$/, guard((ctx, admin) =>
     withAccount(ctx, admin, ctx.match[1], async acc => {
@@ -1245,6 +1371,14 @@ function register(bot, getDeps) {
         .eq("account_id", acc.id).eq("can_send", true);
       return show(ctx, await groupScreenFromBack(acc, ctx.match[2], {
         prefix: "➕ Semua grup yang bisa dikirimi sudah dipilih."
+      }));
+    })));
+
+  bot.callbackQuery(/^wa:grp:none:(\d+):(.+)$/, guard((ctx, admin) =>
+    withAccount(ctx, admin, ctx.match[1], async acc => {
+      await db().from("wa_account_groups").update({ enabled: false }).eq("account_id", acc.id);
+      return show(ctx, await groupScreenFromBack(acc, ctx.match[2], {
+        prefix: "❎ Semua grup dibatalkan. Belum ada grup yang dipilih."
       }));
     })));
 
@@ -1304,10 +1438,66 @@ function register(bot, getDeps) {
     withFormat(ctx, admin, ctx.match[1], ctx.match[2], async (acc, fmt) =>
       show(ctx, await screenFormat(acc, fmt)))));
 
+  // Pilihan cepat jeda & durasi (sama seperti menu Telegram). Ketik manual tetap bisa.
+  const INTERVAL_PRESETS = [["1 menit", 60], ["5 menit", 300], ["10 menit", 600], ["30 menit", 1800], ["1 jam", 3600]];
+  const DURATION_PRESETS = [["1 jam", 1], ["1 hari", 24], ["3 hari", 72], ["7 hari", 168]];
+
+  async function presetScreen(kind, acc, fmt) {
+    const id = acc.id;
+    const f = fmt.id;
+    const label = await fmtLabel(acc.id, fmt);
+    const isInt = kind === "interval";
+    const presets = isInt ? INTERVAL_PRESETS : DURATION_PRESETS;
+    const act = isInt ? "setint" : "setdur";
+    const rows = [];
+    for (let i = 0; i < presets.length; i += 2) {
+      rows.push(presets.slice(i, i + 2).map(([t, v]) => [t, `wa:fmt:${act}:${id}:${f}:${v}`]));
+    }
+    rows.push([["⌨️ Ketik sendiri", `wa:fmt:typed:${kind}:${id}:${f}`]]);
+    rows.push([["⬅️ Kembali", `wa:fmt:view:${id}:${f}`]]);
+    return {
+      text: `${isInt ? "⏱️ <b>ATUR JEDA</b>" : "📅 <b>ATUR DURASI</b>"}\n${RULE}\nFormat: <b>${esc(label)}</b>\n\nPilih ${isInt ? "jeda" : "durasi"} cepat di bawah, atau tekan ⌨️ Ketik sendiri.`,
+      kb: buildKb(rows)
+    };
+  }
+
+  bot.callbackQuery(/^wa:fmt:typed:(interval|duration):(\d+):([a-f0-9]+)$/, guard((ctx, admin) =>
+    withFormat(ctx, admin, ctx.match[2], ctx.match[3], async (acc, fmt) => {
+      const kind = ctx.match[1];
+      setFlow(ctx.from.id, { t: kind, accountId: acc.id, formatId: fmt.id });
+      await show(ctx, {
+        text: ASK[kind],
+        kb: buildKb([[["⬅️ Kembali", `wa:fmt:ask:${kind}:${acc.id}:${fmt.id}`]]])
+      });
+    })));
+
+  bot.callbackQuery(/^wa:fmt:setint:(\d+):([a-f0-9]+):(\d+)$/, guard((ctx, admin) =>
+    withFormat(ctx, admin, ctx.match[1], ctx.match[2], async (acc, fmt) => {
+      const sec = Number(ctx.match[3]);
+      if (!Number.isFinite(sec) || sec < 1) return;
+      await updateFormat(acc.id, fmt.id, { interval_seconds: sec, interval_minutes: Math.max(1, Math.round(sec / 60)) });
+      clearFlow(ctx.from.id);
+      return show(ctx, await formatWithNote(acc, await getFormat(acc.id, fmt.id), `✅ Jeda disimpan: <b>${esc(secText(sec))}</b>`));
+    })));
+
+  bot.callbackQuery(/^wa:fmt:setdur:(\d+):([a-f0-9]+):(\d+)$/, guard((ctx, admin) =>
+    withFormat(ctx, admin, ctx.match[1], ctx.match[2], async (acc, fmt) => {
+      const h = Number(ctx.match[3]);
+      if (!Number.isFinite(h) || h < 1) return;
+      const patch = { duration_hours: h };
+      if (fmt.active) patch.expires_at = new Date(Date.now() + h * 3600 * 1000).toISOString();
+      await updateFormat(acc.id, fmt.id, patch);
+      clearFlow(ctx.from.id);
+      return show(ctx, await formatWithNote(acc, await getFormat(acc.id, fmt.id), `✅ Durasi disimpan: <b>${esc(hours(h))}</b>`));
+    })));
+
   bot.callbackQuery(/^wa:fmt:ask:(msg|photo|interval|duration):(\d+):([a-f0-9]+)$/, guard((ctx, admin) =>
     withFormat(ctx, admin, ctx.match[2], ctx.match[3], async (acc, fmt) => {
       const kind = ctx.match[1];
       setFlow(ctx.from.id, { t: kind, accountId: acc.id, formatId: fmt.id });
+      if (kind === "interval" || kind === "duration") {
+        return show(ctx, await presetScreen(kind, acc, fmt));
+      }
       await show(ctx, {
         text: ASK[kind],
         kb: buildKb([
@@ -1472,7 +1662,10 @@ function register(bot, getDeps) {
       if (flow.t === "duration") {
         const h = D().parseHours(text);
         if (!h) return note(tgId, "❌ Format durasi tidak valid. Contoh: 1 jam, 3 hari", cancelKb(acc.id, flow.formatId));
-        await updateFormat(acc.id, flow.formatId, { duration_hours: h });
+        const curFmt = await getFormat(acc.id, flow.formatId);
+        const patch = { duration_hours: h };
+        if (curFmt?.active) patch.expires_at = new Date(Date.now() + h * 3600 * 1000).toISOString();
+        await updateFormat(acc.id, flow.formatId, patch);
         clearFlow(tgId);
         return showFormatNote(tgId, acc, flow.formatId);
       }
@@ -1570,7 +1763,37 @@ function register(bot, getDeps) {
         if (f.active) startLoop(s.account_id, f.id);
       }
     }
+
+    // Penjaga: tiap 30 detik pastikan akun yang seharusnya tersambung punya koneksi dan format aktif punya loop.
+    if (!watchdogStarted) {
+      watchdogStarted = true;
+      setInterval(async () => {
+        try {
+          const { data: list } = await db().from("wa_accounts").select("*").neq("status", "disconnected");
+          for (const a of list || []) {
+            if (!isRegistered(a.id) || pairings.has(String(a.id))) continue;
+            if (!sockets.has(String(a.id)) && !reconnecting.has(String(a.id))) {
+              console.warn("WA WATCHDOG: akun", a.id, "tidak punya koneksi, menyambung ulang");
+              reconnect(a.id).catch(() => {});
+            }
+          }
+          const { data: sets } = await db().from("wa_account_settings").select("account_id,formats");
+          for (const st of sets || []) {
+            for (const f of Array.isArray(st.formats) ? st.formats : []) {
+              if (f.active && !tasks.has(`${st.account_id}:${f.id}`)) {
+                console.warn("WA WATCHDOG: loop format", f.id, "mati, dihidupkan ulang");
+                startLoop(st.account_id, f.id);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("WA WATCHDOG:", errText(e));
+        }
+      }, 30000);
+    }
   }
+
+  let watchdogStarted = false;
 
   return { restore };
 }
